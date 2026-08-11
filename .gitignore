@@ -1,0 +1,25 @@
+# credentials
+.env
+.env.*
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.ipynb_checkpoints/
+
+# tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# analysis output
+out/
+data/
+*.parquet
+*.csv
+
+# os
+.DS_Store
