@@ -52,12 +52,126 @@ the fee-policy map", which contains every auction order. In the DB the analogue 
 `competition_auctions.order_uids` — *not* the `fee_policies` table, which is only
 populated for executed orders.
 
-### One asymmetry to preserve
+### Two asymmetries to preserve
 
 Step 1 keys pairs on the **raw** `sell_token`/`buy_token`. Step 5 normalises them through
 `as_erc20`, mapping the native-token sentinel `0xee…ee` to WETH. So a solution trading
 ETH→USDC and one trading WETH→USDC are scored under separate pairs but conflict when
-picking winners. This is in the Rust and should be mirrored, not tidied up.
+picking winners.
+
+Step 1 also skips orders failing `contributes_to_score`, while step 5 claims pairs from
+**every** order in the solution (`arbitrator.rs:587` iterates `solution.orders()` with no
+filter). A solution can therefore be single-pair for scoring — and so exempt from the
+fairness filter — while blocking two pairs when winners are picked.
+
+Both are in the Rust and should be mirrored, not tidied up.
+
+### `ranked` order is load-bearing
+
+`arbitrate` returns after
+`sort_by_key(|s| (Reverse(s.is_winner()), Reverse(s.score())))` (`arbitrator.rs:51`), so
+`ranking.ranked` is **winners by descending score, then non-winners by descending score**
+— not plain score order. A non-winner can outscore a winner that sorts ahead of it:
+scores `[100, 90, 80]` where the 90 conflicts with the 100 and the 80 does not ranks as
+`[100, 80, 90]`.
+
+`compute_reference_scores` then re-runs `pick_winners` on *that* list
+(`arbitrator.rs:624`), and `pick_winners` is order-dependent. Re-sorting by score before
+computing reference scores gives different numbers whenever a non-winner conflicts with a
+lower-scoring winner. The ordering must be carried through, not recovered.
+
+Conveniently, the DB records it: `proposed_solutions.uid` is assigned in exactly this
+order — see
+[analytics-db.md](analytics-db.md#proposed_solutionsuid-encodes-the-ranking).
+
+### Reproduction status
+
+Reproduced against three days of mainnet (2026-08-01 to 2026-08-04, 7,745 auctions,
+98,669 solutions), score mode, taking `proposed_solutions.score` as each solution's total:
+
+| check | result |
+| --- | --- |
+| step 5 re-picked on the recorded kept set vs. `is_winner` | **7745 / 7745** |
+| step 6 re-run on the recorded ranking vs. `reference_scores` | **7745 / 7745** |
+| per-order surplus vs. the dbt model | 93941 / 94565, all 624 differences exactly −1 (the model's rounding, [above](analytics-db.md#order_surplus_atoms_in_surplus_token-rounds)) |
+| solutions we could not value at all | **0** |
+| end-to-end winner set vs. `is_winner` | 7740 / 7745 |
+| end-to-end `filtered_out` | 7738 / 7745 |
+
+The first two are the ones that matter: they hold the DB's own filter decisions fixed and
+re-run only the step under test, so no approximation is anywhere in their path — every
+quantity is either a recorded score or a token pair read off a trade. Both are exact.
+
+Every end-to-end difference therefore traces to step 4, the fairness filter, which is the
+one place the missing per-pair split enters.
+
+### The filter runs on surplus
+
+Scores are stored per solution, so the per-pair split step 4 compares is not recorded
+anywhere. Something has to stand in for it. Two things narrow the problem first: the pair
+*set* is exact regardless, since it comes from the trades and not from any value, and only
+5.3% of solutions touch more than one pair (5,211 of 98,669) — single-pair solutions are
+exempt from the filter outright.
+
+**Both sides of the comparison use native user surplus**: a batch's surplus on a pair
+against the best surplus any single-pair solution reached on that pair. Nothing is invented
+and the units match. Solution *totals* remain recorded scores, so ranking, winner picking
+and reference scores are unaffected — per-pair values feed the filter and nothing else, and
+in score mode a solution's total deliberately exceeds the sum of its pair values by its
+protocol fees.
+
+Two alternatives were built and measured before being removed, since the result is worth
+recording. Both tried to keep the comparison on the *score* scale: `scaled` split a batch's
+score across its pairs in proportion to surplus and left single-pair baselines at full
+score; `raw` put surplus on the left and full-score baselines on the right. Over the
+three-day window:
+
+| filter | decisions differing from the DB | auctions with a different winner set |
+| --- | --- | --- |
+| **surplus on both sides** | **7 / 5211 (0.13%)** | **5** |
+| `scaled` | 196 / 5211 (3.8%) | 76 |
+| `raw` | 200 / 5211 (3.8%) | 74 |
+
+Surplus wins by more than an order of magnitude despite being the one option that does not
+try to reconstruct the score split. The reason is that both sides move together: `scaled`
+and `raw` compare a batch against a baseline inflated by that baseline solution's own
+protocol fees, a systematic bias no split of the batch's score can correct for.
+
+#### Bounding what the missing split can cost
+
+The unknown split is not unconstrained. For a solution with recorded score `S` and per-pair
+user surplus `u_i`, the true per-pair score `v_i` satisfies
+
+```
+u_i  <=  v_i  <=  S - Σ_{j≠i} u_j
+```
+
+since protocol fees are non-negative and the `v_i` sum to `S`. Comparing that interval
+against the **exact score baselines** — the best recorded score among single-pair solutions,
+which is what the protocol itself used — decides most solutions outright whatever the fees
+turn out to be:
+
+| bracket | multi-pair solutions | meaning |
+| --- | --- | --- |
+| `must_filter` | 4,064 (78%) | unfair under every valid split |
+| `must_keep` | 66 (1.3%) | fair under every valid split |
+| `undetermined` | 1,081 (21%) | genuinely depends on the fee split |
+
+The bracket deliberately uses **score** baselines, not the surplus ones the filter itself
+compares against, which is what makes it a statement about the recorded competition rather
+than about our model. A decisive verdict therefore binds the DB absolutely, and binds us in
+one direction only:
+
+- Surplus baselines sit at or below score baselines, so keeping a solution the score filter
+  drops (`must_filter`) is expected. `validate` reports it as `model`.
+- The reverse is impossible. `must_keep` means every pair's surplus already clears its
+  *score* baseline, which is at least its surplus baseline, so the surplus filter keeps it
+  too. Dropping it anyway means our baselines or valuation are wrong: `bug`.
+
+**All 7 differences fall in the `undetermined` band** — not one lands where the bracket
+forces an answer, and no `model` case occurred at all. They also have a uniform shape: every
+one is the recorded filter dropping a batched solution that the surplus filter keeps, and
+all 7 involve a partially fillable order, where surplus and score diverge most.
 
 ### Reference scores do not re-filter
 

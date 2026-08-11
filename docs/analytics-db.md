@@ -94,6 +94,35 @@ Other joins are unsurprising: `orders.uid = order_uid`, `auction_prices` on
 are `bytea` — compare with `decode(...,'hex')` or `\x…` literals, and render with
 `encode(col,'hex')`.
 
+## `proposed_solutions.uid` encodes the ranking
+
+`uid` is not an arbitrary index. The autopilot assigns it **best to worst**
+(`services/crates/database/src/solver_competition_v2.rs:147`, "uids get assigned from
+best to worst"), so ordering by `uid` reproduces the arbitrator's own output order:
+
+```
+[winners, by descending score] ++ [non-winners, by descending score] ++ [filtered_out]
+```
+
+Verified over 2,531 solutions (auctions 13509000–13509867): `uid` order matches that
+ordering for every row, and filtered-out solutions come after every kept one in all 299
+auctions that had any.
+
+Two consequences worth having:
+
+- The recorded order is the only surviving record of the autopilot's tie-breaks. It
+  shuffles bids before sorting by score (`run_loop.rs:636`), so equal scores are split
+  randomly; feeding solutions in `uid` order is the only way to reproduce it. 54 auctions
+  in that same range had two solutions with identical non-zero scores.
+- The `ranked` ordering is *not* plain score order, and reference scores depend on it —
+  see [winner-selection.md](winner-selection.md#ranked-order-is-load-bearing).
+
+Also note that solutions dropped by the arbitrator never reach the table: there are no
+rows with `score = 0` or `score is null` (checked over auctions 13505000–13509867), which
+is consistent with `arbitrator.rs:72` discarding zero-score solutions before ranking.
+Every stored row therefore had a *successful* score computation — so a valuation that
+fails while reproducing one is a bug in the reproduction, not a property of the data.
+
 ## Native prices
 
 A price converts a token amount to the native token as
@@ -108,9 +137,20 @@ are per auction; there is no global price table.
 ## Coverage and lag
 
 - `int_backend_data__proposed_solution_data` starts at auction `12709602` and **lags the
-  raw staging tables by ~2–3 days** (as of 2026-08-11: max `13509867` vs. `13562448`).
-  For a window that reaches the present, join
-  `stg_backend_data__proposed_solutions` × `…__proposed_trade_executions` directly.
+  raw staging tables badly and by a varying amount** — measured at **7.5 days** on
+  2026-08-11: its frontier is auction `13509867`, block deadline timestamp
+  2026-08-03 23:59 UTC, while `stg_backend_data__proposed_solutions` reaches `13563642`
+  and block timestamps run to 2026-08-11 12:32 UTC. Measure the gap, do not assume it:
+
+  ```sql
+  select (select max(auction_id) from dbt.int_backend_data__proposed_solution_data) as int_max,
+         (select max(auction_id) from dbt.stg_backend_data__proposed_solutions)      as stg_max
+  ```
+
+  For anything that must cover recent auctions, join
+  `stg_backend_data__proposed_solutions` × `…__proposed_trade_executions` directly. The
+  intermediate model also lacks `filtered_out`, so the staging join is the only route to
+  the fairness-filter ground truth regardless of the window.
 - `stg_rpc_data__block_timestamp` covers block `24178030` onward (2026-01-06). Earlier
   windows need `stg_dune_data__block_timestamp`.
 - Auction ids are sparse — do not assume consecutive integers.
@@ -126,6 +166,45 @@ where block_deadline between
 ```
 
 This is the same auction universe the dbt reward models use.
+
+## `order_surplus_atoms_in_surplus_token` rounds
+
+The surplus column of `int_backend_data__proposed_solution_data` uses the same formula as
+the Rust — `executed_buy - ceil(executed_sell * buy_amount / sell_amount)` for sell orders
+— but computes it in Postgres `numeric`, and **`/` on two integral numerics rounds the
+quotient before `ceil()` ever sees it**. Postgres picks a result scale from the operands;
+for amounts of this magnitude it comes out as 0, so the quotient is rounded half-up to an
+integer and `ceil` becomes a no-op. Where the true fraction is in `(0, 0.5)` the model
+lands one atom above the exact value.
+
+Traced on auction `13488353`, solution `0`:
+
+```
+executed_sell 90888722591939552      buy_amount   105000028207312463683085
+executed_buy  954600229483096975804  sell_amount  10000000000000000000
+
+exact numerator      9543318435880250535850911543951604877920   (40 digits)
+exact floor          954331843588025053585   remainder 911543951604877920  (frac ≈ 0.09)
+exact ceil           954331843588025053586
+postgres quotient    954331843588025053585   <- scale 0, already rounded down
+postgres ceil        954331843588025053585   <- no-op
+
+model surplus  268385895071922219      exact surplus  268385895071922218
+```
+
+Over three days of mainnet (2026-08-01 to 2026-08-04, 94,565 orders) **624 orders differ
+and every single difference is exactly −1** — the exact value is always the smaller one,
+and nothing else diverges at all. So the column is
+fine for aggregate work and wrong by up to one atom per order for anything that has to
+match the protocol. Reproduce integer ceiling division exactly (`-(-a // b)` in Python,
+`div()` plus a remainder test in SQL) rather than `ceil(a / b)`.
+
+## `competition_auctions` price arrays are empty
+
+`price_tokens` and `price_values` on `stg_backend_data__competition_auctions` are `NULL`
+in recent data, despite looking like a convenient denormalised copy. Use
+`stg_backend_data__auction_prices`, which had 917 rows for auction `13509867` while the
+array columns were null.
 
 ## Fee policies are incomplete
 

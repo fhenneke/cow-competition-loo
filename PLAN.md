@@ -36,6 +36,12 @@ So the pipeline carries both, and `arbitrate` takes them as inputs rather than d
 | solution total (steps 2, 5, 6) | `proposed_solutions.score` | Σ per-order surplus in native |
 | per-pair decomposition (steps 3, 4) | per-pair surplus, used as a proxy | same |
 
+Both sides of the step-4 comparison use surplus, baselines included — a batch's surplus on a
+pair against the best surplus any single-pair solution reached on that pair. Nothing is
+invented and the units match. Two score-scale alternatives were measured and are 30× further
+from the recorded filter, so they were dropped rather than kept as options
+([numbers](docs/winner-selection.md#the-filter-runs-on-surplus)).
+
 - **Score mode is the default** and is what reward numbers and "who would have won" must
   use. Scores come straight from the DB, so no protocol-fee reimplementation is needed.
 - **Surplus mode** answers "how much user value did `X` add" self-consistently, and is the
@@ -49,14 +55,18 @@ So the pipeline carries both, and `arbitrate` takes them as inputs rather than d
 ```
 loo/
   db.py                # connect(network) -> conn; run(sql, params) -> DataFrame
+  primitives.py        # as_erc20, price_in_eth, ceil_div, order owner, per-network WETH
   extract.py           # window -> auction ids; per-auction bid/order/price bundles
   valuation.py         # per-order surplus in native; per-solution totals and pair maps
   winner_selection.py  # pure: baselines, fairness filter, pick_winners, reference_scores
+  validate.py          # M1: reproduce the recorded competition and attribute every diff
   counterfactual.py    # baseline vs. LOO per auction -> per-order and per-auction diffs
   rewards.py           # uncapped (+ later capped) rewards
   cli.py               # --network --solver <name|addr> --start --end --mode --out
 tests/
   test_winner_selection.py
+  test_valuation.py
+  test_validate.py
 notebooks/analysis.ipynb
 ```
 
@@ -75,15 +85,19 @@ class Solution:
 
 Integer arithmetic throughout the valuation path — no floats.
 
-## 4. M1 — extraction and baseline reproduction
+## 4. M1 — extraction and baseline reproduction — **done**
 
-**The gate.** Everything downstream inherits errors made here.
+**The gate.** Everything downstream inherits errors made here. Results in
+[§4.1](#41-m1-result); what follows is what was built.
 
 1. **Connect and window.** Implement `db.connect(network)` per
    [docs/analytics-db.md](docs/analytics-db.md#connecting) (the URL has no scheme and no
    dbname). Resolve one day of auctions via the date→block→auction query in
-   [the same doc](docs/analytics-db.md#mapping-a-date-window-to-auctions). Pick a day at
-   least 4 days old so `int_backend_data__proposed_solution_data` covers it.
+   [the same doc](docs/analytics-db.md#mapping-a-date-window-to-auctions). Only the
+   surplus cross-check needs `int_backend_data__proposed_solution_data`, whose lag is
+   large and variable — measured at 7.5 days, not the 2–3 originally assumed
+   ([why](docs/analytics-db.md#coverage-and-lag)) — so check its frontier rather than
+   picking a window by age.
 
 2. **Extract per auction.** Bids and executions from
    `int_backend_data__proposed_solution_data`; `order_uids` and
@@ -125,6 +139,56 @@ Integer arithmetic throughout the valuation path — no floats.
 
 **Exit criterion:** every winner-set discrepancy has a named, verified cause, and the
 filter-proxy error rate is measured and written down.
+
+### 4.1 M1 result
+
+```bash
+uv run python -m loo.cli validate --start 2026-08-01 --end 2026-08-04 --cross-check-surplus
+```
+
+7,745 mainnet auctions, 98,669 solutions, score mode. **Gate met** — the command exits 0
+only when nothing is left unexplained.
+
+| | |
+| --- | --- |
+| step 5 re-picked on the recorded kept set vs. `is_winner` | **7745 / 7745** |
+| step 6 re-run on the recorded ranking vs. `reference_scores` | **7745 / 7745** |
+| solutions that could not be valued | **0** |
+| per-order surplus vs. the dbt model | 93941 / 94565, every difference exactly −1 |
+| end-to-end winner set / `filtered_out` | 7740 / 7738 of 7745 |
+| filter decisions differing from the DB | **7**, all proxy-attributable |
+
+The comparison is structured so a cause is *proven* rather than asserted. Two of the three
+checks hold the DB's own filter decisions fixed and re-run a single step, so no
+approximation is in their path — both are exact, which clears steps 5 and 6 outright and
+localises every remaining difference to step 4.
+
+For step 4, the true per-pair split is unknown but bounded: per-pair score is at least the
+pair's user surplus (fees are non-negative) and at most the solution's score minus the
+other pairs' surplus. Comparing that interval against the exact score baselines decides 79%
+of multi-pair solutions regardless of fees. All 7 differences fall in the undetermined 21%,
+none where the bracket forces an answer, and all 7 go the same way: the recorded filter
+dropped a batch that the surplus filter keeps, always on a partially fillable order. Full
+numbers in
+[docs/winner-selection.md](docs/winner-selection.md#the-filter-runs-on-surplus).
+
+Expected explanation (a), partial fills, turned out **not** to contribute: with exact
+integer ceiling division the surplus formulas reproduce the dbt model on every order up to
+that model's own rounding. The whole residual is explanation (b).
+
+Two findings worth carrying forward, both now in `docs/`:
+
+- `proposed_solutions.uid` is assigned best-to-worst, so it records the arbitrator's
+  output ordering including the tie-breaks from its pre-sort shuffle. Reference scores
+  depend on that ordering, which is *not* plain score order
+  ([why](docs/winner-selection.md#ranked-order-is-load-bearing)).
+- `order_surplus_atoms_in_surplus_token` is off by one atom whenever Postgres numeric
+  division rounds the quotient before `ceil()` runs
+  ([why](docs/analytics-db.md#order_surplus_atoms_in_surplus_token-rounds)).
+
+Not built, deferred to their milestones: `counterfactual.py` (M2), `rewards.py` (M3),
+`notebooks/analysis.ipynb` (M4). Surplus mode is implemented and unit-tested but has not
+been run over a window, since M1's comparisons are all score-mode by definition.
 
 ## 5. M2 — LOO ranking and surplus deltas
 
