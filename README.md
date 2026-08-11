@@ -39,7 +39,6 @@ Useful flags:
 | `--cross-check-surplus` | also diff per-order surplus against the dbt model |
 | `--out report.json` | write the full report, including every disagreeing auction |
 | `--network` | defaults to `mainnet`; see `loo/db.py` for the rest |
-| `--pair-proxy {surplus,scaled,raw}` | what the fairness filter compares per token pair |
 
 A ~2,700-auction day takes about five minutes.
 
@@ -80,10 +79,9 @@ and re-run a single step of the algorithm — winner picking, then reference sco
 approximation is in their path and both should be exact.
 
 The other lines can differ from the DB, because the fairness filter compares solutions
-**per token pair** and the per-pair split of a solution's score is not stored anywhere.
-`--pair-proxy` chooses what to compare instead; the default values every pair by user
-surplus on both sides of the comparison. `bracket` bounds how much the unknown split could
-possibly matter, and `cause` classifies each difference:
+**per token pair** and the per-pair split of a solution's score is not stored anywhere. The
+filter compares user surplus on both sides instead. `bracket` bounds how much the unknown
+split could possibly matter, and `cause` classifies each difference:
 
 - `proxy` — the split genuinely decides it and cannot be known
 - `model` — a deliberate consequence of filtering on surplus rather than score

@@ -18,7 +18,6 @@ from .primitives import Pair, as_erc20, ceil_div, price_in_eth
 
 Side = Literal["sell", "buy"]
 Mode = Literal["score", "surplus"]
-PairProxy = Literal["surplus", "scaled", "raw"]
 
 
 class ValuationError(Exception):
@@ -207,81 +206,21 @@ def value_solution(
     )
 
 
-@dataclass(frozen=True)
-class PairValues:
-    """Per-pair values handed to the fairness filter, plus how they were derived."""
+def solution_total(valuation: SolutionValuation, mode: Mode, db_score: int | None = None) -> int:
+    """The value that ranks a solution and feeds reference scores.
 
-    values: dict[Pair, int]
-    total: int
-    basis: str
-    """One of `surplus-mode`, `surplus`, `exact`, `scaled`, `raw`, `empty`. See
-    `pair_values_for_mode`."""
+    Score mode takes it from `proposed_solutions.score`, so protocol fees are included
+    without having to be recomputed. Surplus mode sums the surplus decomposition instead,
+    answering the user-value question self-consistently.
 
-
-def pair_values_for_mode(
-    valuation: SolutionValuation,
-    mode: Mode,
-    db_score: int | None = None,
-    pair_proxy: PairProxy = "surplus",
-) -> PairValues:
-    """Turn a surplus decomposition into the `(total, pair_values)` the filter compares.
-
-    `total` ranks solutions and feeds reference scores; `values` is used by nothing except
-    the fairness filter. The two are allowed to disagree, and in score mode they
-    deliberately do.
-
-    Surplus mode is self-consistent: both come straight from the surplus decomposition.
-
-    Score mode takes the total from `proposed_solutions.score`. The per-pair split it
-    would need for the filter is not recorded anywhere — scores are stored per solution —
-    so `pair_proxy` chooses what to compare instead:
-
-    - **surplus** (default) — value every pair, on both sides of the comparison, by native
-      user surplus. A batched solution's surplus on a pair is compared against the best
-      surplus any single-pair solution achieved on that pair. Nothing is invented and both
-      sides are in the same units; the cost is that it answers the fairness question about
-      user surplus rather than about score.
-    - **scaled** — split the score across pairs in proportion to surplus, leaving
-      single-pair solutions exact. Both sides land on the score scale, so this is the
-      closest available model of what the protocol actually compares, at the price of
-      assuming fees follow surplus across a batch's pairs.
-    - **raw** — surplus on the left, exact score baselines on the right, as PLAN.md §2
-      originally specified. Mixes fee-exclusive and fee-inclusive quantities and so
-      systematically over-filters; kept to measure exactly that cost.
-
-    `scaled` and `raw` are *score-consistent*: their pair values are always a valid
-    candidate split of the recorded score, which is what lets `validate.filter_bracket`
-    treat any decisive disagreement as a bug. `surplus` is not, and its disagreements with
-    the recorded filter are a modelling difference rather than a defect.
+    The per-pair values the fairness filter compares are always `valuation.pair_surplus`,
+    in both modes — see docs/winner-selection.md on why the filter is evaluated in surplus
+    terms rather than trying to reconstruct a per-pair score split that is not recorded
+    anywhere. So in score mode a solution's total and the sum of its pair values
+    deliberately differ.
     """
     if mode == "surplus":
-        return PairValues(dict(valuation.pair_surplus), valuation.total, "surplus-mode")
-
+        return valuation.total
     if db_score is None:
         raise ValueError("score mode needs the solution's DB score")
-
-    if pair_proxy == "surplus":
-        # Deliberately ahead of the single-pair shortcut: baselines come only from
-        # single-pair solutions, so they have to be surplus too for both sides of the
-        # comparison to be in surplus terms.
-        return PairValues(dict(valuation.pair_surplus), db_score, "surplus")
-
-    if not valuation.pair_surplus:
-        # No contributing orders, yet the DB recorded a positive score. The Rust would
-        # have dropped this solution before ranking, so it should be unreachable;
-        # surfaced as its own basis so validation can count it rather than hide it.
-        return PairValues({}, db_score, "empty")
-
-    if len(valuation.pair_surplus) == 1:
-        ((pair, _),) = valuation.pair_surplus.items()
-        return PairValues({pair: db_score}, db_score, "exact")
-
-    surplus_total = valuation.total
-    if pair_proxy == "scaled" and surplus_total > 0:
-        values = {
-            pair: db_score * value // surplus_total
-            for pair, value in valuation.pair_surplus.items()
-        }
-        return PairValues(values, db_score, "scaled")
-
-    return PairValues(dict(valuation.pair_surplus), db_score, "raw")
+    return db_score

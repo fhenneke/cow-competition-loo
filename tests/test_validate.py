@@ -72,7 +72,6 @@ def check(**kwargs) -> SolutionCheck:
         db_score=100,
         total=100,
         n_pairs=2,
-        basis="scaled",
         db_winner=False,
         our_winner=False,
         db_filtered=False,
@@ -85,8 +84,9 @@ def check(**kwargs) -> SolutionCheck:
 
 
 class TestFilterCause:
-    """A decisive bracket binds both sides, so any difference under one is a bug; only
-    `undetermined` leaves room for the proxy to be the culprit."""
+    """A decisive bracket binds the DB, which filtered on the true split. It binds us only
+    in one direction, because we filter on surplus and surplus baselines sit at or below
+    the score baselines the protocol used."""
 
     def test_no_difference_has_no_cause(self):
         assert check().filter_cause is None
@@ -107,8 +107,8 @@ class TestFilterCause:
         )
 
     def test_keeping_what_the_score_filter_drops_is_a_modelling_difference(self):
-        """The surplus proxy's one legitimate direction: surplus baselines sit below score
-        baselines, so it keeps batches the protocol's filter drops."""
+        """The one legitimate direction: surplus baselines sit below score baselines, so
+        the surplus filter keeps batches the protocol's filter drops."""
         assert (
             check(
                 db_filtered=True, our_filtered=False, bracket="must_filter"
@@ -116,7 +116,9 @@ class TestFilterCause:
             == "model"
         )
 
-    def test_dropping_what_must_be_kept_is_a_bug_in_every_mode(self):
+    def test_dropping_what_the_score_filter_keeps_is_a_bug(self):
+        """The reverse is impossible: a pair clearing its score baseline clears its
+        surplus baseline too, so our filter cannot be the one dropping it."""
         assert (
             check(
                 db_filtered=False, our_filtered=True, bracket="must_filter"
@@ -252,6 +254,18 @@ class TestUnexplained:
             db_winner_uids=frozenset({0}),
         )
         assert report.unexplained == "filter-decision-no-valid-split-explains"
+
+    def test_a_solution_with_no_contributing_orders_is_flagged(self):
+        """The DB recorded a score and kept it, yet nothing in it counts toward score.
+        The filter would wave it through vacuously, so it has to be surfaced."""
+        report = AuctionReport(
+            auction_id=1,
+            n_solutions=1,
+            checks=[check(n_pairs=0, db_filtered=False, our_filtered=False)],
+            observed_pick_uids=frozenset({0}),
+            db_winner_uids=frozenset({0}),
+        )
+        assert report.unexplained == "solution-with-no-contributing-orders"
 
     def test_valuation_failure_dominates(self):
         report = AuctionReport(

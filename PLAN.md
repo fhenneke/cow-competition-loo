@@ -36,11 +36,11 @@ So the pipeline carries both, and `arbitrate` takes them as inputs rather than d
 | solution total (steps 2, 5, 6) | `proposed_solutions.score` | Σ per-order surplus in native |
 | per-pair decomposition (steps 3, 4) | per-pair surplus, used as a proxy | same |
 
-Both sides of the step-4 comparison use surplus, baselines included — a batch's surplus on
-a pair against the best surplus any single-pair solution reached on that pair. Nothing is
-invented and the units match. This is `--pair-proxy surplus`, the default; `scaled` and
-`raw` exist to measure the alternatives and are 30× further from the recorded filter
-([measured](docs/winner-selection.md#what-the-per-pair-proxy-costs)).
+Both sides of the step-4 comparison use surplus, baselines included — a batch's surplus on a
+pair against the best surplus any single-pair solution reached on that pair. Nothing is
+invented and the units match. Two score-scale alternatives were measured and are 30× further
+from the recorded filter, so they were dropped rather than kept as options
+([numbers](docs/winner-selection.md#the-filter-runs-on-surplus)).
 
 - **Score mode is the default** and is what reward numbers and "who would have won" must
   use. Scores come straight from the DB, so no protocol-fee reimplementation is needed.
@@ -170,7 +170,7 @@ of multi-pair solutions regardless of fees. All 7 differences fall in the undete
 none where the bracket forces an answer, and all 7 go the same way: the recorded filter
 dropped a batch that the surplus filter keeps, always on a partially fillable order. Full
 numbers in
-[docs/winner-selection.md](docs/winner-selection.md#what-the-per-pair-proxy-costs).
+[docs/winner-selection.md](docs/winner-selection.md#the-filter-runs-on-surplus).
 
 Expected explanation (a), partial fills, turned out **not** to contribute: with exact
 integer ceiling division the surplus formulas reproduce the dbt model on every order up to

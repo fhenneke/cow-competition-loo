@@ -12,7 +12,7 @@ from loo.valuation import (
     custom_prices_from_executed,
     order_surplus,
     order_surplus_native,
-    pair_values_for_mode,
+    solution_total,
     surplus_over,
     to_native,
     value_solution,
@@ -211,7 +211,7 @@ class TestValueSolution:
         assert valuation.total == 100
 
 
-class TestPairValuesForMode:
+class TestSolutionTotal:
     def make(self, pair_surplus: dict) -> SolutionValuation:
         return SolutionValuation(
             pair_surplus=pair_surplus,
@@ -221,89 +221,16 @@ class TestPairValuesForMode:
             order_uids=frozenset(),
         )
 
-    def test_surplus_mode_is_self_consistent(self):
+    def test_surplus_mode_sums_the_decomposition(self):
+        assert solution_total(self.make({(WETH, USDC): 60, (DAI, USDC): 40}), "surplus") == 100
+
+    def test_score_mode_takes_the_recorded_score(self):
+        """Score mode deliberately leaves the total and the sum of the pair values
+        different: the total carries protocol fees, the pair values do not."""
         valuation = self.make({(WETH, USDC): 60, (DAI, USDC): 40})
-        values = pair_values_for_mode(valuation, "surplus")
-        assert values.total == 100
-        assert sum(values.values.values()) == values.total
-        assert values.basis == "surplus-mode"
-
-    def test_surplus_proxy_values_every_pair_by_surplus(self):
-        """The default. Both sides of the filter comparison end up in surplus, so nothing
-        is invented — the total stays the recorded score for ranking purposes."""
-        valuation = self.make({(WETH, USDC): 60, (DAI, USDC): 40})
-        values = pair_values_for_mode(valuation, "score", db_score=200)
-        assert values.values == {(WETH, USDC): 60, (DAI, USDC): 40}
-        assert values.total == 200
-        assert values.basis == "surplus"
-
-    def test_surplus_proxy_applies_to_single_pair_solutions_too(self):
-        """Baselines come only from single-pair solutions, so they must be surplus as
-        well — otherwise the comparison mixes units again."""
-        values = pair_values_for_mode(
-            self.make({(WETH, USDC): 100}), "score", db_score=250
-        )
-        assert values.values == {(WETH, USDC): 100}
-        assert values.total == 250
-        assert values.basis == "surplus"
-
-    def test_single_pair_is_exact_under_score_consistent_proxies(self):
-        """The pair's value *is* the solution's score, so `scaled` and `raw` baselines
-        are exact."""
-        valuation = self.make({(WETH, USDC): 100})
-        for proxy in ("scaled", "raw"):
-            values = pair_values_for_mode(
-                valuation, "score", db_score=250, pair_proxy=proxy
-            )
-            assert values.values == {(WETH, USDC): 250}
-            assert values.basis == "exact"
-
-    def test_scaled_proxy_splits_the_score_in_surplus_proportion(self):
-        valuation = self.make({(WETH, USDC): 60, (DAI, USDC): 40})
-        values = pair_values_for_mode(
-            valuation, "score", db_score=200, pair_proxy="scaled"
-        )
-        assert values.values == {(WETH, USDC): 120, (DAI, USDC): 80}
-        assert values.basis == "scaled"
-
-    def test_raw_proxy_keeps_fee_exclusive_surplus(self):
-        valuation = self.make({(WETH, USDC): 60, (DAI, USDC): 40})
-        values = pair_values_for_mode(
-            valuation, "score", db_score=200, pair_proxy="raw"
-        )
-        assert values.values == {(WETH, USDC): 60, (DAI, USDC): 40}
-        assert values.total == 200
-        assert values.basis == "raw"
-
-    def test_scaled_falls_back_when_there_is_no_surplus_to_scale(self):
-        valuation = self.make({(WETH, USDC): 0, (DAI, USDC): 0})
-        values = pair_values_for_mode(
-            valuation, "score", db_score=200, pair_proxy="scaled"
-        )
-        assert values.basis == "raw"
-
-    def test_no_contributing_orders_is_flagged(self):
-        values = pair_values_for_mode(
-            self.make({}), "score", db_score=200, pair_proxy="scaled"
-        )
-        assert values.basis == "empty"
+        assert solution_total(valuation, "score", db_score=250) == 250
+        assert valuation.total == 100
 
     def test_score_mode_needs_a_score(self):
         with pytest.raises(ValueError):
-            pair_values_for_mode(self.make({(WETH, USDC): 1}), "score")
-
-    def test_score_consistent_proxies_never_exceed_the_upper_bound(self):
-        """What licenses `filter_bracket` to call a decisive disagreement a bug: for
-        `scaled` and `raw`, every pair value is at most `score - Σ other pairs' surplus`,
-        so the filter cannot keep a solution the bracket says must be filtered."""
-        valuation = self.make({(WETH, USDC): 60, (DAI, USDC): 40})
-        score = 200
-        for proxy in ("scaled", "raw"):
-            values = pair_values_for_mode(
-                valuation, "score", db_score=score, pair_proxy=proxy
-            )
-            for pair, value in values.values.items():
-                others = sum(
-                    v for p, v in valuation.pair_surplus.items() if p != pair
-                )
-                assert value <= score - others
+            solution_total(self.make({(WETH, USDC): 1}), "score")

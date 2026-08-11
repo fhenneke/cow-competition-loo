@@ -26,14 +26,6 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--network", default="mainnet")
     check.add_argument("--start", required=True, help="inclusive, e.g. 2026-08-01")
     check.add_argument("--end", required=True, help="exclusive, e.g. 2026-08-02")
-    check.add_argument(
-        "--pair-proxy",
-        default="surplus",
-        choices=["surplus", "scaled", "raw"],
-        help="what the fairness filter compares per token pair (PLAN.md §2): "
-        "surplus on both sides (default), the score split in surplus proportion, "
-        "or surplus against score baselines",
-    )
     check.add_argument("--max-winners", type=int, default=MAX_WINNERS)
     check.add_argument("--limit", type=int, help="only the first N auctions in the window")
     check.add_argument(
@@ -89,12 +81,7 @@ def run_validate(args) -> int:
 
         for bundle in extract.load_auctions(conn, auction_ids):
             summary.add(
-                validate.check_auction(
-                    bundle,
-                    weth,
-                    pair_proxy=args.pair_proxy,
-                    max_winners=args.max_winners,
-                )
+                validate.check_auction(bundle, weth, max_winners=args.max_winners)
             )
             if db_surplus:
                 surplus.merge(validate.check_surplus_against_db(bundle, db_surplus))
@@ -117,7 +104,6 @@ def run_validate(args) -> int:
 def report_summary(summary: validate.Summary, args) -> None:
     total = summary.auctions
     print(f"\n=== {total} auctions, {summary.solutions} solutions ===")
-    print(f"pair proxy:                 {args.pair_proxy}")
     print(f"winner set matches:         {summary.auctions_winners_match}/{total}")
     print(f"filtered-out set matches:   {summary.auctions_filter_match}/{total}")
     print(
@@ -131,11 +117,7 @@ def report_summary(summary: validate.Summary, args) -> None:
     print(f"pick on observed kept set:  {summary.auctions_pick_match_observed}/{total}")
     print(f"valuation failures:         {summary.valuation_failures}")
     print(
-        "\npair decomposition basis:   "
-        + ", ".join(f"{k}={v}" for k, v in sorted(summary.basis_counts.items()))
-    )
-    print(
-        f"filter differs from DB:     "
+        f"\nfilter differs from DB:     "
         f"{summary.multi_pair_filter_mismatch}/{summary.multi_pair_solutions} "
         f"multi-pair solutions ({summary.proxy_error_rate:.4%})"
     )
@@ -193,7 +175,7 @@ def print_report(report) -> None:
             continue
         print(
             f"    uid={check.uid:<3} solver={check.solver[:8]} "
-            f"score={check.db_score:<22} pairs={check.n_pairs} basis={check.basis:<7} "
+            f"score={check.db_score:<22} pairs={check.n_pairs} "
             f"winner {check.db_winner}->{check.our_winner} "
             f"filtered {check.db_filtered}->{check.our_filtered} "
             f"partial={check.partially_fillable} "
@@ -240,7 +222,6 @@ def write_json(path: str, summary, surplus: validate.SurplusCrossCheck) -> None:
         "auctions_reference_match_observed": summary.auctions_reference_match_observed,
         "auctions_pick_match_observed": summary.auctions_pick_match_observed,
         "valuation_failures": summary.valuation_failures,
-        "basis_counts": summary.basis_counts,
         "multi_pair_solutions": summary.multi_pair_solutions,
         "multi_pair_filter_mismatch": summary.multi_pair_filter_mismatch,
         "proxy_error_rate": summary.proxy_error_rate,

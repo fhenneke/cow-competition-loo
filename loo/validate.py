@@ -24,11 +24,10 @@ from .extract import AuctionBundle, Bid
 from .primitives import MAX_WINNERS, Pair
 from .valuation import (
     Mode,
-    PairProxy,
     SolutionValuation,
     ValuationError,
     order_surplus,
-    pair_values_for_mode,
+    solution_total,
     value_solution,
 )
 from .winner_selection import (
@@ -108,7 +107,6 @@ class SolutionCheck:
     db_score: int
     total: int
     n_pairs: int
-    basis: str
     db_winner: bool
     our_winner: bool
     db_filtered: bool
@@ -136,15 +134,15 @@ class SolutionCheck:
         `proxy`.
 
         Where the bracket is decisive it binds the DB, which filtered on the true split.
-        It also binds any *score-consistent* proxy (`scaled`, `raw`), whose pair values
-        are always a valid candidate split, so for those a decisive difference means one
-        of the two sides is wrong: `bug`.
+        It does not bind us: we filter on surplus, and surplus baselines sit at or below
+        the score baselines the protocol used, so keeping a solution the score filter drops
+        is expected. That one direction is `model`.
 
-        The `surplus` proxy is not score-consistent — it compares surplus against surplus
-        baselines, which sit below the score baselines the protocol uses, so it keeps
-        solutions the score filter drops. That one direction is expected and is reported
-        as `model`. The reverse — dropping something every valid split keeps — remains
-        impossible either way, and is still a `bug`.
+        The reverse is impossible. `must_keep` means every pair's surplus already clears its
+        *score* baseline, which is at least its surplus baseline, so our filter keeps it
+        too — dropping it anyway means our baselines or valuation are wrong. Likewise a DB
+        decision contradicting a decisive bracket cannot come from any valid split. Both
+        are `bug`.
         """
         if not self.filter_differs:
             return None
@@ -235,6 +233,13 @@ class AuctionReport:
         """
         if self.valuation_failures:
             return "valuation-failure"
+        if any(
+            check.n_pairs == 0 and not check.db_filtered for check in self.checks
+        ):
+            # No contributing orders, yet the DB recorded a positive score and kept the
+            # solution. The Rust drops zero-value solutions before ranking, so this should
+            # be unreachable; the fairness filter would also wave it through vacuously.
+            return "solution-with-no-contributing-orders"
         if any(check.filter_cause == "bug" for check in self.checks):
             return "filter-decision-no-valid-split-explains"
         if not self.pick_matches_observed:
@@ -269,7 +274,6 @@ class ValuedBid:
     bid: Bid
     solution: Solution
     valuation: SolutionValuation
-    basis: str
 
 
 def build_solutions(
@@ -277,7 +281,6 @@ def build_solutions(
     weth: str,
     *,
     mode: Mode = "score",
-    pair_proxy: PairProxy = "scaled",
 ) -> tuple[list[ValuedBid], dict[int, str]]:
     """Value every bid in an auction.
 
@@ -295,7 +298,7 @@ def build_solutions(
             valuation = value_solution(
                 bid.orders, bid.contributes, bundle.native_prices, weth
             )
-            values = pair_values_for_mode(valuation, mode, bid.score, pair_proxy)
+            total = solution_total(valuation, mode, bid.score)
         except ValuationError as error:
             failures[bid.uid] = str(error)
             continue
@@ -306,13 +309,12 @@ def build_solutions(
                 solution=Solution(
                     solver=bid.solver,
                     solution_uid=bid.uid,
-                    total=values.total,
-                    pair_values=values.values,
+                    total=total,
+                    pair_values=dict(valuation.pair_surplus),
                     order_uids=valuation.order_uids,
                     winner_pairs=valuation.winner_pairs,
                 ),
                 valuation=valuation,
-                basis=values.basis,
             )
         )
 
@@ -322,10 +324,10 @@ def build_solutions(
 def score_baselines(valued: Iterable[ValuedBid]) -> dict[Pair, int]:
     """Exact per-pair baselines: the best recorded score among single-pair solutions.
 
-    Deliberately independent of `--pair-proxy`. Step 3 only ever considers solutions
-    touching exactly one pair, and for those the pair's value *is* the solution's recorded
-    score — so these are the baselines the protocol itself used, whatever our filter is
-    configured to compare. `filter_bracket` needs them to say anything about the DB.
+    Deliberately *not* the surplus baselines the filter itself compares against. Step 3 only
+    ever considers solutions touching exactly one pair, and for those the pair's value *is*
+    the solution's recorded score — so these are the baselines the protocol used.
+    `filter_bracket` needs them to say anything about the DB rather than about our model.
     """
     baselines: dict[Pair, int] = {}
     for entry in valued:
@@ -386,11 +388,10 @@ def check_auction(
     weth: str,
     *,
     mode: Mode = "score",
-    pair_proxy: PairProxy = "surplus",
     max_winners: int = MAX_WINNERS,
 ) -> AuctionReport:
     """Reproduce one auction and diff it against the DB."""
-    valued, failures = build_solutions(bundle, weth, mode=mode, pair_proxy=pair_proxy)
+    valued, failures = build_solutions(bundle, weth, mode=mode)
     solutions = [v.solution for v in valued]
     ranking = arbitrate(solutions, max_winners)
     exact_baselines = score_baselines(valued)
@@ -427,7 +428,6 @@ def check_auction(
                 db_score=bid.score,
                 total=entry.solution.total if entry else 0,
                 n_pairs=len(entry.solution.pair_values) if entry else 0,
-                basis=entry.basis if entry else "unvalued",
                 db_winner=bid.is_winner,
                 our_winner=bid.uid in ranking.winner_uids,
                 db_filtered=bid.filtered_out,
@@ -460,7 +460,6 @@ class Summary:
     the right denominator. Split by `filter_causes` into unknowable (`proxy`), deliberate
     (`model`) and defective (`bug`)."""
     valuation_failures: int = 0
-    basis_counts: dict[str, int] = field(default_factory=dict)
     bracket_counts: dict[str, int] = field(default_factory=dict)
     filter_causes: dict[str, int] = field(default_factory=dict)
     mismatched: list[AuctionReport] = field(default_factory=list)
@@ -485,7 +484,6 @@ class Summary:
         self.auctions_pick_match_observed += report.pick_matches_observed
 
         for check in report.checks:
-            self.basis_counts[check.basis] = self.basis_counts.get(check.basis, 0) + 1
             if check.n_pairs > 1:
                 self.multi_pair_solutions += 1
                 self.bracket_counts[check.bracket] = (

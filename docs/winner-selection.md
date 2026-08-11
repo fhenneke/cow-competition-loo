@@ -103,40 +103,41 @@ re-run only the step under test, so no approximation is anywhere in their path �
 quantity is either a recorded score or a token pair read off a trade. Both are exact.
 
 Every end-to-end difference therefore traces to step 4, the fairness filter, which is the
-one place the per-pair proxy enters. The end-to-end rows above use the default `surplus`
-proxy; see below for how the alternatives compare.
+one place the missing per-pair split enters.
 
-### What the per-pair proxy costs
+### The filter runs on surplus
 
 Scores are stored per solution, so the per-pair split step 4 compares is not recorded
-anywhere. Something has to stand in for it. Two things narrow the problem before any choice
-is made: the pair *set* is exact either way, since it comes from the trades and not from any
-value, and only 5.3% of solutions touch more than one pair (5,211 of 98,669) — single-pair
-solutions are exempt from the filter outright.
+anywhere. Something has to stand in for it. Two things narrow the problem first: the pair
+*set* is exact regardless, since it comes from the trades and not from any value, and only
+5.3% of solutions touch more than one pair (5,211 of 98,669) — single-pair solutions are
+exempt from the filter outright.
 
-Three stand-ins are implemented, selected with `--pair-proxy`:
+**Both sides of the comparison use native user surplus**: a batch's surplus on a pair
+against the best surplus any single-pair solution reached on that pair. Nothing is invented
+and the units match. Solution *totals* remain recorded scores, so ranking, winner picking
+and reference scores are unaffected — per-pair values feed the filter and nothing else, and
+in score mode a solution's total deliberately exceeds the sum of its pair values by its
+protocol fees.
 
-| proxy | left-hand side | baseline | score-consistent |
-| --- | --- | --- | --- |
-| **`surplus`** (default) | per-pair native user surplus | best single-pair **surplus** | no |
-| `scaled` | score split in proportion to surplus | best single-pair **score** | yes |
-| `raw` | per-pair native user surplus | best single-pair **score** | yes |
+Two alternatives were built and measured before being removed, since the result is worth
+recording. Both tried to keep the comparison on the *score* scale: `scaled` split a batch's
+score across its pairs in proportion to surplus and left single-pair baselines at full
+score; `raw` put surplus on the left and full-score baselines on the right. Over the
+three-day window:
 
-Measured over the three-day window:
-
-| proxy | filter decisions differing from the DB | auctions with a different winner set |
+| filter | decisions differing from the DB | auctions with a different winner set |
 | --- | --- | --- |
-| **`surplus`** | **7 / 5211 (0.13%)** | **5** |
+| **surplus on both sides** | **7 / 5211 (0.13%)** | **5** |
 | `scaled` | 196 / 5211 (3.8%) | 76 |
 | `raw` | 200 / 5211 (3.8%) | 74 |
 
-`surplus` wins by an order of magnitude, which is not what the score-consistency argument
-would predict — it is the one option that does *not* try to reconstruct the score split.
-The reason is that both sides move together. `scaled` and `raw` compare a batch against a
-baseline inflated by that baseline solution's own protocol fees; putting both sides in
-surplus removes a systematic bias that no split of the batch's score can correct for.
+Surplus wins by more than an order of magnitude despite being the one option that does not
+try to reconstruct the score split. The reason is that both sides move together: `scaled`
+and `raw` compare a batch against a baseline inflated by that baseline solution's own
+protocol fees, a systematic bias no split of the batch's score can correct for.
 
-#### Bounding what the proxy can get wrong
+#### Bounding what the missing split can cost
 
 The unknown split is not unconstrained. For a solution with recorded score `S` and per-pair
 user surplus `u_i`, the true per-pair score `v_i` satisfies
@@ -156,22 +157,21 @@ turn out to be:
 | `must_keep` | 66 (1.3%) | fair under every valid split |
 | `undetermined` | 1,081 (21%) | genuinely depends on the fee split |
 
-The bracket is computed from score baselines regardless of which proxy is in use, so it is a
-statement about the recorded competition rather than about the model. That makes it a real
-test: for the score-consistent proxies, every pair value is provably a valid candidate
-split, so they *cannot* disagree with a decisive bracket — any such disagreement is a bug.
+The bracket deliberately uses **score** baselines, not the surplus ones the filter itself
+compares against, which is what makes it a statement about the recorded competition rather
+than about our model. A decisive verdict therefore binds the DB absolutely, and binds us in
+one direction only:
 
-**All 7 of the `surplus` proxy's differences fall in the `undetermined` band**, as do all
-196 of `scaled`'s. Not one lands where the bracket forces an answer.
+- Surplus baselines sit at or below score baselines, so keeping a solution the score filter
+  drops (`must_filter`) is expected. `validate` reports it as `model`.
+- The reverse is impossible. `must_keep` means every pair's surplus already clears its
+  *score* baseline, which is at least its surplus baseline, so the surplus filter keeps it
+  too. Dropping it anyway means our baselines or valuation are wrong: `bug`.
 
-The residual has a uniform shape. Every one of the 7 is the same case: the recorded filter
-dropped a batched solution and the surplus filter keeps it, on a pair where the bracket
-cannot decide — and all 7 involve a partially fillable order, where surplus and score
-diverge most. `scaled` errs in the opposite direction, over-filtering batches, which is why
-its count is so much higher.
-
-One direction stays impossible for every proxy: dropping a solution the bracket says must be
-kept. `validate` reports that as a bug rather than a modelling difference.
+**All 7 differences fall in the `undetermined` band** — not one lands where the bracket
+forces an answer, and no `model` case occurred at all. They also have a uniform shape: every
+one is the recorded filter dropping a batched solution that the surplus filter keeps, and
+all 7 involve a partially fillable order, where surplus and score diverge most.
 
 ### Reference scores do not re-filter
 
