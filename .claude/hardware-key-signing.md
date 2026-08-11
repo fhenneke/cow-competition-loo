@@ -45,6 +45,10 @@ So:
 
 - Ask for the tap in the **very next message**, before any other tool call.
   Do not queue up file reads or status checks first — that spends the window.
+- Make that request the **entire message**. Text streams out after the tool call
+  returns, so a long summary wrapped around the request burns the window while
+  it is being generated — even with the request at the top. Summarise *after*
+  the signature lands.
 - Do not stage more work while a signature is pending.
 - A timeout is not a broken setup. The staged index is untouched, so just re-run
   the identical command and ask again.
