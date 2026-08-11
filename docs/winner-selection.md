@@ -52,12 +52,105 @@ the fee-policy map", which contains every auction order. In the DB the analogue 
 `competition_auctions.order_uids` — *not* the `fee_policies` table, which is only
 populated for executed orders.
 
-### One asymmetry to preserve
+### Two asymmetries to preserve
 
 Step 1 keys pairs on the **raw** `sell_token`/`buy_token`. Step 5 normalises them through
 `as_erc20`, mapping the native-token sentinel `0xee…ee` to WETH. So a solution trading
 ETH→USDC and one trading WETH→USDC are scored under separate pairs but conflict when
-picking winners. This is in the Rust and should be mirrored, not tidied up.
+picking winners.
+
+Step 1 also skips orders failing `contributes_to_score`, while step 5 claims pairs from
+**every** order in the solution (`arbitrator.rs:587` iterates `solution.orders()` with no
+filter). A solution can therefore be single-pair for scoring — and so exempt from the
+fairness filter — while blocking two pairs when winners are picked.
+
+Both are in the Rust and should be mirrored, not tidied up.
+
+### `ranked` order is load-bearing
+
+`arbitrate` returns after
+`sort_by_key(|s| (Reverse(s.is_winner()), Reverse(s.score())))` (`arbitrator.rs:51`), so
+`ranking.ranked` is **winners by descending score, then non-winners by descending score**
+— not plain score order. A non-winner can outscore a winner that sorts ahead of it:
+scores `[100, 90, 80]` where the 90 conflicts with the 100 and the 80 does not ranks as
+`[100, 80, 90]`.
+
+`compute_reference_scores` then re-runs `pick_winners` on *that* list
+(`arbitrator.rs:624`), and `pick_winners` is order-dependent. Re-sorting by score before
+computing reference scores gives different numbers whenever a non-winner conflicts with a
+lower-scoring winner. The ordering must be carried through, not recovered.
+
+Conveniently, the DB records it: `proposed_solutions.uid` is assigned in exactly this
+order — see
+[analytics-db.md](analytics-db.md#proposed_solutionsuid-encodes-the-ranking).
+
+### Reproduction status
+
+Reproduced against three days of mainnet (2026-08-01 to 2026-08-04, 7,745 auctions,
+98,669 solutions), score mode, taking `proposed_solutions.score` as each solution's total:
+
+| check | result |
+| --- | --- |
+| step 5 re-picked on the recorded kept set vs. `is_winner` | **7745 / 7745** |
+| step 6 re-run on the recorded ranking vs. `reference_scores` | **7745 / 7745** |
+| per-order surplus vs. the dbt model | 93941 / 94565, all 624 differences exactly −1 (the model's rounding, [above](analytics-db.md#order_surplus_atoms_in_surplus_token-rounds)) |
+| solutions we could not value at all | **0** |
+| end-to-end winner set vs. `is_winner` | 7669 / 7745 |
+| end-to-end `filtered_out` | 7668 / 7745 |
+
+The first two are the ones that matter: they hold the DB's own filter decisions fixed and
+re-run only the step under test, so no approximation is anywhere in their path — every
+quantity is either a recorded score or a token pair read off a trade. Both are exact.
+
+Every end-to-end difference therefore traces to step 4, the fairness filter, which is the
+one place the per-pair proxy enters.
+
+### What the per-pair proxy costs
+
+Scores are stored per solution, so the per-pair split step 4 compares is not available and
+has to be approximated. The approximation is narrower than it first appears:
+
+- **Baselines are exact.** Only solutions touching exactly one pair set a baseline
+  (step 3), and for those the pair's value *is* the solution's recorded score. The
+  right-hand side of `value[pair] >= baseline[pair]` is never approximated.
+- **The pair *set* is exact** either way — it comes from the trades, not from any value.
+- Only the left-hand side of multi-pair solutions is proxied, and only 5.3% of solutions
+  are multi-pair (5,211 of 98,669).
+
+That leaves a bounded question, and the bound is computable. For a solution with total
+score `S` and per-pair user surplus `u_i`, the true per-pair score `v_i` satisfies
+
+```
+u_i  <=  v_i  <=  S - Σ_{j≠i} u_j
+```
+
+since protocol fees are non-negative and the `v_i` sum to `S`. Comparing that interval
+against the exact baselines decides many solutions outright, whatever the fees turn out
+to be. Over the three-day window:
+
+| bracket | multi-pair solutions | meaning |
+| --- | --- | --- |
+| `must_filter` | 4,064 (78%) | unfair under every valid split |
+| `must_keep` | 66 (1.3%) | fair under every valid split |
+| `undetermined` | 1,081 (21%) | genuinely depends on the fee split |
+
+**196 filter decisions differ from the DB, and all 196 fall in the `undetermined` band.**
+Not one lands where the bracket forces an answer — which is what makes the proxy, rather
+than a bug, the verified cause. As rates: 3.8% of multi-pair solutions, 0.2% of all
+solutions, and 18% of the genuinely ambiguous cases. 76 auctions (1.0%) end up with a
+different winner set as a result.
+
+Two ways to split the score across a multi-pair solution's pairs were measured on the same
+window, and they come out equivalent:
+
+| proxy | filter decisions wrong | auctions with a different winner set |
+| --- | --- | --- |
+| score split in proportion to surplus | 196 / 5211 | 76 |
+| raw user surplus (PLAN.md §2's original) | 200 / 5211 | 74 |
+
+Proportional splitting is marginally better per solution and marginally worse per auction,
+so there is no real reason to prefer either. The `exact` and `must_filter` cases dominate
+whichever is used.
 
 ### Reference scores do not re-filter
 

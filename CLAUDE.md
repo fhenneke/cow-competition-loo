@@ -34,7 +34,18 @@ Both are read-only references here. Do not modify them.
 4. Surplus and score are **not** interchangeable — median score/surplus is 1.08, p90 is
    2.70, and 3.2% of bids are fee-dominated. See
    [docs/winner-selection.md](docs/winner-selection.md#measured-divergence--surplus-is-not-a-stand-in-for-score).
-5. `int_backend_data__proposed_solution_data` lags the raw tables by ~2–3 days.
+5. `int_backend_data__proposed_solution_data` lags the raw tables **badly and variably** —
+   7.5 days when measured on 2026-08-11. Query its `max(auction_id)` rather than assuming.
+   It also has no `filtered_out` column, so the fairness-filter ground truth only comes
+   from `stg_backend_data__proposed_solutions`.
+6. `order_surplus_atoms_in_surplus_token` is up to one atom too high: Postgres `numeric`
+   division rounds the quotient before the model's `ceil()` sees it. Use exact integer
+   ceiling division. See
+   [docs/analytics-db.md](docs/analytics-db.md#order_surplus_atoms_in_surplus_token-rounds).
+7. `proposed_solutions.uid` is assigned best-to-worst and is the only record of the
+   arbitrator's tie-breaks. Reference scores depend on that ordering, which is *not* plain
+   score order — see
+   [docs/winner-selection.md](docs/winner-selection.md#ranked-order-is-load-bearing).
 
 ## Environment
 
