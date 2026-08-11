@@ -95,38 +95,60 @@ Reproduced against three days of mainnet (2026-08-01 to 2026-08-04, 7,745 auctio
 | step 6 re-run on the recorded ranking vs. `reference_scores` | **7745 / 7745** |
 | per-order surplus vs. the dbt model | 93941 / 94565, all 624 differences exactly −1 (the model's rounding, [above](analytics-db.md#order_surplus_atoms_in_surplus_token-rounds)) |
 | solutions we could not value at all | **0** |
-| end-to-end winner set vs. `is_winner` | 7669 / 7745 |
-| end-to-end `filtered_out` | 7668 / 7745 |
+| end-to-end winner set vs. `is_winner` | 7740 / 7745 |
+| end-to-end `filtered_out` | 7738 / 7745 |
 
 The first two are the ones that matter: they hold the DB's own filter decisions fixed and
 re-run only the step under test, so no approximation is anywhere in their path — every
 quantity is either a recorded score or a token pair read off a trade. Both are exact.
 
 Every end-to-end difference therefore traces to step 4, the fairness filter, which is the
-one place the per-pair proxy enters.
+one place the per-pair proxy enters. The end-to-end rows above use the default `surplus`
+proxy; see below for how the alternatives compare.
 
 ### What the per-pair proxy costs
 
-Scores are stored per solution, so the per-pair split step 4 compares is not available and
-has to be approximated. The approximation is narrower than it first appears:
+Scores are stored per solution, so the per-pair split step 4 compares is not recorded
+anywhere. Something has to stand in for it. Two things narrow the problem before any choice
+is made: the pair *set* is exact either way, since it comes from the trades and not from any
+value, and only 5.3% of solutions touch more than one pair (5,211 of 98,669) — single-pair
+solutions are exempt from the filter outright.
 
-- **Baselines are exact.** Only solutions touching exactly one pair set a baseline
-  (step 3), and for those the pair's value *is* the solution's recorded score. The
-  right-hand side of `value[pair] >= baseline[pair]` is never approximated.
-- **The pair *set* is exact** either way — it comes from the trades, not from any value.
-- Only the left-hand side of multi-pair solutions is proxied, and only 5.3% of solutions
-  are multi-pair (5,211 of 98,669).
+Three stand-ins are implemented, selected with `--pair-proxy`:
 
-That leaves a bounded question, and the bound is computable. For a solution with total
-score `S` and per-pair user surplus `u_i`, the true per-pair score `v_i` satisfies
+| proxy | left-hand side | baseline | score-consistent |
+| --- | --- | --- | --- |
+| **`surplus`** (default) | per-pair native user surplus | best single-pair **surplus** | no |
+| `scaled` | score split in proportion to surplus | best single-pair **score** | yes |
+| `raw` | per-pair native user surplus | best single-pair **score** | yes |
+
+Measured over the three-day window:
+
+| proxy | filter decisions differing from the DB | auctions with a different winner set |
+| --- | --- | --- |
+| **`surplus`** | **7 / 5211 (0.13%)** | **5** |
+| `scaled` | 196 / 5211 (3.8%) | 76 |
+| `raw` | 200 / 5211 (3.8%) | 74 |
+
+`surplus` wins by an order of magnitude, which is not what the score-consistency argument
+would predict — it is the one option that does *not* try to reconstruct the score split.
+The reason is that both sides move together. `scaled` and `raw` compare a batch against a
+baseline inflated by that baseline solution's own protocol fees; putting both sides in
+surplus removes a systematic bias that no split of the batch's score can correct for.
+
+#### Bounding what the proxy can get wrong
+
+The unknown split is not unconstrained. For a solution with recorded score `S` and per-pair
+user surplus `u_i`, the true per-pair score `v_i` satisfies
 
 ```
 u_i  <=  v_i  <=  S - Σ_{j≠i} u_j
 ```
 
 since protocol fees are non-negative and the `v_i` sum to `S`. Comparing that interval
-against the exact baselines decides many solutions outright, whatever the fees turn out
-to be. Over the three-day window:
+against the **exact score baselines** — the best recorded score among single-pair solutions,
+which is what the protocol itself used — decides most solutions outright whatever the fees
+turn out to be:
 
 | bracket | multi-pair solutions | meaning |
 | --- | --- | --- |
@@ -134,23 +156,22 @@ to be. Over the three-day window:
 | `must_keep` | 66 (1.3%) | fair under every valid split |
 | `undetermined` | 1,081 (21%) | genuinely depends on the fee split |
 
-**196 filter decisions differ from the DB, and all 196 fall in the `undetermined` band.**
-Not one lands where the bracket forces an answer — which is what makes the proxy, rather
-than a bug, the verified cause. As rates: 3.8% of multi-pair solutions, 0.2% of all
-solutions, and 18% of the genuinely ambiguous cases. 76 auctions (1.0%) end up with a
-different winner set as a result.
+The bracket is computed from score baselines regardless of which proxy is in use, so it is a
+statement about the recorded competition rather than about the model. That makes it a real
+test: for the score-consistent proxies, every pair value is provably a valid candidate
+split, so they *cannot* disagree with a decisive bracket — any such disagreement is a bug.
 
-Two ways to split the score across a multi-pair solution's pairs were measured on the same
-window, and they come out equivalent:
+**All 7 of the `surplus` proxy's differences fall in the `undetermined` band**, as do all
+196 of `scaled`'s. Not one lands where the bracket forces an answer.
 
-| proxy | filter decisions wrong | auctions with a different winner set |
-| --- | --- | --- |
-| score split in proportion to surplus | 196 / 5211 | 76 |
-| raw user surplus (PLAN.md §2's original) | 200 / 5211 | 74 |
+The residual has a uniform shape. Every one of the 7 is the same case: the recorded filter
+dropped a batched solution and the surplus filter keeps it, on a pair where the bracket
+cannot decide — and all 7 involve a partially fillable order, where surplus and score
+diverge most. `scaled` errs in the opposite direction, over-filtering batches, which is why
+its count is so much higher.
 
-Proportional splitting is marginally better per solution and marginally worse per auction,
-so there is no real reason to prefer either. The `exact` and `must_filter` cases dominate
-whichever is used.
+One direction stays impossible for every proxy: dropping a solution the bracket says must be
+kept. `validate` reports that as a bug rather than a modelling difference.
 
 ### Reference scores do not re-filter
 

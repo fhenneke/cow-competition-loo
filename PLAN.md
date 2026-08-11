@@ -36,6 +36,12 @@ So the pipeline carries both, and `arbitrate` takes them as inputs rather than d
 | solution total (steps 2, 5, 6) | `proposed_solutions.score` | Σ per-order surplus in native |
 | per-pair decomposition (steps 3, 4) | per-pair surplus, used as a proxy | same |
 
+Both sides of the step-4 comparison use surplus, baselines included — a batch's surplus on
+a pair against the best surplus any single-pair solution reached on that pair. Nothing is
+invented and the units match. This is `--pair-proxy surplus`, the default; `scaled` and
+`raw` exist to measure the alternatives and are 30× further from the recorded filter
+([measured](docs/winner-selection.md#what-the-per-pair-proxy-costs)).
+
 - **Score mode is the default** and is what reward numbers and "who would have won" must
   use. Scores come straight from the DB, so no protocol-fee reimplementation is needed.
 - **Surplus mode** answers "how much user value did `X` add" self-consistently, and is the
@@ -149,8 +155,8 @@ only when nothing is left unexplained.
 | step 6 re-run on the recorded ranking vs. `reference_scores` | **7745 / 7745** |
 | solutions that could not be valued | **0** |
 | per-order surplus vs. the dbt model | 93941 / 94565, every difference exactly −1 |
-| end-to-end winner set / `filtered_out` | 7669 / 7668 of 7745 |
-| filter decisions differing from the DB | 196, **all** proxy-attributable |
+| end-to-end winner set / `filtered_out` | 7740 / 7738 of 7745 |
+| filter decisions differing from the DB | **7**, all proxy-attributable |
 
 The comparison is structured so a cause is *proven* rather than asserted. Two of the three
 checks hold the DB's own filter decisions fixed and re-run a single step, so no
@@ -159,10 +165,11 @@ localises every remaining difference to step 4.
 
 For step 4, the true per-pair split is unknown but bounded: per-pair score is at least the
 pair's user surplus (fees are non-negative) and at most the solution's score minus the
-other pairs' surplus. Comparing that interval against the baselines — which are *exact*,
-since only single-pair solutions set them — decides 79% of multi-pair solutions regardless
-of fees. All 196 differences fall in the undetermined 21%, and none where the bracket
-forces an answer. Full numbers in
+other pairs' surplus. Comparing that interval against the exact score baselines decides 79%
+of multi-pair solutions regardless of fees. All 7 differences fall in the undetermined 21%,
+none where the bracket forces an answer, and all 7 go the same way: the recorded filter
+dropped a batch that the surplus filter keeps, always on a partially fillable order. Full
+numbers in
 [docs/winner-selection.md](docs/winner-selection.md#what-the-per-pair-proxy-costs).
 
 Expected explanation (a), partial fills, turned out **not** to contribute: with exact

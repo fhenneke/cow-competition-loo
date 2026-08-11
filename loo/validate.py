@@ -57,8 +57,10 @@ class FilterBracket:
     - `must_filter` — some pair misses its baseline even at its *upper* bound.
     - `undetermined` — both filter outcomes are consistent with some valid split.
 
-    Baselines are exact in score mode: only single-pair solutions set them, and for
-    those the pair's value is the solution's recorded score.
+    The baselines passed here must be the **score** baselines from `score_baselines`, not
+    whatever the configured proxy fed the filter. They are exact — only single-pair
+    solutions set a baseline, and for those the pair's value is the recorded score — which
+    is what makes the verdict a statement about the protocol rather than about our model.
     """
 
     verdict: str
@@ -129,16 +131,28 @@ class SolutionCheck:
     def filter_cause(self) -> str | None:
         """Why our filter decision differs from the DB's.
 
-        A decisive bracket binds *both* sides: the DB's decision came from the true
-        per-pair split, and both proxies produce a valid candidate split (each pair value
-        is at least its surplus and they sum to at most the score), so both must agree
-        with `must_keep` and `must_filter`. A difference is therefore only legitimate
-        where the bracket is `undetermined` — that is exactly the approximation PLAN.md §2
-        accepts. Anywhere else, one of the two is wrong and it needs fixing before M2.
+        Where the bracket is `undetermined` the true per-pair split decides the filter and
+        we cannot know it, so a difference is the approximation PLAN.md §2 accepts:
+        `proxy`.
+
+        Where the bracket is decisive it binds the DB, which filtered on the true split.
+        It also binds any *score-consistent* proxy (`scaled`, `raw`), whose pair values
+        are always a valid candidate split, so for those a decisive difference means one
+        of the two sides is wrong: `bug`.
+
+        The `surplus` proxy is not score-consistent — it compares surplus against surplus
+        baselines, which sit below the score baselines the protocol uses, so it keeps
+        solutions the score filter drops. That one direction is expected and is reported
+        as `model`. The reverse — dropping something every valid split keeps — remains
+        impossible either way, and is still a `bug`.
         """
         if not self.filter_differs:
             return None
-        return "proxy" if self.bracket == "undetermined" else "bug"
+        if self.bracket == "undetermined":
+            return "proxy"
+        if self.db_filtered and not self.our_filtered and self.bracket == "must_filter":
+            return "model"
+        return "bug"
 
 
 @dataclass
@@ -151,6 +165,8 @@ class AuctionReport:
     reference_observed: dict[str, int] = field(default_factory=dict)
     reference_db: dict[str, int] = field(default_factory=dict)
     baselines: dict[Pair, int] = field(default_factory=dict)
+    """Exact score baselines from `score_baselines`, used by the bracket. Not necessarily
+    what the configured filter compared against."""
     observed_pick_uids: frozenset[int] = frozenset()
     """Winners obtained by re-picking on the DB's own kept set — see `observed_pick`."""
     db_winner_uids: frozenset[int] = frozenset()
@@ -208,8 +224,9 @@ class AuctionReport:
         """The M1 exit criterion, per auction.
 
         Returns `None` when every difference has a named, verified cause, and otherwise
-        names what is still unaccounted for. The per-pair proxy of PLAN.md §2 is an
-        accepted cause; anything else is a bug to resolve before M2.
+        names what is still unaccounted for. Accepted causes are `proxy` (the unknowable
+        per-pair split of PLAN.md §2) and `model` (a surplus-based filter deliberately
+        answering a different question); a `bug` is not.
 
         The two "observed" checks are what make this a real gate rather than a
         restatement: they re-run the pick and the reference scores against the DB's own
@@ -302,6 +319,23 @@ def build_solutions(
     return valued, failures
 
 
+def score_baselines(valued: Iterable[ValuedBid]) -> dict[Pair, int]:
+    """Exact per-pair baselines: the best recorded score among single-pair solutions.
+
+    Deliberately independent of `--pair-proxy`. Step 3 only ever considers solutions
+    touching exactly one pair, and for those the pair's value *is* the solution's recorded
+    score — so these are the baselines the protocol itself used, whatever our filter is
+    configured to compare. `filter_bracket` needs them to say anything about the DB.
+    """
+    baselines: dict[Pair, int] = {}
+    for entry in valued:
+        if len(entry.valuation.pair_surplus) != 1:
+            continue
+        ((pair, _),) = entry.valuation.pair_surplus.items()
+        baselines[pair] = max(baselines.get(pair, 0), entry.bid.score)
+    return baselines
+
+
 def observed_ranking(bundle: AuctionBundle, solutions: Iterable[Solution]) -> Ranking:
     """Rebuild the `Ranking` the autopilot recorded, taking the DB at its word.
 
@@ -352,13 +386,14 @@ def check_auction(
     weth: str,
     *,
     mode: Mode = "score",
-    pair_proxy: PairProxy = "scaled",
+    pair_proxy: PairProxy = "surplus",
     max_winners: int = MAX_WINNERS,
 ) -> AuctionReport:
     """Reproduce one auction and diff it against the DB."""
     valued, failures = build_solutions(bundle, weth, mode=mode, pair_proxy=pair_proxy)
     solutions = [v.solution for v in valued]
     ranking = arbitrate(solutions, max_winners)
+    exact_baselines = score_baselines(valued)
 
     our_filtered = {s.solution_uid for s in ranking.filtered_out}
     # A solution we failed to value never reaches the ranking, so it shows up as
@@ -372,7 +407,7 @@ def check_auction(
             observed_ranking(bundle, solutions), max_winners
         ),
         reference_db=dict(bundle.reference_scores),
-        baselines=ranking.baselines,
+        baselines=exact_baselines,
         observed_pick_uids=observed_pick(bundle, solutions, max_winners),
         db_winner_uids=frozenset(b.uid for b in bundle.bids if b.is_winner),
     )
@@ -381,7 +416,7 @@ def check_auction(
     for bid in bundle.bids:
         entry = by_uid.get(bid.uid)
         bracket = (
-            filter_bracket(entry.valuation, bid.score, ranking.baselines)
+            filter_bracket(entry.valuation, bid.score, exact_baselines)
             if entry
             else FilterBracket("undetermined")
         )
@@ -420,8 +455,10 @@ class Summary:
     solutions: int = 0
     multi_pair_solutions: int = 0
     multi_pair_filter_mismatch: int = 0
-    """The honest cost of the per-pair proxy: single-pair solutions are exempt from the
-    filter and their pair value is exact, so only multi-pair solutions can be wrong."""
+    """Filter decisions differing from the DB. Single-pair solutions are exempt from the
+    filter entirely, so only multi-pair solutions can differ — which is what makes them
+    the right denominator. Split by `filter_causes` into unknowable (`proxy`), deliberate
+    (`model`) and defective (`bug`)."""
     valuation_failures: int = 0
     basis_counts: dict[str, int] = field(default_factory=dict)
     bracket_counts: dict[str, int] = field(default_factory=dict)

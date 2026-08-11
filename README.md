@@ -39,7 +39,7 @@ Useful flags:
 | `--cross-check-surplus` | also diff per-order surplus against the dbt model |
 | `--out report.json` | write the full report, including every disagreeing auction |
 | `--network` | defaults to `mainnet`; see `loo/db.py` for the rest |
-| `--pair-proxy {scaled,raw}` | how a multi-pair solution's score is split across pairs |
+| `--pair-proxy {surplus,scaled,raw}` | what the fairness filter compares per token pair |
 
 A ~2,700-auction day takes about five minutes.
 
@@ -63,22 +63,30 @@ uv run --extra dev pytest
 ## Reading a run
 
 ```
-winner set matches:         2654/2675
-filtered-out set matches:   2654/2675
+winner set matches:         2670/2675
+filtered-out set matches:   2668/2675
 reference scores (observed): 2675/2675
 pick on observed kept set:  2675/2675
 valuation failures:         0
-filter proxy error:         78/1905 multi-pair solutions (4.0945%)
+filter differs from DB:     7/1905 multi-pair solutions (0.3675%)
 multi-pair bracket:         must_filter=1465, must_keep=19, undetermined=421
-filter difference cause:    proxy=78
+filter difference cause:    proxy=7
 
 every difference has a named cause — M1 gate met.
 ```
 
-The two `observed` lines are the real checks: they hold the DB's own filter decisions
-fixed and re-run a single step of the algorithm, so no approximation is in their path.
-The other lines will differ from the DB, because the per-pair score split the fairness
-filter compares is not stored anywhere and has to be approximated. `bracket` bounds how
-much that can matter and `cause` says whether each difference is the approximation
-(`proxy`) or a real defect (`bug`) — see
-[PLAN.md §4.1](PLAN.md#41-m1-result).
+The two `observed` lines are the real checks. They hold the DB's own filter decisions fixed
+and re-run a single step of the algorithm — winner picking, then reference scores — so no
+approximation is in their path and both should be exact.
+
+The other lines can differ from the DB, because the fairness filter compares solutions
+**per token pair** and the per-pair split of a solution's score is not stored anywhere.
+`--pair-proxy` chooses what to compare instead; the default values every pair by user
+surplus on both sides of the comparison. `bracket` bounds how much the unknown split could
+possibly matter, and `cause` classifies each difference:
+
+- `proxy` — the split genuinely decides it and cannot be known
+- `model` — a deliberate consequence of filtering on surplus rather than score
+- `bug` — no valid split explains it; the run exits 2
+
+See [PLAN.md §4.1](PLAN.md#41-m1-result) for the full argument.

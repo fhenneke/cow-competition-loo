@@ -28,9 +28,11 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--end", required=True, help="exclusive, e.g. 2026-08-02")
     check.add_argument(
         "--pair-proxy",
-        default="scaled",
-        choices=["scaled", "raw"],
-        help="how a multi-pair solution's score is split across pairs (PLAN.md §2)",
+        default="surplus",
+        choices=["surplus", "scaled", "raw"],
+        help="what the fairness filter compares per token pair (PLAN.md §2): "
+        "surplus on both sides (default), the score split in surplus proportion, "
+        "or surplus against score baselines",
     )
     check.add_argument("--max-winners", type=int, default=MAX_WINNERS)
     check.add_argument("--limit", type=int, help="only the first N auctions in the window")
@@ -133,7 +135,7 @@ def report_summary(summary: validate.Summary, args) -> None:
         + ", ".join(f"{k}={v}" for k, v in sorted(summary.basis_counts.items()))
     )
     print(
-        f"filter proxy error:         "
+        f"filter differs from DB:     "
         f"{summary.multi_pair_filter_mismatch}/{summary.multi_pair_solutions} "
         f"multi-pair solutions ({summary.proxy_error_rate:.4%})"
     )

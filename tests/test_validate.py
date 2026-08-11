@@ -106,13 +106,17 @@ class TestFilterCause:
             == "bug"
         )
 
-    def test_difference_under_must_filter_is_a_bug(self):
+    def test_keeping_what_the_score_filter_drops_is_a_modelling_difference(self):
+        """The surplus proxy's one legitimate direction: surplus baselines sit below score
+        baselines, so it keeps batches the protocol's filter drops."""
         assert (
             check(
                 db_filtered=True, our_filtered=False, bracket="must_filter"
             ).filter_cause
-            == "bug"
+            == "model"
         )
+
+    def test_dropping_what_must_be_kept_is_a_bug_in_every_mode(self):
         assert (
             check(
                 db_filtered=False, our_filtered=True, bracket="must_filter"
@@ -223,6 +227,31 @@ class TestUnexplained:
         )
         assert report.filter_causes == {"proxy": 1}
         assert report.unexplained == "pick-differs-on-observed-kept-set"
+
+    def test_a_modelling_difference_is_explained(self):
+        report = AuctionReport(
+            auction_id=1,
+            n_solutions=1,
+            checks=[
+                check(db_filtered=True, our_filtered=False, bracket="must_filter")
+            ],
+            observed_pick_uids=frozenset({0}),
+            db_winner_uids=frozenset({0}),
+        )
+        assert report.filter_causes == {"model": 1}
+        assert report.unexplained is None
+
+    def test_a_bug_is_not_explained(self):
+        report = AuctionReport(
+            auction_id=1,
+            n_solutions=1,
+            checks=[
+                check(db_filtered=False, our_filtered=True, bracket="must_keep")
+            ],
+            observed_pick_uids=frozenset({0}),
+            db_winner_uids=frozenset({0}),
+        )
+        assert report.unexplained == "filter-decision-no-valid-split-explains"
 
     def test_valuation_failure_dominates(self):
         report = AuctionReport(
