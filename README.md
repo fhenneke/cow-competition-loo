@@ -4,9 +4,6 @@ Counterfactual analysis of the CoW Protocol solver competition: remove one solve
 past auctions, re-run winner selection, and measure the impact on user surplus, solver
 rewards and order coverage.
 
-Orientation: **[PLAN.md](PLAN.md)** for the work, **[docs/](docs/)** for the DB and
-protocol background.
-
 ## Setup
 
 `uv` handles the environment; there is nothing to install by hand.
@@ -19,12 +16,54 @@ ANALYTICS_DB_URL=user:password@host:port
 
 No scheme and no database name — the database is derived from `--network`.
 
-## Run
+## The full flow
 
-Four commands. `validate` reproduces the recorded competition and accounts for every
-difference — it is the gate the counterfactual rests on. `validate-rewards` does the same
-for the reward formula. `analyse` is the counterfactual itself. `compare` aggregates
-several `analyse` reports into the per-solver comparison table.
+Windows are date ranges, `--start` inclusive, `--end` exclusive; the three-day window
+below is ~7,700 mainnet auctions, and each `validate`/`analyse` run over it takes about
+five minutes.
+
+**1. Gates.** Reproduce the recorded competition and the recorded rewards before
+trusting anything counterfactual. Both must exit 0:
+
+```bash
+uv run loo validate --start 2026-08-01 --end 2026-08-04
+uv run loo validate-rewards --start 2026-08-01 --end 2026-08-04
+```
+
+**2. The counterfactual**, once per solver and outcome rule. Only `inherited` is
+required; `observed` and `assume-settled` supply the bounds around it:
+
+```bash
+for solver in Fractal Sector; do
+  for rule in inherited observed assume-settled; do
+    uv run loo analyse --solver "$solver" --start 2026-08-01 --end 2026-08-04 \
+        --outcome-rule "$rule" --out "out/$(echo $solver | tr 'A-Z' 'a-z')-$rule.json"
+  done
+done
+```
+
+**3. The comparison table** — seconds, it only reads the JSONs (plus one DB query for
+the USD columns):
+
+```bash
+uv run loo compare out/*.json
+```
+
+Add `--markdown --out out/comparison.md` for a GitHub table, or `--skip-usd` to run
+without a DB connection.
+
+**4. The notebook** — the same aggregation plus the concentration curve, per-auction
+distributions and rule-sensitivity table, from the same `out/*.json`:
+
+```bash
+uv run --extra notebook jupyter lab notebooks/analysis.ipynb
+```
+
+The measured result of exactly this flow is [PLAN.md §7.1](PLAN.md#71-m4-result).
+
+## The commands
+
+### analyse
 
 ```bash
 uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04
@@ -34,7 +73,18 @@ Removes one solver from every auction in the window, re-runs winner selection, a
 what users would have gained or lost. `--solver` takes a name or a submission address,
 matched exactly — `Arc` and `Arctic` are different solvers and both compete.
 
-### The outcome rule
+| flag | |
+| --- | --- |
+| `--outcome-rule` | `inherited` (default), `observed` or `assume-settled` — see below |
+| `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus |
+| `--limit N` | only the first N auctions — start here |
+| `--out report.json` | per-auction records, including both sides' reference scores and rewards |
+
+Exit code is 0 normally, 1 if the window has no auctions, 2 if any auction could not be
+valued, 4 if `--solver` did not resolve, 5 if the settlement source does not cover the
+window.
+
+#### The outcome rule
 
 A winner that never won for real never settled either, so the counterfactual has to decide
 what its orders do. That decision is worth several ETH — 14.9% of winning solutions never
@@ -61,24 +111,9 @@ exactly, to the atom, so the only on-chain input the pipeline has is the settlem
 status — and "settled" means landed **in time**, so the real surplus of late batches is
 reported as `of which merely late` rather than absorbed.
 
-```bash
-uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04 --outcome-rule observed
-```
+#### Rewards
 
-| flag | |
-| --- | --- |
-| `--outcome-rule` | `inherited` (default), `observed` or `assume-settled` — see above |
-| `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus |
-| `--limit N` | only the first N auctions — start here |
-| `--out report.json` | per-auction records, including both sides' reference scores and rewards |
-
-Exit code is 0 normally, 1 if the window has no auctions, 2 if any auction could not be
-valued, 4 if `--solver` did not resolve, 5 if the settlement source does not cover the
-window.
-
-### Rewards
-
-In score mode `analyse` reports solver rewards on both sides (M3), twice:
+In score mode `analyse` reports solver rewards on both sides, twice:
 
 - **Uncapped** — the mechanism's exact accounting. The removed solver's own reward
   drops out, and rivals' rewards grow because their reference scores fall without it.
@@ -97,7 +132,7 @@ Both deltas are converted native → COW at each auction's accounting-period rat
 the rate has been snapshotted. Rewards use the same outcome rule as surplus, so the two
 sides of one auction never disagree about which winners delivered.
 
-### Price sanity
+#### Price sanity
 
 Native prices in `auction_prices` are sometimes plain wrong — one token was priced
 ~15,300× too high for a whole window, fabricating 139 ETH scores on 0.80 ETH trades
@@ -108,38 +143,38 @@ from every statistic** — the report names the excluded auction ids (0.6% of th
 window, which carried 82% of Sector's Δsurplus, all fabricated).
 `--include-price-suspects` keeps them in instead; the ids are printed either way.
 
-### Compare
+### compare
 
 ```bash
-uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04 --out out/sector-inherited.json
 uv run loo compare out/*.json
 ```
 
-Aggregates `analyse --out` reports into the PLAN §7 comparison: one column per
-solver-window, medians and the largest auction's share beside every sum, the outcome
-rules as bounds around the `inherited` headline, and the caveats attached. Give every
-outcome-rule run of a solver-window together; a group without an `inherited` run is
-refused rather than silently led by another rule.
+Aggregates `analyse --out` reports into the comparison: one column per solver-window,
+medians and the largest auction's share beside every sum, the outcome rules as bounds
+around the `inherited` headline, and the caveats attached. Give every outcome-rule run
+of a solver-window together; a group without an `inherited` run is refused rather than
+silently led by another rule.
 
 USD columns are display-only conversions at each auction's own stablecoin-implied rate
 (the analytics DB has no USD table —
-[details](docs/analytics-db.md#no-usd-prices--stablecoin-native-prices-imply-the-rate));
-`--skip-usd` runs without a DB connection, `--markdown` renders a GitHub table, `--out`
-writes the rendering to a file. The same aggregation drives
-[notebooks/analysis.ipynb](notebooks/analysis.ipynb), which adds the concentration
-curve and per-auction distributions (`uv run --extra notebook jupyter lab`).
+[details](docs/analytics-db.md#no-usd-prices--stablecoin-native-prices-imply-the-rate)).
 
-### Validate
+| flag | |
+| --- | --- |
+| `--skip-usd` | no DB connection, no USD columns |
+| `--markdown` | render as a GitHub table |
+| `--out FILE` | also write the rendering to a file |
+
+### validate
 
 ```bash
 uv run loo validate --start 2026-08-01 --end 2026-08-02
 ```
 
-`--start` is inclusive, `--end` exclusive. Exit code is 0 when every difference has a
-named cause, 1 if the window has no auctions, 2 when something is unexplained, 3 on a bad
-cross-check window.
-
-Useful flags:
+Reproduces the recorded competition — winners, fairness filter, reference scores — and
+accounts for every difference. Exit code is 0 when every difference has a named cause,
+1 if the window has no auctions, 2 when something is unexplained, 3 on a bad
+cross-check window. How to read its output is [below](#reading-a-validate-run).
 
 | flag | |
 | --- | --- |
@@ -147,8 +182,6 @@ Useful flags:
 | `--cross-check-surplus` | also diff per-order surplus against the dbt model |
 | `--out report.json` | write the full report, including every disagreeing auction |
 | `--network` | defaults to `mainnet`; see `loo/db.py` for the rest |
-
-A ~2,700-auction day takes about five minutes.
 
 `--cross-check-surplus` needs `int_backend_data__proposed_solution_data`, which lags the
 raw tables by over a week. It fails with a clear message rather than checking nothing:
@@ -159,7 +192,7 @@ uv run python -c "from loo import db; c = db.connect('mainnet'); print(db.fetch(
 
 Everything else reads the staging tables and works up to the present.
 
-### Validate rewards
+### validate-rewards
 
 ```bash
 uv run loo validate-rewards --start 2026-08-01 --end 2026-08-04
@@ -178,11 +211,11 @@ empty window, 2 on a mismatch, 3 when the mart does not cover the window.
 uv run --extra dev pytest
 ```
 
-167 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
+168 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
 `loo/counterfactual.py`, `loo/rewards.py` and `loo/aggregate.py` take plain dataclasses
 and files and hold no connection.
 
-## Reading a run
+## Reading a validate run
 
 ```
 === 7745 auctions, 98669 solutions ===
@@ -214,3 +247,14 @@ split could possibly matter, and `cause` classifies each difference:
 - `bug` — no valid split explains it; the run exits 2
 
 See [PLAN.md §4.1](PLAN.md#41-m1-result) for the full argument.
+
+## Background
+
+- **[PLAN.md](PLAN.md)** — the milestones, every design decision (D1–D15) in one
+  table, and the measured results per milestone (§4.1, §5.1, §6.1, §7.1).
+- **[docs/analytics-db.md](docs/analytics-db.md)** — DB connection, tables, join keys,
+  coverage and lag, the wrong-native-price story, the USD rate source.
+- **[docs/winner-selection.md](docs/winner-selection.md)** — the algorithm, Rust source
+  map, score/surplus formulas.
+- **[docs/rewards.md](docs/rewards.md)** — reward and cap formulas, and why the cap is
+  hard counterfactually.

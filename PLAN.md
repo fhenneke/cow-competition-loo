@@ -596,8 +596,8 @@ with every table — the numbers are not supposed to travel without them.
 ```bash
 for solver in Fractal Sector; do
   for rule in inherited observed assume-settled; do
-    uv run loo analyse --solver $solver --start 2026-08-01 --end 2026-08-04 \
-        --outcome-rule $rule --out out/$solver-$rule.json
+    uv run loo analyse --solver "$solver" --start 2026-08-01 --end 2026-08-04 \
+        --outcome-rule "$rule" --out "out/$(echo $solver | tr 'A-Z' 'a-z')-$rule.json"
   done
 done
 uv run loo compare out/*.json --markdown
