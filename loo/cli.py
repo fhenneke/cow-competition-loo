@@ -1,6 +1,6 @@
 """Command line entry point.
 
-Three subcommands:
+Four subcommands:
 
 - `validate` (M1) reproduces the recorded competition over a date window and accounts for
   every difference. It is the gate the counterfactual rests on.
@@ -9,6 +9,8 @@ Three subcommands:
   its path, so it must match exactly.
 - `analyse` (M2+M3) removes one solver from those auctions, re-runs the competition and
   reports what users and the protocol would have lost or saved.
+- `compare` (M4) aggregates several `analyse --out` reports into the per-solver
+  comparison table, with medians beside the sums and USD conversion.
 """
 
 from __future__ import annotations
@@ -20,7 +22,8 @@ from dataclasses import asdict
 from decimal import Decimal
 from typing import NamedTuple
 
-from . import counterfactual, db, extract, rewards, validate
+from . import aggregate, counterfactual, db, extract, rewards, validate
+from .aggregate import cow_amount, eth, pct
 from .primitives import MAX_WINNERS, wrapped_native_token
 
 
@@ -106,6 +109,27 @@ def main(argv: list[str] | None = None) -> int:
         "--show", type=int, default=10, help="how many changed auctions to print"
     )
     analyse.set_defaults(func=run_analyse)
+
+    compare = sub.add_parser(
+        "compare",
+        help="aggregate analyse reports into the per-solver comparison table (M4)",
+    )
+    compare.add_argument(
+        "reports",
+        nargs="+",
+        help="JSON files written by `analyse --out`; give every outcome-rule run of a "
+        "solver-window together, and `inherited` must be among them",
+    )
+    compare.add_argument(
+        "--skip-usd",
+        action="store_true",
+        help="no DB connection; omit the USD conversion columns",
+    )
+    compare.add_argument(
+        "--markdown", action="store_true", help="render the table as GitHub markdown"
+    )
+    compare.add_argument("--out", help="also write the rendered comparison to a file")
+    compare.set_defaults(func=run_compare)
 
     args = parser.parse_args(argv)
     return args.func(args)
@@ -460,23 +484,62 @@ def run_analyse(args) -> int:
     return 2 if analysis.auctions_skipped else 0
 
 
-def eth(wei: int | Decimal, places: int = 6) -> str:
-    """Format native wei as a decimal string, by integer arithmetic only. Decimals
-    (the capped path) are truncated to whole wei first — display only."""
-    wei = int(wei)
-    sign = "-" if wei < 0 else ""
-    scaled = abs(wei) * 10**places // 10**18
-    return f"{sign}{scaled // 10**places}.{scaled % 10**places:0{places}d}"
+def run_compare(args) -> int:
+    """M4: the per-solver comparison table, from `analyse --out` files.
 
+    Pure post-processing of the reports; the only DB work is fetching the stablecoin
+    prices behind the USD columns, and `--skip-usd` removes even that.
+    """
+    try:
+        reports = [aggregate.load_report(path) for path in args.reports]
+        windows = aggregate.group_reports(reports)
+    except (ValueError, OSError, KeyError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 4
 
-def pct(part: int, whole: int) -> str:
-    return f"{part / whole:.1%}" if whole else "n/a"
+    usd_by_network: dict[str, aggregate.UsdContext] = {}
+    if not args.skip_usd:
+        # One rate query per network, over the union of every report's changed
+        # auctions — those are the only auctions that carry a non-zero delta.
+        by_network: dict[str, set[int]] = {}
+        for report in reports:
+            by_network.setdefault(report.network, set()).update(
+                move.auction_id for move in report.moves
+            )
+        for network, auction_ids in sorted(by_network.items()):
+            conn = db.connect(network)
+            try:
+                rates = extract.load_usd_rates(conn, sorted(auction_ids), network)
+            except KeyError as error:
+                # No curated stablecoins for this network — USD is display sugar, so
+                # say so and carry on rather than failing the comparison.
+                print(f"note: no USD rates for {network}: {error}", file=sys.stderr)
+                continue
+            finally:
+                conn.close()
+            context = aggregate.usd_context(rates)
+            if context is not None:
+                usd_by_network[network] = context
+                print(
+                    f"USD rates for {len(rates)} {network} auctions, window median "
+                    f"{aggregate.usd_amount(context.fallback)}/native",
+                    file=sys.stderr,
+                )
 
+    table = aggregate.comparison(windows, usd_by_network)
+    render = aggregate.render_markdown if args.markdown else aggregate.render_text
+    rendered = render(table)
 
-def cow_amount(wei: Decimal, places: int = 2) -> str:
-    """Format COW wei (a Decimal) as whole COW."""
-    quantum = Decimal(1).scaleb(-places)
-    return str((wei / Decimal(10**18)).quantize(quantum))
+    caveats = "\n".join(
+        f"{i}. {caveat}" for i, caveat in enumerate(aggregate.CAVEATS, 1)
+    )
+    output = f"{rendered}\n\ncaveats (PLAN.md section 7):\n{caveats}\n"
+    print(output)
+    if args.out:
+        with open(args.out, "w") as handle:
+            handle.write(output)
+        print(f"comparison written to {args.out}", file=sys.stderr)
+    return 0
 
 
 def report_analysis(

@@ -160,6 +160,32 @@ Two lessons on detection:
 The check needs both tokens' prices, so `PRICES_SQL` loads sell tokens too even though
 the valuation itself converts through the buy token only.
 
+## No USD prices — stablecoin native prices imply the rate
+
+The analytics DB has **no USD price table** (checked: no `dbt` table matches
+`%price%`/`%usd%`/`%rate%` beyond the native `auction_prices` and the COW→native
+accounting rates; the USD models in `dune_dbt` live on Dune, not in this Postgres).
+
+For display-only USD figures there is no need for one: `auction_prices` carries a
+native price for every token in the auction, so a major stablecoin's native price
+implies the rate, per auction, from the source every other number already uses:
+
+```
+usd_per_native = 10^(36 − decimals) / price(stablecoin)
+```
+
+(1 USD = `10^decimals` atoms = `10^decimals × price / 1e18` wei.) Measured over
+2026-08-01..04 on mainnet, the three reference stablecoins agree to ~0.1% — USDC
+1914.9, USDT 1916.9, DAI 1915.1 USD/ETH — and each is priced in essentially every
+auction (3,521 of 3,521 sampled). `loo.extract.load_usd_rates` takes the per-auction
+median across USDC/USDT/DAI so no single wrong price can set the rate (the
+[wrong-native-price](#native-prices-can-be-plain-wrong) lesson, applied to the one
+place a price has no counterparty in the same trade to cross-check against). The
+curated per-network token list is `loo.primitives.USD_REFERENCE_TOKENS`; networks
+without one fail loudly and the USD columns are skipped (D15).
+
+Display only: nothing on the valuation or reward path consumes a USD number.
+
 ## Coverage and lag
 
 - `int_backend_data__proposed_solution_data` starts at auction `12709602` and **lags the

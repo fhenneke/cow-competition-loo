@@ -8,6 +8,8 @@ what `encode(col, 'hex')` returns from the analytics DB.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 # `Address::repeat_byte(0xee)` — the sentinel for the native token.
 NATIVE_TOKEN = "ee" * 20
 
@@ -25,6 +27,21 @@ WRAPPED_NATIVE_TOKEN = {
     "sepolia": "fff9976782d46cc05630d1f6ebab18b2324d6b14",  # WETH
 }
 
+# USD reference tokens per network, address -> decimals. The analytics DB has no USD
+# price table, but `stg_backend_data__auction_prices` carries a native price for every
+# token in the auction — so a major stablecoin's own native price implies the USD rate,
+# per auction, from the same source every other number here already trusts. Measured on
+# the M1 window the three tokens below agree within ~0.1%, so a median across them is
+# robust to any one being off. Deliberately incomplete like WRAPPED_NATIVE_TOKEN:
+# an unverified stablecoin address would silently fabricate every USD figure.
+USD_REFERENCE_TOKENS: dict[str, dict[str, int]] = {
+    "mainnet": {
+        "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": 6,  # USDC
+        "dac17f958d2ee523a2206206994597c13d831ec7": 6,  # USDT
+        "6b175474e89094c44da98b954eedeac495271d0f": 18,  # DAI
+    },
+}
+
 # `crates/configs/src/autopilot/run_loop.rs:11`
 MAX_WINNERS = 20
 
@@ -40,6 +57,27 @@ def wrapped_native_token(network: str) -> str:
             f"no verified wrapped native token for network {network!r}; "
             f"add it to WRAPPED_NATIVE_TOKEN after checking the autopilot config"
         ) from None
+
+
+def usd_reference_tokens(network: str) -> dict[str, int]:
+    try:
+        return USD_REFERENCE_TOKENS[network]
+    except KeyError:
+        raise KeyError(
+            f"no verified USD reference tokens for network {network!r}; add the "
+            f"network's major stablecoins to USD_REFERENCE_TOKENS after verifying "
+            f"their addresses and decimals"
+        ) from None
+
+
+def usd_per_native(price: int, decimals: int) -> Decimal:
+    """USD per native token implied by a stablecoin's native price.
+
+    1 USD = `10**decimals` atoms, worth `10**decimals * price / 1e18` wei, so one
+    native token (1e18 wei) is `10**(36 - decimals) / price` USD. Display only —
+    nothing on the valuation path consumes this.
+    """
+    return Decimal(10) ** (36 - decimals) / Decimal(price)
 
 
 def as_erc20(token: str, weth: str) -> str:

@@ -21,9 +21,10 @@ No scheme and no database name — the database is derived from `--network`.
 
 ## Run
 
-Three commands. `validate` reproduces the recorded competition and accounts for every
+Four commands. `validate` reproduces the recorded competition and accounts for every
 difference — it is the gate the counterfactual rests on. `validate-rewards` does the same
-for the reward formula. `analyse` is the counterfactual itself.
+for the reward formula. `analyse` is the counterfactual itself. `compare` aggregates
+several `analyse` reports into the per-solver comparison table.
 
 ```bash
 uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04
@@ -49,8 +50,9 @@ settled and they carry half of all winning score — so the rule is explicit:
 - `assume-settled` — every winner settles on both sides, so failures are ignored entirely.
   Normally the upper bound.
 
-Report the default and quote the bound you care about; for Sector the three give 8.01, 2.89
-and 8.13 ETH. See [PLAN.md §5.1](PLAN.md#51-m2-result).
+Report the default and quote the bound you care about; for Sector the three give
++1.33, −3.79 and +1.44 ETH on the clean set — the lower bound is wider than the
+headline itself. See [PLAN.md §7.1](PLAN.md#71-m4-result).
 
 Two things the rule names do **not** vary, both measured facts
 ([details](docs/analytics-db.md#observed-outcomes-what-actually-settled)): executed
@@ -106,6 +108,27 @@ from every statistic** — the report names the excluded auction ids (0.6% of th
 window, which carried 82% of Sector's Δsurplus, all fabricated).
 `--include-price-suspects` keeps them in instead; the ids are printed either way.
 
+### Compare
+
+```bash
+uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04 --out out/sector-inherited.json
+uv run loo compare out/*.json
+```
+
+Aggregates `analyse --out` reports into the PLAN §7 comparison: one column per
+solver-window, medians and the largest auction's share beside every sum, the outcome
+rules as bounds around the `inherited` headline, and the caveats attached. Give every
+outcome-rule run of a solver-window together; a group without an `inherited` run is
+refused rather than silently led by another rule.
+
+USD columns are display-only conversions at each auction's own stablecoin-implied rate
+(the analytics DB has no USD table —
+[details](docs/analytics-db.md#no-usd-prices--stablecoin-native-prices-imply-the-rate));
+`--skip-usd` runs without a DB connection, `--markdown` renders a GitHub table, `--out`
+writes the rendering to a file. The same aggregation drives
+[notebooks/analysis.ipynb](notebooks/analysis.ipynb), which adds the concentration
+curve and per-auction distributions (`uv run --extra notebook jupyter lab`).
+
 ### Validate
 
 ```bash
@@ -155,9 +178,9 @@ empty window, 2 on a mismatch, 3 when the mart does not cover the window.
 uv run --extra dev pytest
 ```
 
-140 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
-`loo/counterfactual.py` and `loo/rewards.py` take plain dataclasses and hold no
-connection.
+167 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
+`loo/counterfactual.py`, `loo/rewards.py` and `loo/aggregate.py` take plain dataclasses
+and files and hold no connection.
 
 ## Reading a run
 
