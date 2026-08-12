@@ -15,8 +15,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterator, Sequence
 
+from decimal import Decimal
+
 from .db import as_int, chunked, fetch
 from .primitives import order_owner
+from .rewards import SolverReward, Win
 from .valuation import Order
 
 CHUNK_SIZE = 200
@@ -113,6 +116,9 @@ class AuctionBundle:
     """Ordered by `uid`, i.e. best-to-worst as the autopilot recorded them."""
     reference_scores: dict[str, int]
     """Ground truth from `stg_backend_data__reference_scores`, winners only."""
+    block_deadline: int = 0
+    """The auction's deadline block. Rewards are converted native -> COW at the
+    conversion rate of the accounting period this block falls in."""
 
 
 WINDOW_SQL = """
@@ -161,6 +167,7 @@ where pte.auction_id = any(%(ids)s)
 AUCTIONS_SQL = """
 select
     auction_id,
+    block_deadline,
     array(
         select encode(owner, 'hex')
         from unnest(surplus_capturing_jit_order_owners) as owner
@@ -169,17 +176,20 @@ from dbt.stg_backend_data__competition_auctions
 where auction_id = any(%(ids)s)
 """
 
-# Only buy-token prices are needed: `compute_order_score` converts through the buy
-# token for both order sides. Restricting to traded tokens keeps this from returning
-# every price in every auction (~900 rows each).
+# The valuation itself only needs buy-token prices — `compute_order_score` converts
+# through the buy token for both order sides — but the price-sanity check values each
+# trade through *both* tokens and compares, so sell tokens ride along. Restricting to
+# traded tokens keeps this from returning every price in every auction (~900 rows each).
 PRICES_SQL = """
 with traded as (
-    select distinct
-        pte.auction_id,
-        coalesce(o.buy_token, j.buy_token) as token
+    select distinct pte.auction_id, t.token
     from dbt.stg_backend_data__proposed_trade_executions pte
     left join dbt.stg_backend_data__orders o on o.uid = pte.order_uid
     left join dbt.stg_backend_data__jit_orders j on j.uid = pte.order_uid
+    cross join lateral (values
+        (coalesce(o.sell_token, j.sell_token)),
+        (coalesce(o.buy_token, j.buy_token))
+    ) as t (token)
     where pte.auction_id = any(%(ids)s)
 )
 select ap.auction_id, encode(ap.token, 'hex') as token, ap.price
@@ -214,6 +224,36 @@ select
     encode(tx_hash, 'hex')    as tx_hash
 from dbt.int_backend_data__winning_solutions_with_onchain_status
 where auction_id = any(%(ids)s)
+"""
+
+# The reward formula's own inputs, straight from the model `fct_solver_rewards_per_auction`
+# builds on: one row per winning solution with its score, settlement flag and caps. Used
+# by the M3 gate, which recomputes both rewards from these and compares against the mart —
+# so the only thing in the comparison's path is the formula transcription itself.
+REWARD_INPUTS_SQL = """
+select auction_id, solution_uid, encode(solver, 'hex') as solver, score,
+       is_settled_in_time, upper_reward_cap, lower_reward_cap, is_excluded
+from dbt.int_backend_data__solution_data
+where auction_id = any(%(ids)s)
+"""
+
+FCT_REWARDS_SQL = """
+select auction_id, encode(solver, 'hex') as solver,
+       competition_score, observed_score, reference_score, uncapped_reward,
+       upper_reward_cap, batch_reward_native
+from dbt.fct_solver_rewards_per_auction
+where auction_id = any(%(ids)s)
+"""
+
+# `int_accounting_period_data__conversion_rates` carries one row per block with the
+# COW->native conversion rate of the accounting period (Tuesday to Tuesday) the block's
+# time falls in. The rate is snapshotted from Dune only after the period is paid out, so
+# recent blocks have a row with a NULL rate — callers must treat missing-rate as "not
+# convertible yet", not as an error.
+CONVERSION_RATES_SQL = """
+select block_number, conversion_rate_cow_to_native
+from dbt.int_accounting_period_data__conversion_rates
+where block_number = any(%(blocks)s)
 """
 
 # `--solver` takes a name or an address. Names are matched **exactly** (case-insensitively):
@@ -348,6 +388,7 @@ def load_auctions(
                 native_prices=prices.get(auction_id, {}),
                 bids=bids,
                 reference_scores=references.get(auction_id, {}),
+                block_deadline=as_int(context["block_deadline"]),
             )
 
 
@@ -410,6 +451,134 @@ def load_settlement_outcomes(
                 tx_hash=row["tx_hash"],
             )
     return outcomes
+
+
+@dataclass(frozen=True)
+class SolutionCap:
+    """One recorded winning solution's cap inputs from `int_backend_data__solution_data`.
+
+    `upper` is that solution's contribution to its solver's upper reward cap —
+    `scaling_factor × realised protocol fees`, so genuinely fractional (`Decimal`) and
+    **0 for a batch that never settled**, since unrealised fees are no fees. `lower`
+    and `excluded` are auction-level facts that ride along on every row.
+    """
+
+    upper: Decimal
+    lower: int
+    excluded: bool
+
+
+@dataclass(frozen=True)
+class RewardInputs:
+    """Everything the reward formula consumes for one auction, from the DB's record."""
+
+    wins: tuple[Win, ...]
+    lower_cap: int
+    excluded: bool
+
+
+def load_reward_inputs(
+    conn, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
+) -> dict[int, RewardInputs]:
+    """The reward formula's inputs per auction — each winning solution's solver, score,
+    settled-in-time flag and cap — from the same model the dbt rewards mart reads."""
+    rows_by_auction: dict[int, list[dict]] = {}
+    for chunk in chunked(list(auction_ids), chunk_size):
+        for row in fetch(conn, REWARD_INPUTS_SQL, {"ids": list(chunk)}):
+            rows_by_auction.setdefault(row["auction_id"], []).append(row)
+
+    inputs: dict[int, RewardInputs] = {}
+    for auction_id, rows in rows_by_auction.items():
+        lower_caps = {as_int(r["lower_reward_cap"]) for r in rows}
+        excluded = {bool(r["is_excluded"]) for r in rows}
+        if len(lower_caps) != 1 or len(excluded) != 1:
+            # Both are auction-level facts; two values on one auction means the model
+            # changed shape and the comparison below would be against the wrong caps.
+            raise ValueError(
+                f"auction {auction_id}: inconsistent lower_reward_cap/is_excluded "
+                f"across its winning solutions"
+            )
+        inputs[auction_id] = RewardInputs(
+            wins=tuple(
+                Win(
+                    solver=r["solver"],
+                    score=as_int(r["score"]),
+                    settled=bool(r["is_settled_in_time"]),
+                    upper_cap=Decimal(r["upper_reward_cap"]),
+                )
+                for r in rows
+            ),
+            lower_cap=lower_caps.pop(),
+            excluded=excluded.pop(),
+        )
+    return inputs
+
+
+def load_solution_caps(
+    conn, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
+) -> dict[int, dict[int, SolutionCap]]:
+    """Cap inputs per recorded winning solution, keyed by auction then `solution_uid`.
+
+    Winners only, by construction of `int_backend_data__solution_data` — a
+    counterfactual replacement has no row here, which is exactly why its cap has to be
+    inherited from the slot it displaced."""
+    caps: dict[int, dict[int, SolutionCap]] = {}
+    for chunk in chunked(list(auction_ids), chunk_size):
+        for row in fetch(conn, REWARD_INPUTS_SQL, {"ids": list(chunk)}):
+            caps.setdefault(row["auction_id"], {})[row["solution_uid"]] = SolutionCap(
+                upper=Decimal(row["upper_reward_cap"]),
+                lower=as_int(row["lower_reward_cap"]),
+                excluded=bool(row["is_excluded"]),
+            )
+    return caps
+
+
+def load_reference_scores(
+    conn, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
+) -> dict[int, dict[str, int]]:
+    """Recorded reference scores keyed by auction then solver — winners only, by
+    construction of the table."""
+    references: dict[int, dict[str, int]] = {}
+    for chunk in chunked(list(auction_ids), chunk_size):
+        for row in fetch(conn, REFERENCE_SCORES_SQL, {"ids": list(chunk)}):
+            references.setdefault(row["auction_id"], {})[row["solver"]] = as_int(
+                row["reference_score"]
+            )
+    return references
+
+
+def load_fct_rewards(
+    conn, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
+) -> dict[int, dict[str, SolverReward]]:
+    """Ground truth from `fct_solver_rewards_per_auction`, keyed by auction then solver."""
+    rewards: dict[int, dict[str, SolverReward]] = {}
+    for chunk in chunked(list(auction_ids), chunk_size):
+        for row in fetch(conn, FCT_REWARDS_SQL, {"ids": list(chunk)}):
+            rewards.setdefault(row["auction_id"], {})[row["solver"]] = SolverReward(
+                solver=row["solver"],
+                competition_score=as_int(row["competition_score"]),
+                observed_score=as_int(row["observed_score"]),
+                reference_score=as_int(row["reference_score"]),
+                uncapped_reward=as_int(row["uncapped_reward"]),
+                upper_cap=Decimal(row["upper_reward_cap"]),
+                capped_reward=Decimal(row["batch_reward_native"]),
+            )
+    return rewards
+
+
+def load_conversion_rates(
+    conn, blocks: Sequence[int], chunk_size: int = CHUNK_SIZE
+) -> dict[int, Decimal | None]:
+    """COW->native conversion rate per block, `None` where the accounting period has
+    not been snapshotted yet. A block missing entirely also maps to `None`."""
+    rates: dict[int, Decimal | None] = {block: None for block in blocks}
+    for chunk in chunked(list(blocks), chunk_size):
+        for row in fetch(conn, CONVERSION_RATES_SQL, {"blocks": list(chunk)}):
+            rate = row["conversion_rate_cow_to_native"]
+            # The column is double precision; going through `str` keeps the value the
+            # DB displays rather than the binary expansion of the float.
+            rates[row["block_number"]] = Decimal(str(rate)) if rate is not None else None
+    return rates
 
 
 def solver_matches(conn, solver: str, start: str, end: str) -> list[SolverMatch]:

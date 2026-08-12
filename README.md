@@ -21,9 +21,9 @@ No scheme and no database name — the database is derived from `--network`.
 
 ## Run
 
-Two commands. `validate` reproduces the recorded competition and accounts for every
-difference — it is the gate the counterfactual rests on. `analyse` is the counterfactual
-itself.
+Three commands. `validate` reproduces the recorded competition and accounts for every
+difference — it is the gate the counterfactual rests on. `validate-rewards` does the same
+for the reward formula. `analyse` is the counterfactual itself.
 
 ```bash
 uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04
@@ -68,11 +68,43 @@ uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04 --outcome
 | `--outcome-rule` | `inherited` (default), `observed` or `assume-settled` — see above |
 | `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus |
 | `--limit N` | only the first N auctions — start here |
-| `--out report.json` | per-auction records, including both sides' reference scores |
+| `--out report.json` | per-auction records, including both sides' reference scores and rewards |
 
 Exit code is 0 normally, 1 if the window has no auctions, 2 if any auction could not be
 valued, 4 if `--solver` did not resolve, 5 if the settlement source does not cover the
 window.
+
+### Rewards
+
+In score mode `analyse` reports solver rewards on both sides (M3), twice:
+
+- **Uncapped** — the mechanism's exact accounting. The removed solver's own reward
+  drops out, and rivals' rewards grow because their reference scores fall without it.
+  Not a payout: a failed settlement's uncapped penalty is `-reference_score` against a
+  real floor of −0.01 ETH, and over the M1 window uncapped rewards sum to −410 ETH
+  against 0.75 ETH actually paid.
+- **Capped (estimate)** — the payout-scale answer, clamping each reward into the
+  recorded caps. A replacement winner inherits the `upper_reward_cap` of the recorded
+  winner whose token pairs it claims — realised fees follow the orders, and a reverted
+  slot's cap is 0 exactly where its settlement is a revert
+  ([details](docs/rewards.md#the-slot-inheritance-estimate-and-why-the-caps-cannot-be-skipped)).
+  A winner with nothing to inherit drops its auction from the capped aggregate rather
+  than being guessed at; the report counts those.
+
+Both deltas are converted native → COW at each auction's accounting-period rate where
+the rate has been snapshotted. Rewards use the same outcome rule as surplus, so the two
+sides of one auction never disagree about which winners delivered.
+
+### Price sanity
+
+Native prices in `auction_prices` are sometimes plain wrong — one token was priced
+~15,300× too high for a whole window, fabricating 139 ETH scores on 0.80 ETH trades
+([details](docs/analytics-db.md#native-prices-can-be-plain-wrong)). Every solution is
+therefore cross-checked by valuing its executed amounts through both tokens' prices,
+and an auction where the two sides of a trade disagree by more than 2× is **excluded
+from every statistic** — the report names the excluded auction ids (0.6% of the M1
+window, which carried 82% of Sector's Δsurplus, all fabricated).
+`--include-price-suspects` keeps them in instead; the ids are printed either way.
 
 ### Validate
 
@@ -104,14 +136,28 @@ uv run python -c "from loo import db; c = db.connect('mainnet'); print(db.fetch(
 
 Everything else reads the staging tables and works up to the present.
 
+### Validate rewards
+
+```bash
+uv run loo validate-rewards --start 2026-08-01 --end 2026-08-04
+```
+
+Recomputes every winning solver's uncapped *and* capped reward from the DB's own
+inputs — winning solutions, settlement flags, caps, reference scores — and diffs
+against `fct_solver_rewards_per_auction`, row by row. Unlike `validate` there is no
+accepted-difference category: nothing in this path is approximated, so anything but an
+exact match on every row exits non-zero. Exit code 0 when every row matches, 1 on an
+empty window, 2 on a mismatch, 3 when the mart does not cover the window.
+
 ## Tests
 
 ```bash
 uv run --extra dev pytest
 ```
 
-109 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py` and
-`loo/counterfactual.py` take plain dataclasses and hold no connection.
+140 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
+`loo/counterfactual.py` and `loo/rewards.py` take plain dataclasses and hold no
+connection.
 
 ## Reading a run
 
