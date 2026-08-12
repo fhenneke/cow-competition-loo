@@ -19,19 +19,17 @@ No scheme and no database name — the database is derived from `--network`.
 ## The full flow
 
 Windows are date ranges, `--start` inclusive, `--end` exclusive; the three-day window
-below is ~7,700 mainnet auctions, and each `validate`/`analyse` run over it takes about
-five minutes.
+below is ~7,700 mainnet auctions and each `analyse` run over it takes about five
+minutes.
 
-**1. Gates.** Reproduce the recorded competition and the recorded rewards before
-trusting anything counterfactual. Both must exit 0:
+**Signs:** every delta is **with-solver − without-solver**. Positive Δsurplus means
+users gained from the solver's presence, positive Δrewards means the protocol paid
+more because of it — a solver's value carries a plus sign by construction. The tables
+state this convention with the numbers.
 
-```bash
-uv run loo validate --start 2026-08-01 --end 2026-08-04
-uv run loo validate-rewards --start 2026-08-01 --end 2026-08-04
-```
-
-**2. The counterfactual**, once per solver and outcome rule. Only `inherited` is
-required; `observed` and `assume-settled` supply the bounds around it:
+**1. The counterfactual**, once per solver and outcome rule. Only `inherited` is
+required; `observed` and `assume-settled` supply the bounds around it (what the rules
+mean and why they exist: [below](#the-outcome-rule)):
 
 ```bash
 for solver in Fractal Sector; do
@@ -42,7 +40,7 @@ for solver in Fractal Sector; do
 done
 ```
 
-**3. The comparison table** — seconds, it only reads the JSONs (plus one DB query for
+**2. The comparison table** — seconds, it only reads the JSONs (plus one DB query for
 the USD columns):
 
 ```bash
@@ -52,14 +50,17 @@ uv run loo compare out/*.json
 Add `--markdown --out out/comparison.md` for a GitHub table, or `--skip-usd` to run
 without a DB connection.
 
-**4. The notebook** — the same aggregation plus the concentration curve, per-auction
-distributions and rule-sensitivity table, from the same `out/*.json`:
+**3. The notebook** — the same aggregation plus the concentration curve, per-auction
+distributions and the rule-sensitivity chart, from the same `out/*.json`:
 
 ```bash
 uv run --extra notebook jupyter lab notebooks/analysis.ipynb
 ```
 
 The measured result of exactly this flow is [PLAN.md §7.1](PLAN.md#71-m4-result).
+First time on a new window, network or code change? Run the
+[validation gates](#validating-the-implementation) first — the counterfactual is only
+as good as its reproduction of the recorded competition.
 
 ## The commands
 
@@ -88,7 +89,8 @@ window.
 
 A winner that never won for real never settled either, so the counterfactual has to decide
 what its orders do. That decision is worth several ETH — 14.9% of winning solutions never
-settled and they carry half of all winning score — so the rule is explicit:
+settled and they carry half of all winning score — so instead of hiding one assumption in
+the code, the rule is explicit and the flow runs all three:
 
 - `inherited` (**default**) — settlement belongs to the **slot**, not the solver. A
   replacement inherits the outcome of the recorded winner that held its token pairs, so a
@@ -100,9 +102,11 @@ settled and they carry half of all winning score — so the rule is explicit:
 - `assume-settled` — every winner settles on both sides, so failures are ignored entirely.
   Normally the upper bound.
 
-Report the default and quote the bound you care about; for Sector the three give
-+1.33, −3.79 and +1.44 ETH on the clean set — the lower bound is wider than the
-headline itself. See [PLAN.md §7.1](PLAN.md#71-m4-result).
+`compare` quantifies what the choice costs as its own statistic — the *rule spread*,
+the width of the [`observed`, `assume-settled`] bracket. Measured on the M1 window it
+is 2–4× the headline itself (for Sector: +1.33 ETH headline inside a [−3.79, +1.44]
+bracket), which is exactly why a single figure quoted without its rule would be a
+choice disguised as a result. See [PLAN.md §7.1](PLAN.md#71-m4-result).
 
 Two things the rule names do **not** vary, both measured facts
 ([details](docs/analytics-db.md#observed-outcomes-what-actually-settled)): executed
@@ -150,9 +154,10 @@ uv run loo compare out/*.json
 ```
 
 Aggregates `analyse --out` reports into the comparison: one column per solver-window,
-medians and the largest auction's share beside every sum, the outcome rules as bounds
-around the `inherited` headline, and the caveats attached. Give every outcome-rule run
-of a solver-window together; a group without an `inherited` run is refused rather than
+the outcome rules as bounds around the `inherited` headline with their spread
+quantified, medians, the sign split and the largest auction's share beside every sum,
+and the caveats and sign convention attached. Give every outcome-rule run of a
+solver-window together; a group without an `inherited` run is refused rather than
 silently led by another rule.
 
 USD columns are display-only conversions at each auction's own stablecoin-implied rate
@@ -165,16 +170,24 @@ USD columns are display-only conversions at each auction's own stablecoin-implie
 | `--markdown` | render as a GitHub table |
 | `--out FILE` | also write the rendering to a file |
 
-### validate
+## Validating the implementation
+
+Everything above trusts that the pipeline reproduces the recorded competition. That is
+not assumed — it is gated, and the gates are re-runnable. For using the analysis you
+never need these; run them when the code, the window's data shape, or the network is
+new, and before believing a surprising result:
 
 ```bash
-uv run loo validate --start 2026-08-01 --end 2026-08-02
+uv run loo validate --start 2026-08-01 --end 2026-08-04
+uv run loo validate-rewards --start 2026-08-01 --end 2026-08-04
 ```
+
+### validate
 
 Reproduces the recorded competition — winners, fairness filter, reference scores — and
 accounts for every difference. Exit code is 0 when every difference has a named cause,
 1 if the window has no auctions, 2 when something is unexplained, 3 on a bad
-cross-check window. How to read its output is [below](#reading-a-validate-run).
+cross-check window.
 
 | flag | |
 | --- | --- |
@@ -194,10 +207,6 @@ Everything else reads the staging tables and works up to the present.
 
 ### validate-rewards
 
-```bash
-uv run loo validate-rewards --start 2026-08-01 --end 2026-08-04
-```
-
 Recomputes every winning solver's uncapped *and* capped reward from the DB's own
 inputs — winning solutions, settlement flags, caps, reference scores — and diffs
 against `fct_solver_rewards_per_auction`, row by row. Unlike `validate` there is no
@@ -205,17 +214,7 @@ accepted-difference category: nothing in this path is approximated, so anything 
 exact match on every row exits non-zero. Exit code 0 when every row matches, 1 on an
 empty window, 2 on a mismatch, 3 when the mart does not cover the window.
 
-## Tests
-
-```bash
-uv run --extra dev pytest
-```
-
-168 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
-`loo/counterfactual.py`, `loo/rewards.py` and `loo/aggregate.py` take plain dataclasses
-and files and hold no connection.
-
-## Reading a validate run
+### Reading a validate run
 
 ```
 === 7745 auctions, 98669 solutions ===
@@ -247,6 +246,16 @@ split could possibly matter, and `cause` classifies each difference:
 - `bug` — no valid split explains it; the run exits 2
 
 See [PLAN.md §4.1](PLAN.md#41-m1-result) for the full argument.
+
+## Tests
+
+```bash
+uv run --extra dev pytest
+```
+
+170 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
+`loo/counterfactual.py`, `loo/rewards.py` and `loo/aggregate.py` take plain dataclasses
+and files and hold no connection.
 
 ## Background
 

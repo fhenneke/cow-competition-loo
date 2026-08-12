@@ -266,6 +266,13 @@ class TestComparison:
                 )
             ),
             load_report(write_report(tmp_path, "fo.json", payload(rule="observed"))),
+            load_report(
+                write_report(
+                    tmp_path,
+                    "fa.json",
+                    payload(rule="assume-settled", changed=[move(1, 3 * ONE)]),
+                )
+            ),
             load_report(write_report(tmp_path, "si.json", payload(solver="Sector"))),
         ]
         return comparison(group_reports(reports), **kwargs)
@@ -279,11 +286,34 @@ class TestComparison:
         assert rows["auctions analysed"][fractal] == "98 of 100 (2 price-suspect excluded)"
         assert rows["Δsurplus (inherited)"][fractal] == "+0.5000 ETH"
         assert rows["  observed"][fractal] == "+1.0000 ETH"
-        assert rows["  assume-settled"][fractal] == "not run"
+        assert rows["  assume-settled"][fractal] == "+3.0000 ETH"
         assert rows["net value (Δsurplus − capped Δrewards)"][fractal] == "-0.5000 ETH"
         assert "over 2 auctions" in rows["  median non-zero auction"][fractal]
         assert "auction 1" in rows["  largest single auction"][fractal]
         assert rows["orders saved"][fractal].startswith("40 (8.0% of 500")
+
+    def test_rule_spread_quantifies_the_settlement_assumption(self, tmp_path):
+        table = self.build(tmp_path)
+
+        rows = dict(table.rows)
+        fractal = list(table.columns).index("Fractal")
+        sector = list(table.columns).index("Sector")
+        # [observed, assume-settled] = [1, 3] ETH around a 0.5 ETH headline.
+        assert rows["  rule spread (upper − lower)"][fractal] == (
+            "+2.0000 ETH — 4.0× the headline"
+        )
+        assert rows["  rule spread (upper − lower)"][sector] == (
+            "needs observed and assume-settled runs"
+        )
+
+    def test_sign_split_keeps_direction_visible(self, tmp_path):
+        table = self.build(tmp_path)
+
+        rows = dict(table.rows)
+        fractal = list(table.columns).index("Fractal")
+        assert rows["  auctions moved + / −"][fractal] == (
+            "1 (+1.0000 ETH) / 1 (-0.5000 ETH)"
+        )
 
     def test_usd_columns_convert_per_auction(self, tmp_path):
         usd = usd_context({1: Decimal(2000), 2: Decimal(1000)})
@@ -332,7 +362,7 @@ class TestComparison:
             "n/a without a capped estimate"
         )
 
-    def test_renderers_carry_every_row_and_warning(self, tmp_path):
+    def test_renderers_carry_every_row_warning_and_the_convention(self, tmp_path):
         table = self.build(tmp_path)
 
         text = render_text(table)
@@ -341,6 +371,9 @@ class TestComparison:
             assert label.strip() in text
             assert label.strip() in markdown
         assert markdown.splitlines()[0].startswith("| |")
+        # The sign convention is part of the output, not something readers infer.
+        assert "with-solver minus without-solver" in text
+        assert "with-solver minus without-solver" in markdown
 
     def test_window_shown_only_when_windows_differ(self, tmp_path):
         reports = [

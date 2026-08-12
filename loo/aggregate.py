@@ -42,6 +42,14 @@ WEI = Decimal(10) ** 18
 HEADLINE_RULE = "inherited"
 BOUND_RULES = ("observed", "assume-settled")
 
+SIGN_CONVENTION = (
+    "every delta is with-solver minus without-solver — positive Δsurplus means users "
+    "gained from the solver's presence, positive Δrewards means the protocol paid more "
+    "because of it, so a solver's value carries a plus sign by construction"
+)
+"""Stated on every rendering rather than assumed: the same numbers under the equally
+sensible loo-minus-baseline convention would flip every sign."""
+
 CAVEATS = (
     "No behavioural response: rivals' bids are held fixed, and "
     "max_solutions_per_solver is applied before arbitration, so no suppressed rival "
@@ -421,7 +429,9 @@ def comparison(
     won = row("solver won")
     surplus = row("Δsurplus (inherited)")
     bounds = {rule: row(f"  {rule}") for rule in BOUND_RULES}
+    spread = row("  rule spread (upper − lower)")
     surplus_median = row("  median non-zero auction")
+    surplus_signs = row("  auctions moved + / −")
     surplus_whale = row("  largest single auction")
     rewards_uncapped = row("Δrewards uncapped")
     rewards_capped = row("Δrewards capped (estimate)")
@@ -454,6 +464,7 @@ def comparison(
         for rule, cells in bounds.items():
             bound = window.by_rule.get(rule)
             cells.append(_surplus_cell(bound, usd) if bound else "not run")
+        spread.append(_spread_cell(window))
 
         moved = distribution({m.auction_id: m.delta_surplus for m in report.moves})
         if moved.median_abs is not None:
@@ -461,8 +472,13 @@ def comparison(
             if usd:
                 cell += f" ({usd_amount(moved.median_abs * usd.fallback / WEI)})"
             surplus_median.append(f"{cell} over {moved.n_nonzero:,} auctions")
+            surplus_signs.append(
+                f"{moved.n_positive:,} ({signed_eth(moved.sum_positive)} ETH) / "
+                f"{moved.n_negative:,} ({signed_eth(moved.sum_negative)} ETH)"
+            )
         else:
             surplus_median.append("no auction moved")
+            surplus_signs.append("no auction moved")
         if moved.largest is not None:
             share = (
                 f" — {moved.largest_share:.0%} of the total"
@@ -518,6 +534,23 @@ def _rewards_cell(report: Report, usd: UsdContext | None, *, capped: bool) -> st
         parts.append(usd_amount(usd_total(deltas, usd)))
     detail = f" ({', '.join(parts)})" if parts else ""
     return f"{signed_eth(delta)} ETH{detail}"
+
+
+def _spread_cell(window: SolverWindow) -> str:
+    """How much the settlement assumption alone can move the headline: the width of
+    the [observed, assume-settled] bracket, and its size relative to the headline.
+    This is the cost of the one judgement call the counterfactual cannot avoid (D4) —
+    measured on the M1 window it is 2–4× the headline itself."""
+    lower = window.by_rule.get("observed")
+    upper = window.by_rule.get("assume-settled")
+    if lower is None or upper is None:
+        return "needs observed and assume-settled runs"
+    width = upper.delta_surplus - lower.delta_surplus
+    cell = f"{signed_eth(width)} ETH"
+    headline = window.headline.delta_surplus
+    if headline:
+        cell += f" — {abs(width) / abs(headline):.1f}× the headline"
+    return cell
 
 
 def _net_cell(report: Report, usd: UsdContext | None) -> str:
@@ -585,6 +618,7 @@ def render_text(table: Table) -> str:
             + "  "
             + "  ".join(cell.ljust(w) for cell, w in zip(cells, widths))
         )
+    lines.append(f"\nsigns: {SIGN_CONVENTION}")
     for warning in table.warnings:
         lines.append(f"\nWARNING: {warning}")
     return "\n".join(lines)
@@ -599,6 +633,7 @@ def render_markdown(table: Table) -> str:
         # label instead.
         shown = "&nbsp;&nbsp;" + label.strip() if label.startswith("  ") else label
         lines.append("| " + shown + " | " + " | ".join(cells) + " |")
+    lines.append(f"\n*Signs: {SIGN_CONVENTION}.*")
     for warning in table.warnings:
         lines.append(f"\n**Warning:** {warning}")
     return "\n".join(lines)

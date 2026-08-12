@@ -540,9 +540,13 @@ lives in those files and a comparison costs seconds rather than six 5-minute re-
 report whose totals disagree with its own auctions** (truncated, edited, or from an
 incompatible `analyse`). A comparison refuses to tabulate a solver-window that lacks
 an `inherited` run — the headline rule is a property of the method, not of whichever
-file happens to exist. The same module drives `notebooks/analysis.ipynb`
-(concentration curve, per-auction distribution, rule-sensitivity table); the CLI and
-the notebook render one `aggregate.comparison(...)` result.
+file happens to exist — and quantifies what running three rules buys as its own
+statistics: the *rule spread* (the [`observed`, `assume-settled`] bracket width,
+relative to the headline) and the per-auction sign split, with the sign convention
+(with-solver − without-solver) printed on every rendering. The same module drives
+`notebooks/analysis.ipynb` (concentration curve, per-auction distribution,
+rule-sensitivity chart); the CLI and the notebook render one
+`aggregate.comparison(...)` result.
 
 USD conversion is D15: per auction, at the rate implied by the auction's own
 stablecoin prices — the analytics DB has no USD table, and the three mainnet reference
@@ -605,7 +609,10 @@ uv run loo compare out/*.json --markdown
 
 Same 7,745 mainnet auctions as M1–M3, score mode, every statistic over the 7,701-auction
 clean set (D14). USD at each auction's stablecoin-implied rate, window median
-$1,863.76/ETH (D15). The table below is `compare`'s output verbatim:
+$1,863.76/ETH (D15). Signs follow the pipeline's one convention, stated on every
+rendering: **every delta is with-solver − without-solver**, so a solver's value
+carries a plus sign by construction (the loo − baseline convention would flip all of
+them). The table below is `compare`'s output verbatim:
 
 | | Fractal | Sector |
 | --- | --- | --- |
@@ -615,7 +622,9 @@ $1,863.76/ETH (D15). The table below is `compare`'s output verbatim:
 | Δsurplus (inherited) | +0.2631 ETH ($488.69) | +1.3259 ETH ($2,463.34) |
 | &nbsp;&nbsp;observed | -0.0348 ETH (-$64.08) | -3.7904 ETH (-$7,048.23) |
 | &nbsp;&nbsp;assume-settled | +0.5114 ETH ($949.92) | +1.4449 ETH ($2,684.29) |
+| &nbsp;&nbsp;rule spread (upper − lower) | +0.5463 ETH — 2.1× the headline | +5.2353 ETH — 3.9× the headline |
 | &nbsp;&nbsp;median non-zero auction | 0.000094 ETH ($0.18) over 750 auctions | 0.000058 ETH ($0.11) over 970 auctions |
+| &nbsp;&nbsp;auctions moved + / − | 750 (+0.2631 ETH) / 0 (0.0000 ETH) | 963 (+1.3262 ETH) / 7 (-0.0003 ETH) |
 | &nbsp;&nbsp;largest single auction | +0.0518 ETH — 20% of the total (auction 13509837) | +0.2595 ETH — 20% of the total (auction 13500787) |
 | Δrewards uncapped | -0.1784 ETH (-2951.69 COW, -$329.26) | -3.0783 ETH (-50921.50 COW, -$5,738.93) |
 | Δrewards capped (estimate) | -0.0187 ETH (-308.99 COW, -$34.46) | -0.0981 ETH (-1622.03 COW, -$184.29) |
@@ -640,9 +649,11 @@ Four findings:
   carrying the entire lower bound. The bracket is now [−3.79, +1.33, +1.44] for
   Sector and [−0.03, +0.26, +0.51] for Fractal: the `inherited`→`assume-settled` gap
   is small (+0.12 / +0.25), but the `observed` gap is wider than the headline itself.
-  That is caveat 2 measured: the lower bound is dominated by charging the removed
-  solver for its own reverts while crediting every replacement, exactly the asymmetry
-  the slot rule removes — quote it as a bound, never as the answer.
+  The table's *rule spread* row states this cost directly — the settlement assumption
+  alone can move the answer by 2.1× (Fractal) and 3.9× (Sector) the headline. That is
+  caveat 2 measured: the lower bound is dominated by charging the removed solver for
+  its own reverts while crediting every replacement, exactly the asymmetry the slot
+  rule removes — quote it as a bound, never as the answer.
 - **Even the clean set is whale-shaped, which is why the medians ride in the table.**
   The largest single auction is 20% of the headline for both solvers, and the median
   non-zero auction moves $0.18 (Fractal) / $0.11 (Sector) — five orders of magnitude
