@@ -1,10 +1,13 @@
 """Command line entry point.
 
-Two subcommands:
+Three subcommands:
 
 - `validate` (M1) reproduces the recorded competition over a date window and accounts for
   every difference. It is the gate the counterfactual rests on.
-- `analyse` (M2) removes one solver from those auctions, re-runs the competition and
+- `validate-rewards` (M3) recomputes every solver's uncapped reward from the DB's own
+  inputs and compares against `fct_solver_rewards_per_auction`. No approximation is in
+  its path, so it must match exactly.
+- `analyse` (M2+M3) removes one solver from those auctions, re-runs the competition and
   reports what users and the protocol would have lost or saved.
 """
 
@@ -14,8 +17,10 @@ import argparse
 import json
 import sys
 from dataclasses import asdict
+from decimal import Decimal
+from typing import NamedTuple
 
-from . import counterfactual, db, extract, validate
+from . import counterfactual, db, extract, rewards, validate
 from .primitives import MAX_WINNERS, wrapped_native_token
 
 
@@ -41,6 +46,22 @@ def main(argv: list[str] | None = None) -> int:
         "--show", type=int, default=20, help="how many mismatching auctions to print"
     )
     check.set_defaults(func=run_validate)
+
+    check_rewards = sub.add_parser(
+        "validate-rewards",
+        help="reproduce uncapped rewards from recorded inputs and diff against the mart",
+    )
+    check_rewards.add_argument("--network", default="mainnet")
+    check_rewards.add_argument("--start", required=True, help="inclusive, e.g. 2026-08-01")
+    check_rewards.add_argument("--end", required=True, help="exclusive, e.g. 2026-08-02")
+    check_rewards.add_argument(
+        "--limit", type=int, help="only the first N auctions in the window"
+    )
+    check_rewards.add_argument("--out", help="write the full report as JSON")
+    check_rewards.add_argument(
+        "--show", type=int, default=20, help="how many mismatching rows to print"
+    )
+    check_rewards.set_defaults(func=run_validate_rewards)
 
     analyse = sub.add_parser(
         "analyse", help="remove one solver, re-run the competition, and diff the outcomes"
@@ -138,6 +159,165 @@ def run_validate(args) -> int:
     return 0 if not summary.unexplained else 2
 
 
+def run_validate_rewards(args) -> int:
+    """The M3 gate: recorded winning solutions + recorded settlement flags + recorded
+    reference scores -> the reward formula -> compare with the dbt mart, row by row.
+
+    Nothing in this path is approximated — the inputs are the mart's own — so unlike
+    `validate` there is no accepted-difference category: anything but an exact match on
+    every row is a transcription bug or a data problem, and the run exits non-zero.
+    """
+    conn = db.connect(args.network)
+    try:
+        auction_ids = extract.auctions_in_window(conn, args.start, args.end)
+        if args.limit:
+            auction_ids = auction_ids[: args.limit]
+        print(
+            f"{len(auction_ids)} auctions in [{args.start}, {args.end}) on {args.network}",
+            file=sys.stderr,
+        )
+        if not auction_ids:
+            return 1
+
+        inputs = extract.load_reward_inputs(conn, auction_ids)
+        references = extract.load_reference_scores(conn, auction_ids)
+        fct = extract.load_fct_rewards(conn, auction_ids)
+        print(
+            f"{sum(len(v) for v in inputs.values())} winning solutions, "
+            f"{sum(len(v) for v in fct.values())} mart reward rows",
+            file=sys.stderr,
+        )
+    finally:
+        conn.close()
+
+    validation = rewards.RewardValidation()
+    try:
+        for auction_id in auction_ids:
+            wins = inputs.get(auction_id, [])
+            ours = (
+                rewards.uncapped_rewards(wins, references.get(auction_id, {}))
+                if wins
+                else {}
+            )
+            validation.check_auction(auction_id, ours, fct.get(auction_id, {}))
+    except rewards.MissingReferenceScoreError as error:
+        # A winner without a reference score means the inputs themselves are broken —
+        # comparing anything after that would attribute a data gap to the formula.
+        print(f"ERROR: auction {auction_id}: {error}", file=sys.stderr)
+        return 3
+
+    report_reward_validation(validation, args)
+
+    if args.out:
+        write_reward_validation_json(args.out, validation)
+        print(f"\nfull report written to {args.out}", file=sys.stderr)
+
+    if validation.mismatches:
+        return 2
+    if validation.auctions_missing_from_fct:
+        return 3
+    return 0
+
+
+def report_reward_validation(validation: rewards.RewardValidation, args) -> None:
+    print(
+        f"\n=== uncapped rewards vs fct_solver_rewards_per_auction: "
+        f"{validation.auctions} auctions, {validation.auctions_with_winners} with winners ==="
+    )
+    print(f"solver-reward rows:         {validation.rows}")
+    print(f"rows matching exactly:      {validation.rows_matched}/{validation.rows}")
+
+    if validation.auctions_missing_from_fct:
+        missing = validation.auctions_missing_from_fct
+        print(
+            f"\nauctions absent from the mart entirely: {len(missing)} — a coverage gap "
+            f"(the mart is incremental), not a formula disagreement. "
+            f"e.g. {missing[:5]}"
+        )
+
+    if not validation.mismatches:
+        if validation.gate_met:
+            print("\nevery row matches — M3 gate met.")
+        return
+
+    fields: dict[str, int] = {}
+    for mismatch in validation.mismatches:
+        for name in mismatch.differing_fields:
+            fields[name] = fields.get(name, 0) + 1
+    print(
+        f"\n{len(validation.mismatches)} rows disagree — M3 gate NOT met: "
+        + ", ".join(f"{k}={v}" for k, v in sorted(fields.items()))
+    )
+    for mismatch in validation.mismatches[: args.show]:
+        print(f"\nauction {mismatch.auction_id} solver {mismatch.solver[:8]}")
+        for name in (
+            "competition_score",
+            "observed_score",
+            "reference_score",
+            "uncapped_reward",
+        ):
+            mine = getattr(mismatch.ours, name) if mismatch.ours else None
+            theirs = getattr(mismatch.theirs, name) if mismatch.theirs else None
+            marker = "  <-" if mine != theirs else ""
+            print(f"    {name:<18} ours={mine}  db={theirs}{marker}")
+
+
+def write_reward_validation_json(path: str, validation: rewards.RewardValidation) -> None:
+    payload = {
+        "auctions": validation.auctions,
+        "auctions_with_winners": validation.auctions_with_winners,
+        "rows": validation.rows,
+        "rows_matched": validation.rows_matched,
+        "gate_met": validation.gate_met,
+        "auctions_missing_from_fct": validation.auctions_missing_from_fct,
+        "mismatches": [
+            {
+                "auction_id": m.auction_id,
+                "solver": m.solver,
+                "differing_fields": list(m.differing_fields),
+                "ours": {k: str(v) for k, v in asdict(m.ours).items()} if m.ours else None,
+                "theirs": (
+                    {k: str(v) for k, v in asdict(m.theirs).items()} if m.theirs else None
+                ),
+            }
+            for m in validation.mismatches
+        ],
+    }
+    with open(path, "w") as handle:
+        json.dump(payload, handle, indent=2, default=str)
+
+
+class CowConversion(NamedTuple):
+    """Δrewards converted native -> COW at each auction's accounting-period rate."""
+
+    cow_wei: Decimal
+    converted_native: int
+    """The part of the native delta the conversion covers."""
+    auctions_without_rate: int
+    native_without_rate: int
+    """Auctions whose accounting period has no snapshotted rate yet, and their native
+    delta — left unconverted rather than guessed at."""
+
+
+def convert_delta_rewards(conn, analysis: counterfactual.Analysis) -> CowConversion:
+    """Only auctions retained in `changed` can carry a non-zero reward delta: rewards
+    move only when the winner set or a reference score does, and both retain (D8)."""
+    moved = [r for r in analysis.changed if r.delta_rewards]
+    rates = extract.load_conversion_rates(
+        conn, sorted({r.block_deadline for r in moved})
+    )
+    cow_wei, converted, missing, missing_native = Decimal(0), 0, 0, 0
+    for result in moved:
+        rate = rates.get(result.block_deadline)
+        if rate:
+            cow_wei += Decimal(result.delta_rewards) / rate
+            converted += result.delta_rewards
+        else:
+            missing += 1
+            missing_native += result.delta_rewards
+    return CowConversion(cow_wei, converted, missing, missing_native)
+
+
 def run_analyse(args) -> int:
     weth = wrapped_native_token(args.network)
     conn = db.connect(args.network)
@@ -211,13 +391,17 @@ def run_analyse(args) -> int:
             # would understate baseline surplus in exactly the auctions it dropped.
             print(f"ERROR: {error}", file=sys.stderr)
             return 5
+
+        cow = None
+        if args.mode == "score":
+            cow = convert_delta_rewards(conn, analysis)
     finally:
         conn.close()
 
-    report_analysis(analysis, args)
+    report_analysis(analysis, args, cow)
 
     if args.out:
-        write_analysis_json(args.out, analysis, args)
+        write_analysis_json(args.out, analysis, args, cow)
         print(f"\nfull report written to {args.out}", file=sys.stderr)
 
     if not analysis.auctions_with_solver:
@@ -251,7 +435,15 @@ def pct(part: int, whole: int) -> str:
     return f"{part / whole:.1%}" if whole else "n/a"
 
 
-def report_analysis(analysis: counterfactual.Analysis, args) -> None:
+def cow_amount(wei: Decimal, places: int = 2) -> str:
+    """Format COW wei (a Decimal) as whole COW."""
+    quantum = Decimal(1).scaleb(-places)
+    return str((wei / Decimal(10**18)).quantize(quantum))
+
+
+def report_analysis(
+    analysis: counterfactual.Analysis, args, cow: CowConversion | None = None
+) -> None:
     total = analysis.auctions
     print(f"\n=== leave one out: {analysis.solver} ===")
     print(f"window          {args.start} .. {args.end} on {args.network}")
@@ -275,6 +467,50 @@ def report_analysis(analysis: counterfactual.Analysis, args) -> None:
     print(f"\nuser surplus with solver      {eth(analysis.surplus_base)} ETH")
     print(f"user surplus without solver   {eth(analysis.surplus_loo)} ETH")
     print(f"delta surplus                 {eth(analysis.delta_surplus)} ETH")
+
+    if analysis.mode == "score":
+        print(f"\nuncapped rewards with solver  {eth(analysis.rewards_base)} ETH")
+        print(f"uncapped rewards without      {eth(analysis.rewards_loo)} ETH")
+        delta_line = f"delta rewards                 {eth(analysis.delta_rewards)} ETH"
+        if cow is not None and not cow.auctions_without_rate:
+            delta_line += f"  = {cow_amount(cow.cow_wei)} COW"
+        print(delta_line)
+        print(
+            f"  the solver's own reward     {eth(analysis.removed_reward_base)} ETH"
+        )
+        print(
+            f"  rivals' rewards change      "
+            f"{eth(analysis.delta_rewards - analysis.removed_reward_base)} ETH"
+            "   <- negative: rivals earn more once the solver is gone"
+        )
+        print(f"  auctions where a reward moved {analysis.auctions_rewards_moved}")
+        print(
+            f"  negative uncapped rewards   "
+            f"{analysis.negative_rewards_base} base ({eth(analysis.negative_reward_sum_base)} ETH) / "
+            f"{analysis.negative_rewards_loo} loo ({eth(analysis.negative_reward_sum_loo)} ETH)"
+        )
+        print(
+            "  NOTE: uncapped only. The real payout is clamped into the reward caps, and\n"
+            "  a failed settlement's uncapped penalty is -reference_score against a real\n"
+            "  floor of -0.01 ETH — see docs/rewards.md#why-the-cap-is-hard-counterfactually."
+        )
+        if cow is not None and cow.auctions_without_rate:
+            print(
+                f"  COW conversion unavailable: {cow.auctions_without_rate} auctions "
+                f"({eth(cow.native_without_rate)} ETH of the delta) fall in an accounting "
+                f"period with no snapshotted rate yet"
+                + (
+                    f"; the other {eth(cow.converted_native)} ETH converts to "
+                    f"{cow_amount(cow.cow_wei)} COW"
+                    if cow.converted_native
+                    else ""
+                )
+            )
+    else:
+        print(
+            "\nrewards not computed: M3 is score mode only, and this run ranked on "
+            "user surplus"
+        )
 
     print(f"\nuser orders compared          {analysis.orders_compared}")
     print(
@@ -343,7 +579,12 @@ def print_counterfactual(result: counterfactual.AuctionCounterfactual) -> None:
     print(
         f"\nauction {result.auction_id}  {result.n_solutions} solutions  "
         f"delta={eth(result.delta_surplus)} ETH  "
-        f"winners {sorted(result.baseline_winner_uids)} -> "
+        + (
+            f"delta_rewards={eth(result.delta_rewards)} ETH  "
+            if result.baseline_rewards or result.loo_rewards
+            else ""
+        )
+        + f"winners {sorted(result.baseline_winner_uids)} -> "
         f"{sorted(result.loo_winner_uids)}"
         + (f"  un-filtered={sorted(result.un_filtered_uids)}" if result.filter_relaxed else "")
     )
@@ -359,7 +600,12 @@ def print_counterfactual(result: counterfactual.AuctionCounterfactual) -> None:
         )
 
 
-def write_analysis_json(path: str, analysis: counterfactual.Analysis, args) -> None:
+def write_analysis_json(
+    path: str,
+    analysis: counterfactual.Analysis,
+    args,
+    cow: CowConversion | None = None,
+) -> None:
     payload = {
         "solver": analysis.solver,
         "addresses": sorted(analysis.addresses),
@@ -381,6 +627,24 @@ def write_analysis_json(path: str, analysis: counterfactual.Analysis, args) -> N
         "surplus_base_wei": str(analysis.surplus_base),
         "surplus_loo_wei": str(analysis.surplus_loo),
         "delta_surplus_wei": str(analysis.delta_surplus),
+        "rewards_uncapped": analysis.mode == "score",
+        "rewards_base_wei": str(analysis.rewards_base),
+        "rewards_loo_wei": str(analysis.rewards_loo),
+        "delta_rewards_wei": str(analysis.delta_rewards),
+        "removed_reward_base_wei": str(analysis.removed_reward_base),
+        "auctions_rewards_moved": analysis.auctions_rewards_moved,
+        "negative_rewards_base": analysis.negative_rewards_base,
+        "negative_rewards_loo": analysis.negative_rewards_loo,
+        "negative_reward_sum_base_wei": str(analysis.negative_reward_sum_base),
+        "negative_reward_sum_loo_wei": str(analysis.negative_reward_sum_loo),
+        "delta_rewards_cow_wei": str(cow.cow_wei) if cow is not None else None,
+        "cow_converted_native_wei": str(cow.converted_native) if cow is not None else None,
+        "cow_auctions_without_rate": (
+            cow.auctions_without_rate if cow is not None else None
+        ),
+        "cow_native_without_rate_wei": (
+            str(cow.native_without_rate) if cow is not None else None
+        ),
         "orders_compared": analysis.orders_compared,
         "orders_only_with_solver": analysis.orders_only_with_solver,
         "orders_only_without_solver": analysis.orders_only_without_solver,
@@ -411,6 +675,15 @@ def write_analysis_json(path: str, analysis: counterfactual.Analysis, args) -> N
                 },
                 "loo_reference_scores": {
                     k: str(v) for k, v in r.loo_reference_scores.items()
+                },
+                "delta_rewards_wei": str(r.delta_rewards),
+                "baseline_rewards": {
+                    solver: {k: str(v) for k, v in asdict(reward).items()}
+                    for solver, reward in r.baseline_rewards.items()
+                },
+                "loo_rewards": {
+                    solver: {k: str(v) for k, v in asdict(reward).items()}
+                    for solver, reward in r.loo_rewards.items()
                 },
                 "solver_set_reference_for": sorted(r.solver_set_reference_for),
                 "un_filtered_uids": sorted(r.un_filtered_uids),

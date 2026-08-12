@@ -40,6 +40,9 @@ stays in the sections and docs each row links to; the milestone sections cite th
 | D8 | Retain an auction when **reference scores move**, not only when the winner set changes — rewards move on a reference score alone ([§5.1](#51-m2-result)) | winner-set-only retention — silently drops 43% of the auctions whose rewards move | `AuctionCounterfactual.anything_moved` | — |
 | D9 | `--solver` matches names **exactly** and removes **every** rotated address together ([traps](docs/analytics-db.md#resolving-a-solver-name)) | substring match — `Arc` ⊂ `Arctic`, both bid, two competitors silently removed | `extract.SOLVER_SQL`, `resolve_solver` | — |
 | D10 | Auctions the solver never bid in are **skipped but stay in the denominator**, so rates describe the window rather than the solver's own subset | rates over the solver's auctions only | `analyse_auction` early return, `Analysis.add` | — |
+| D11 | M3 stops at **uncapped** rewards and reports the negative-reward exposure next to every total, because the gap to capped payouts is first-order, not a refinement ([§6.1](#61-m3-result)) | caps — the upper cap needs the realised protocol fees of a settled batch, which a replacement winner does not have ([why](docs/rewards.md#why-the-cap-is-hard-counterfactually)) | `rewards.uncapped_rewards`, `Analysis.negative_*` | backfill fee policies per docs/rewards.md, then clamp |
+| D12 | The reward side consumes the **same per-solution settlement decision** as the surplus side, under whatever outcome rule is in force, so the two views of one auction cannot disagree about which winners delivered (D5 extended to M3) | reading `is_settled_in_time` again independently | `SideOutcomes.solution_executed` feeding `Win.settled` | — |
+| D13 | Δrewards converts native → COW **per auction**, at the accounting-period rate of its `block_deadline`; an unsnapshotted rate leaves the auction unconverted and reported, never guessed | one window-level rate — wrong whenever a window straddles a Tuesday period boundary | `cli.convert_delta_rewards` | — |
 
 ## 2. Two valuations, deliberately separate
 
@@ -86,6 +89,8 @@ tests/
   test_winner_selection.py
   test_valuation.py
   test_validate.py
+  test_counterfactual.py
+  test_rewards.py
 notebooks/analysis.ipynb
 ```
 
@@ -394,19 +399,93 @@ the uncapped reward, so keeping only the latter would have silently dropped 43% 
 auctions whose rewards actually move. Δsurplus is unaffected, so nothing in M2's own output
 would have shown it.
 
-## 6. M3 — rewards
+## 6. M3 — rewards — **done**
 
-Score mode only. Apply the formulas in [docs/rewards.md](docs/rewards.md) to the baseline
-and LOO winner sets:
+Score mode only. Results in [§6.1](#61-m3-result); what follows is what was built.
 
 1. Validate the baseline reproduction against `fct_solver_rewards_per_auction.uncapped_reward`
-   before computing anything counterfactual.
+   before computing anything counterfactual. **Done — `loo validate-rewards`**, which
+   recomputes every row from the DB's own inputs (winning solutions and settlement flags
+   from `int_backend_data__winning_solutions_with_onchain_status`, reference scores from
+   staging — the same models the mart reads). Nothing in that path is approximated, so
+   unlike M1 the gate is absolute: any row that is not an exact match exits non-zero.
 2. Counterfactual uncapped rewards from the LOO winner set and its recomputed reference
-   scores. `X`'s reward drops out entirely.
-3. `Δrewards = baseline_total − loo_total`; convert native → COW.
+   scores. `X`'s reward drops out entirely. **Done** — both sides computed in
+   `analyse_auction`, feeding each winner the same settlement decision as the surplus
+   side (D12), so `observed_score` follows the outcome rule.
+3. `Δrewards = baseline_total − loo_total`; convert native → COW. **Done** — converted
+   per auction at the accounting-period rate of its `block_deadline` (D13). Only
+   auctions retained in `changed` can carry a non-zero reward delta, which is what D8's
+   wider retention was for.
 4. Caps only if the protocol-fee estimate for replacement winners proves tractable — see
    [docs/rewards.md](docs/rewards.md#why-the-cap-is-hard-counterfactually). Uncapped is a
-   legitimate stopping point; say so in the output if you stop there.
+   legitimate stopping point; say so in the output if you stop there. **Stopped at
+   uncapped (D11), and the output says so** — with the negative-reward exposure printed
+   next to the totals, because §6.1 shows the gap to real payouts is first-order.
+
+### 6.1 M3 result
+
+```bash
+uv run loo validate-rewards --start 2026-08-01 --end 2026-08-04
+uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04
+```
+
+**Gate met, exactly:** over the same 7,745 mainnet auctions as M1, all **9,809 / 9,809**
+(auction, solver) reward rows recomputed from recorded inputs match
+`fct_solver_rewards_per_auction.uncapped_reward` to the wei. The whole window sits in one
+accounting period (2026-07-28 → 2026-08-04, rate 6.045134508635538e-05 COW→native), so
+the COW figures below are single-rate.
+
+Counterfactual, `inherited` outcome rule, uncapped:
+
+| | Fractal | Sector |
+| --- | --- | --- |
+| uncapped rewards with solver | −283.0310 ETH | −411.1515 ETH |
+| uncapped rewards without | −282.8497 ETH | −297.8702 ETH |
+| **Δrewards (uncapped)** | **−0.1813 ETH** (−2,999 COW) | **−113.2813 ETH** (−1,873,925 COW) |
+| the solver's own uncapped reward | +0.2099 ETH | +3.0277 ETH |
+| rivals' rewards change | −0.3911 ETH | −116.3089 ETH |
+| auctions where any reward moved | 1,278 | 1,798 |
+| negative reward rows, base / loo | 664 / 626 | 579 / 569 |
+| …their sums | −289.82 / −289.62 ETH | −426.10 / −392.20 ETH |
+
+Three findings, the first two of which decide how M4 may quote these numbers:
+
+- **Δrewards is negative for both solvers: in uncapped terms the protocol would pay
+  *more* without the solver, not less.** The removed solver's own reward is small — a
+  settled winner earns `winning − reference`, a thin margin — while every surviving
+  rival's reference score falls once the solver's solutions leave the without-`s` pick,
+  and rewards are `winning − min(winning, reference)`. Removing a competitor makes the
+  remaining competition look weaker, so the mechanism pays everyone else more. The
+  decomposition makes that explicit: Sector's own +3.03 ETH is dwarfed by rivals'
+  −116.31 ETH.
+- **Uncapped is not a payout estimate, and in this window the distance is the headline.**
+  The totals are penalty-dominated: an unsettled winner is charged `−reference_score`
+  uncapped against a real floor of −0.01 ETH, and 14.9% of winners never settled while
+  carrying half the winning score. Three consecutive whale auctions
+  (13498033/36/37, the same ~139 ETH order) carry **−108.34 of Sector's −113.28 ETH**:
+  in two of them the whale winner never settled and only its *penalty* moved with the
+  reference score Sector was setting (real payout delta under the floor: ≈ 0), and in
+  the third Sector's replacement would earn +81.31 ETH uncapped where the real payout
+  clamps to the fee-derived upper cap. Flooring penalties at mainnet's −0.01 ETH — the
+  one cap that needs no fee data — moves Sector's Δ from −113.28 to −79.43 ETH and
+  collapses the unchanged-winner-set share from −20.21 to −2.05 ETH; the rest is the
+  missing upper cap. So M4 must present Δrewards(uncapped) as a property of the
+  *mechanism's accounting*, never as money saved or spent, and any dollar claim needs
+  the caps (D11's revision path).
+- **D8 priced out:** rewards moved in 1,798 Sector auctions against 1,025 with a changed
+  win, and the changed-win-free auctions still carry −20.21 ETH of uncapped delta.
+  Retaining on winner-set change alone would have dropped 43% of the auctions whose
+  rewards move, and with them most of the penalty phantom that the floored diagnostic
+  exposes.
+
+Numbers above are the default rule; a replacement inheriting a reverted slot earns no
+`observed_score` (38 such replacements for Sector, 80 for Fractal), which is what keeps
+the reward and surplus sides of one auction consistent (D12). Other outcome rules were
+not run over the window in M3 — the cap distortion dominates the rule sensitivity here,
+and M4 can add them if a bound is wanted.
+
+Not built, deferred: capped rewards (D11), `notebooks/analysis.ipynb` (M4).
 
 ## 7. M4 — aggregation and write-up
 
@@ -441,3 +520,8 @@ State these caveats with the results:
    uncertainty about whether those batches would ever have landed.
 3. **Filter proxy** — the measured per-pair surplus proxy error from M1 step 5.
 4. **Quote rewards excluded** — no data on counterfactual quoting.
+5. **Rewards are uncapped** (D11) and M3 measured the gap to payouts as first-order:
+   penalties are unfloored (−reference_score against a real −0.01 ETH) and replacement
+   winners are uncrowned (+81 ETH uncapped on the window's whale against a fee-derived
+   cap). Quote Δrewards as mechanism accounting, not as money, and never net it against
+   Δsurplus without saying so — [§6.1](#61-m3-result).

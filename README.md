@@ -21,9 +21,9 @@ No scheme and no database name — the database is derived from `--network`.
 
 ## Run
 
-Two commands. `validate` reproduces the recorded competition and accounts for every
-difference — it is the gate the counterfactual rests on. `analyse` is the counterfactual
-itself.
+Three commands. `validate` reproduces the recorded competition and accounts for every
+difference — it is the gate the counterfactual rests on. `validate-rewards` does the same
+for the reward formula. `analyse` is the counterfactual itself.
 
 ```bash
 uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04
@@ -68,11 +68,27 @@ uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04 --outcome
 | `--outcome-rule` | `inherited` (default), `observed` or `assume-settled` — see above |
 | `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus |
 | `--limit N` | only the first N auctions — start here |
-| `--out report.json` | per-auction records, including both sides' reference scores |
+| `--out report.json` | per-auction records, including both sides' reference scores and rewards |
 
 Exit code is 0 normally, 1 if the window has no auctions, 2 if any auction could not be
 valued, 4 if `--solver` did not resolve, 5 if the settlement source does not cover the
 window.
+
+### Rewards
+
+In score mode `analyse` also reports **uncapped** solver rewards on both sides
+(M3): the removed solver's own reward drops out, and rivals' rewards grow because their
+reference scores fall without it. Δrewards is converted native → COW at each auction's
+accounting-period rate where the rate has been snapshotted.
+
+Uncapped is a deliberate stopping point: the real payout is clamped into the reward
+caps, and the upper cap needs the realised protocol fees of a settled batch — which a
+replacement winner does not have
+([why](docs/rewards.md#why-the-cap-is-hard-counterfactually)). The report carries the
+count and sum of negative uncapped rewards so the distance to the real clamped payout
+stays visible; a failed settlement's uncapped penalty is `-reference_score` against a
+real floor of −0.01 ETH. Rewards use the same outcome rule as surplus, so the two sides
+of one auction never disagree about which winners delivered.
 
 ### Validate
 
@@ -104,14 +120,28 @@ uv run python -c "from loo import db; c = db.connect('mainnet'); print(db.fetch(
 
 Everything else reads the staging tables and works up to the present.
 
+### Validate rewards
+
+```bash
+uv run loo validate-rewards --start 2026-08-01 --end 2026-08-04
+```
+
+Recomputes every winning solver's uncapped reward from the DB's own inputs — winning
+solutions, settlement flags, reference scores — and diffs against
+`fct_solver_rewards_per_auction`, row by row. Unlike `validate` there is no
+accepted-difference category: nothing in this path is approximated, so anything but an
+exact match on every row exits non-zero. Exit code 0 when every row matches, 1 on an
+empty window, 2 on a mismatch, 3 when the mart does not cover the window.
+
 ## Tests
 
 ```bash
 uv run --extra dev pytest
 ```
 
-109 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py` and
-`loo/counterfactual.py` take plain dataclasses and hold no connection.
+127 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
+`loo/counterfactual.py` and `loo/rewards.py` take plain dataclasses and hold no
+connection.
 
 ## Reading a run
 

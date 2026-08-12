@@ -20,6 +20,7 @@ from typing import Iterable, Literal, Mapping
 
 from .extract import AuctionBundle, Settlement
 from .primitives import MAX_WINNERS, Pair
+from .rewards import SolverReward, Win, uncapped_rewards
 from .valuation import Mode, ValuedBid, build_solutions
 from .winner_selection import (
     Ranking,
@@ -208,6 +209,11 @@ class SideOutcomes:
     replacements claiming a pair no recorded winner held, so there was nothing to inherit;
     under `observed` every replacement is one. Empty under `assume-settled`, which does not
     consult the record at all."""
+    solution_executed: dict[int, bool] = field(default_factory=dict)
+    """The per-winner settlement decision the orders above were given, by solution uid.
+    This is what the reward formula's `observed_score` consumes — keeping it here rather
+    than re-deriving it guarantees the surplus and reward sides of one auction can never
+    disagree about which winners delivered (D5)."""
 
 
 def side_outcomes(
@@ -239,6 +245,7 @@ def side_outcomes(
     replacements: set[int] = set()
     inherited_reverts: set[int] = set()
     orphans: set[int] = set()
+    solution_executed: dict[int, bool] = {}
     inherit = dict(inherit) if inherit else {}
 
     for entry in winners:
@@ -277,6 +284,8 @@ def side_outcomes(
             executed, observed = True, False
             orphans.add(uid)
 
+        solution_executed[uid] = executed
+
         for order in entry.bid.orders:
             if order.uid in outcomes:
                 raise AssertionError(
@@ -304,6 +313,7 @@ def side_outcomes(
         replacements=frozenset(replacements),
         inherited_reverts=frozenset(inherited_reverts),
         orphans=frozenset(orphans),
+        solution_executed=solution_executed,
     )
 
 
@@ -420,6 +430,16 @@ class AuctionCounterfactual:
     loo_reference_scores: dict[str, int] = field(default_factory=dict)
     solver_set_reference_for: frozenset[str] = frozenset()
     """Solvers whose baseline reference score the removed solver contributed to."""
+    baseline_rewards: dict[str, SolverReward] = field(default_factory=dict)
+    loo_rewards: dict[str, SolverReward] = field(default_factory=dict)
+    """Uncapped rewards per winning solver on each side (M3). Score mode only — in
+    surplus mode the totals are not scores, so the formula's quantities do not exist
+    and both dicts stay empty. The settlement decision inside `observed_score` is the
+    same one the order outcomes above were given, so the surplus and reward sides
+    always agree on which winners delivered (D5)."""
+    block_deadline: int = 0
+    """Deadline block, carried so Δrewards can be converted native -> COW at the
+    auction's own accounting-period rate."""
     un_filtered_uids: frozenset[int] = frozenset()
     un_filtered_winner_uids: frozenset[int] = frozenset()
     order_diffs: tuple[OrderDiff, ...] = ()
@@ -485,6 +505,23 @@ class AuctionCounterfactual:
     def surplus_loo(self) -> int:
         return sum(d.surplus_loo or 0 for d in self.order_diffs if d.contributes)
 
+    @property
+    def rewards_base(self) -> int:
+        return sum(r.uncapped_reward for r in self.baseline_rewards.values())
+
+    @property
+    def rewards_loo(self) -> int:
+        return sum(r.uncapped_reward for r in self.loo_rewards.values())
+
+    @property
+    def delta_rewards(self) -> int:
+        """Uncapped native rewards the protocol pays with the solver, minus without it.
+
+        Positive means the solver's presence costs the protocol money — the usual case,
+        since its own reward drops out and rivals' rewards *grow* without it (their
+        reference scores fall when its solutions leave the without-`s` pick)."""
+        return self.rewards_base - self.rewards_loo
+
 
 def analyse_auction(
     bundle: AuctionBundle,
@@ -514,6 +551,7 @@ def analyse_auction(
             solver_present=present,
             solver_won_db=bool(removed & {b.solver for b in bundle.bids if b.is_winner}),
             valuation_failures=tuple(sorted(failures.items())),
+            block_deadline=bundle.block_deadline,
         )
 
     solutions = [v.solution for v in valued]
@@ -547,6 +585,33 @@ def analyse_auction(
     )
 
     baseline_references = compute_reference_outcomes(baseline, max_winners)
+    baseline_reference_scores = {
+        solver: ref.score for solver, ref in baseline_references.items()
+    }
+    loo_reference_scores = compute_reference_scores(loo, max_winners)
+
+    # Rewards exist only in score mode: the formula's quantities are scores, and in
+    # surplus mode `total` is user surplus instead. The settled flag fed to
+    # `observed_score` is the same per-solution decision the order outcomes got, so
+    # both sides of one auction, and the surplus and reward views of it, are always
+    # consistent under whichever outcome rule is in force.
+    baseline_rewards: dict[str, SolverReward] = {}
+    loo_rewards: dict[str, SolverReward] = {}
+    if mode == "score":
+        baseline_rewards = uncapped_rewards(
+            [
+                Win(s.solver, s.total, base.solution_executed[s.solution_uid])
+                for s in baseline.winners
+            ],
+            baseline_reference_scores,
+        )
+        loo_rewards = uncapped_rewards(
+            [
+                Win(s.solver, s.total, loo_side.solution_executed[s.solution_uid])
+                for s in loo.winners
+            ],
+            loo_reference_scores,
+        )
 
     return AuctionCounterfactual(
         auction_id=bundle.auction_id,
@@ -558,13 +623,14 @@ def analyse_auction(
         loo_winner_uids=loo.winner_uids,
         baseline_winning_total=baseline.winning_score,
         loo_winning_total=loo.winning_score,
-        baseline_reference_scores={
-            solver: ref.score for solver, ref in baseline_references.items()
-        },
-        loo_reference_scores=compute_reference_scores(loo, max_winners),
+        baseline_reference_scores=baseline_reference_scores,
+        loo_reference_scores=loo_reference_scores,
         solver_set_reference_for=frozenset(
             solver for solver, ref in baseline_references.items() if ref.setters & removed
         ),
+        baseline_rewards=baseline_rewards,
+        loo_rewards=loo_rewards,
+        block_deadline=bundle.block_deadline,
         un_filtered_uids=relaxed,
         un_filtered_winner_uids=relaxed & loo.winner_uids,
         order_diffs=diff_outcomes(base.orders, loo_side.orders),
@@ -607,6 +673,28 @@ class Analysis:
 
     surplus_base: int = 0
     surplus_loo: int = 0
+
+    rewards_base: int = 0
+    rewards_loo: int = 0
+    """Uncapped native rewards summed over every winning solver of every arbitrated
+    auction — i.e. over the auctions the removed solver bid in, since the others cancel
+    identically and are skipped. Score mode only; zero in surplus mode."""
+    removed_reward_base: int = 0
+    """The removed solver's own share of `rewards_base`. The rest of the delta is the
+    change in rivals' rewards, which is usually negative — without the solver their
+    reference scores fall, so the protocol pays them more."""
+    auctions_rewards_moved: int = 0
+    """Auctions where any solver's uncapped reward differs between the sides. Wider
+    than `auctions_winner_set_changed` (D8): a reference score moving alone moves a
+    reward."""
+    negative_rewards_base: int = 0
+    negative_rewards_loo: int = 0
+    negative_reward_sum_base: int = 0
+    negative_reward_sum_loo: int = 0
+    """(count, native sum) of negative uncapped rewards on each side. The real payout
+    clamps these at `lower_reward_cap` (-0.01 ETH on mainnet), and the uncapped penalty
+    for a failed settlement is `-reference_score` — orders of magnitude larger. Reported
+    so the cost of stopping at uncapped rewards (PLAN §6 step 4) stays visible."""
 
     orders_compared: int = 0
     orders_only_with_solver: int = 0
@@ -654,6 +742,11 @@ class Analysis:
         """Positive means users were better off with the solver in the competition."""
         return self.surplus_base - self.surplus_loo
 
+    @property
+    def delta_rewards(self) -> int:
+        """Positive means the protocol pays more with the solver than without it."""
+        return self.rewards_base - self.rewards_loo
+
     def add(self, result: AuctionCounterfactual) -> None:
         self.auctions += 1
         if result.valuation_failures:
@@ -673,6 +766,22 @@ class Analysis:
         self.auctions_baseline_differs_from_db += not result.baseline_matches_db
         self.surplus_base += result.surplus_base
         self.surplus_loo += result.surplus_loo
+        self.rewards_base += result.rewards_base
+        self.rewards_loo += result.rewards_loo
+        self.removed_reward_base += sum(
+            r.uncapped_reward
+            for solver, r in result.baseline_rewards.items()
+            if solver in self.addresses
+        )
+        self.auctions_rewards_moved += result.baseline_rewards != result.loo_rewards
+        for reward in result.baseline_rewards.values():
+            if reward.uncapped_reward < 0:
+                self.negative_rewards_base += 1
+                self.negative_reward_sum_base += reward.uncapped_reward
+        for reward in result.loo_rewards.values():
+            if reward.uncapped_reward < 0:
+                self.negative_rewards_loo += 1
+                self.negative_reward_sum_loo += reward.uncapped_reward
         self.replacements_base += len(result.replacements_base)
         self.replacements_loo += len(result.replacements_loo)
         self.inherited_reverts_loo += len(result.inherited_reverts_loo)

@@ -26,8 +26,12 @@ uncapped_reward(s)   = winning_score
 
 When the solver settles in time, `observed_score = competition_score` and this reduces to
 `winning_score − min(winning_score, reference_score)` — the marginal value the solver added
-to the auction. Verified against `fct_solver_rewards_per_auction` on auction 13509862
-(two winners, both matching to the wei).
+to the auction. Verified exhaustively by `loo validate-rewards` over 2026-08-01..2026-08-04:
+all 9,809 (auction, solver) rows built from the window's 10,301 winning solutions match
+`fct_solver_rewards_per_auction.uncapped_reward` to the wei (`loo/rewards.py` is the
+transcription). Uncapped rewards are routinely negative — a solver that won and failed to
+settle is charged `−reference_score` uncapped, which only the lower cap turns into the
+real −0.01 ETH penalty — so uncapped sums must never be read as payouts.
 
 ```
 capped_reward(s) = 0                                   if auction is excluded
@@ -68,6 +72,18 @@ code produces directly. Start there.
 
 `dbt.int_accounting_period_data__conversion_rates` holds the per-accounting-period rate.
 `reward_config.reward_token_address` gives the COW token per network.
+
+Three facts about that table, measured on 2026-08-12:
+
+- The grain is **one row per block** (`block_number`, unique key and indexed — filter on
+  it, not on `block_time`), each carrying the `conversion_rate_cow_to_native` of the
+  accounting period (Tuesday 00:00 UTC to Tuesday 00:00 UTC) the block's time falls in.
+  Look rewards up at the auction's `block_deadline`.
+- `conversion_rate_cow_to_native` is **double precision**, not `numeric` — go through
+  `str()` when building a `Decimal`. `cow = native / rate`; the rate was ≈6.045e-05 for
+  the period covering 2026-08-01..04, i.e. one period spans the whole M1/M2 window.
+- The rate is snapshotted from Dune **after the period is paid out**, so recent blocks
+  have a row with a NULL rate. Treat a missing rate as "not convertible yet", never as 0.
 
 ## Out of scope
 
