@@ -69,9 +69,37 @@ Both are read-only references here. Do not modify them.
   `auction_id` range run for many minutes or hang. Always add a range or a `LIMIT`, and
   `set statement_timeout = '120s'` so a bad query fails instead of stalling. Note there is
   no `timeout` binary on this machine.
+- **Do not edit `loo/` while a run is in flight.** A full-window `analyse` or `validate`
+  takes ~5 minutes and each invocation re-imports from disk, so a background run that
+  started before an edit picks up half of it and dies on an `AttributeError`. Finish the
+  edit first, or wait — a lost run costs five minutes and reads like a data problem.
 
-## Committing
+## Committing and merging
 
-Commits are signed with a YubiKey and need a physical tap. Run `git commit` as a
-**background** command and ask for the tap in the very next message — see
-[.claude/hardware-key-signing.md](.claude/hardware-key-signing.md).
+Each milestone gets its own branch and lands on `main` as **one squashed commit** — not a
+fast-forward, not a merge commit. `main` is one commit per milestone, and the milestone
+branches are kept afterwards rather than deleted (`m1-extraction-baseline`,
+`m2-loo-counterfactual`).
+
+```bash
+git checkout main
+git merge --squash m<N>-<slug>      # stages everything, deliberately makes no commit
+```
+
+Then write one commit message covering the whole milestone. Check the squash carries the
+branch exactly with `git diff main m<N>-<slug>`, which must come back empty.
+
+Commits are signed with a YubiKey and need a physical tap, which makes the commit itself
+the fiddly part:
+
+- **Never bare `git commit`.** It opens an editor and the prepared message is lost. Use
+  `git commit -F -` with a heredoc.
+- Better, put it in a **re-runnable script** — a failed tap is then retried by running the
+  same script again, with no message to retype. Two rules: keep *staging out of it* (a
+  script that re-stages would undo its own commit on a second run), and guard the commit
+  with `git diff --cached --quiet` so a second run is a no-op instead of an empty commit.
+- Run it as a **background** command and ask for the tap in the **very next message, as the
+  entire message** — the signing prompt times out in ~15-25s and streaming a summary first
+  burns that window.
+
+Failure modes and full rationale: [.claude/hardware-key-signing.md](.claude/hardware-key-signing.md).

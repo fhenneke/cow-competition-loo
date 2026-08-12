@@ -12,7 +12,23 @@ The key is **not** loaded in `ssh-agent` (the agent only holds the plain ED25519
 auth key), so `git commit` invokes `ssh-keygen -Y sign`, which talks to the FIDO
 device directly. It requires **a button press on the YubiKey — no passphrase.**
 
-## The failure mode
+## Two failure modes, and telling them apart
+
+```
+Couldn't sign message: device not found?
+```
+
+The YubiKey is **not plugged in**. Nothing to retry until it is — say so and stop.
+
+```
+Couldn't sign message: incorrect passphrase supplied to decrypt private key?
+```
+
+The key *is* present and this is **a timeout, not a passphrase or PIN problem** — see
+below. Do not go looking for a PIN prompt or suggest the user enters one; just ask for
+the tap again, promptly.
+
+## The timeout in detail
 
 A signed commit run in the foreground from a tool call fails like this:
 
@@ -52,6 +68,35 @@ So:
 - Do not stage more work while a signature is pending.
 - A timeout is not a broken setup. The staged index is untouched, so just re-run
   the identical command and ask again.
+
+## Retry without retyping: a commit script
+
+Re-running "the identical command" means reproducing a long heredoc by hand every time.
+Write the message into a script instead and run *that*, so each retry is one call:
+
+```sh
+#!/bin/sh
+set -eu
+cd <repo>
+[ "$(git rev-parse --abbrev-ref HEAD)" = main ] || { echo "ABORT: not on main"; exit 1; }
+if git diff --cached --quiet; then
+    echo "Nothing staged — already committed?"; git log --oneline -1; exit 0
+fi
+git commit -F - <<'MSG'
+<the whole message, including the Co-Authored-By trailer>
+MSG
+git log --show-signature --oneline -1
+```
+
+Two rules make it safe to re-run blindly:
+
+- **No staging inside it.** Do `git add` / `git merge --squash` in a separate call. A
+  script that re-stages would undo its own commit the second time it runs — and a script
+  containing `git reset` could destroy the commit it just made.
+- **Guard on `git diff --cached --quiet`,** so a run after success is a no-op rather than
+  an empty commit or a duplicate.
+
+Keep it in the scratchpad, not the repo.
 
 Verify afterwards:
 
