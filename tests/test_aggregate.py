@@ -59,6 +59,7 @@ def payload(
         "start": "2026-08-01",
         "end": "2026-08-04",
         "mode": "score",
+        "sign_convention": "counterfactual-minus-actual",
         "settlement": rule,
         "price_suspects_excluded": True,
         "price_suspect_auctions": [900, 901],
@@ -159,6 +160,15 @@ class TestLoadReport:
         with pytest.raises(ValueError, match="delta_surplus"):
             load_report(path)
 
+    def test_rejects_a_report_from_the_old_sign_convention(self, tmp_path):
+        """Both sides of the totals check flip together when the convention changes,
+        so only an explicit marker can catch a stale report — silently tabulating one
+        would invert every sign it contributes."""
+        data = payload()
+        del data["sign_convention"]
+        with pytest.raises(ValueError, match="sign convention"):
+            load_report(write_report(tmp_path, "old.json", data))
+
     def test_rejects_capped_totals_that_disagree(self, tmp_path):
         data = payload()
         data["delta_rewards_capped_wei"] = "123456"
@@ -228,7 +238,9 @@ class TestGrouping:
     def test_groups_rules_of_one_solver_window(self, tmp_path):
         reports = [
             load_report(write_report(tmp_path, "a.json", payload(rule="inherited"))),
-            load_report(write_report(tmp_path, "b.json", payload(rule="observed"))),
+            load_report(
+                write_report(tmp_path, "b.json", payload(rule="assume-settled"))
+            ),
             load_report(
                 write_report(tmp_path, "c.json", payload(solver="Sector"))
             ),
@@ -238,11 +250,13 @@ class TestGrouping:
 
         assert {w.solver for w in windows} == {"Fractal", "Sector"}
         fractal = next(w for w in windows if w.solver == "Fractal")
-        assert set(fractal.by_rule) == {"inherited", "observed"}
+        assert set(fractal.by_rule) == {"inherited", "assume-settled"}
         assert fractal.headline.outcome_rule == "inherited"
 
     def test_headline_rule_is_required(self, tmp_path):
-        report = load_report(write_report(tmp_path, "a.json", payload(rule="observed")))
+        report = load_report(
+            write_report(tmp_path, "a.json", payload(rule="assume-settled"))
+        )
         with pytest.raises(ValueError, match="inherited"):
             group_reports([report])
 
@@ -265,7 +279,6 @@ class TestComparison:
                     payload(changed=[move(1, ONE, 2 * ONE, str(ONE)), move(2, -ONE // 2)]),
                 )
             ),
-            load_report(write_report(tmp_path, "fo.json", payload(rule="observed"))),
             load_report(
                 write_report(
                     tmp_path,
@@ -283,27 +296,16 @@ class TestComparison:
         assert set(table.columns) == {"Fractal", "Sector"}
         rows = dict(table.rows)
         fractal = list(table.columns).index("Fractal")
+        sector = list(table.columns).index("Sector")
         assert rows["auctions analysed"][fractal] == "98 of 100 (2 price-suspect excluded)"
         assert rows["Δsurplus (inherited)"][fractal] == "+0.5000 ETH"
-        assert rows["  observed"][fractal] == "+1.0000 ETH"
         assert rows["  assume-settled"][fractal] == "+3.0000 ETH"
-        assert rows["net value (Δsurplus − capped Δrewards)"][fractal] == "-0.5000 ETH"
+        assert rows["  assume-settled"][sector] == "not run"
+        assert rows["net change (Δsurplus − capped Δrewards)"][fractal] == "-0.5000 ETH"
         assert "over 2 auctions" in rows["  median non-zero auction"][fractal]
         assert "auction 1" in rows["  largest single auction"][fractal]
-        assert rows["orders saved"][fractal].startswith("40 (8.0% of 500")
-
-    def test_rule_spread_quantifies_the_settlement_assumption(self, tmp_path):
-        table = self.build(tmp_path)
-
-        rows = dict(table.rows)
-        fractal = list(table.columns).index("Fractal")
-        sector = list(table.columns).index("Sector")
-        # [observed, assume-settled] = [1, 3] ETH around a 0.5 ETH headline.
-        assert rows["  rule spread (upper − lower)"][fractal] == (
-            "+2.0000 ETH — 4.0× the headline"
-        )
-        assert rows["  rule spread (upper − lower)"][sector] == (
-            "needs observed and assume-settled runs"
+        assert rows["orders executed only with the solver"][fractal].startswith(
+            "40 (8.0% of 500"
         )
 
     def test_sign_split_keeps_direction_visible(self, tmp_path):
@@ -358,7 +360,7 @@ class TestComparison:
 
         rows = dict(table.rows)
         assert rows["Δrewards uncapped"][0] == "not computed (surplus mode)"
-        assert rows["net value (Δsurplus − capped Δrewards)"][0] == (
+        assert rows["net change (Δsurplus − capped Δrewards)"][0] == (
             "n/a without a capped estimate"
         )
 
@@ -372,8 +374,8 @@ class TestComparison:
             assert label.strip() in markdown
         assert markdown.splitlines()[0].startswith("| |")
         # The sign convention is part of the output, not something readers infer.
-        assert "with-solver minus without-solver" in text
-        assert "with-solver minus without-solver" in markdown
+        assert "counterfactual minus actual" in text
+        assert "counterfactual minus actual" in markdown
 
     def test_window_shown_only_when_windows_differ(self, tmp_path):
         reports = [

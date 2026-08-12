@@ -85,12 +85,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     analyse.add_argument(
         "--outcome-rule",
-        choices=("inherited", "observed", "assume-settled"),
+        choices=("inherited", "assume-settled"),
         default="inherited",
         help=(
-            "what a replacement winner is taken to do: inherit the settlement of the slot "
-            "it displaced (default), assume it settles (pessimistic bound), or assume "
-            "every winner on both sides settles (optimistic bound). See PLAN.md section 5"
+            "the settlement scenario: a replacement winner inherits the outcome of the "
+            "slot it displaced (default), or every winner on both sides is assumed to "
+            "settle in time. See PLAN.md section 5"
         ),
     )
     analyse.add_argument(
@@ -582,7 +582,10 @@ def report_analysis(
 
     print(f"\nuser surplus with solver      {eth(analysis.surplus_base)} ETH")
     print(f"user surplus without solver   {eth(analysis.surplus_loo)} ETH")
-    print(f"delta surplus                 {eth(analysis.delta_surplus)} ETH")
+    print(
+        f"delta surplus                 {eth(analysis.delta_surplus)} ETH"
+        "   <- every delta is counterfactual minus actual"
+    )
 
     if analysis.mode == "score":
         print(f"\nuncapped rewards with solver  {eth(analysis.rewards_base)} ETH")
@@ -596,8 +599,8 @@ def report_analysis(
         )
         print(
             f"  rivals' rewards change      "
-            f"{eth(analysis.delta_rewards - analysis.removed_reward_base)} ETH"
-            "   <- negative means rivals earn more once the solver is gone"
+            f"{eth(analysis.delta_rewards + analysis.removed_reward_base)} ETH"
+            "   <- positive means rivals earn more once the solver is gone"
         )
         print(f"  auctions where a reward moved {analysis.auctions_rewards_moved}")
         print(
@@ -671,13 +674,6 @@ def report_analysis(
     )
     print(f"JIT orders only with solver   {analysis.jit_orders_only_with_solver}")
     print(f"JIT orders only without       {analysis.jit_orders_only_without_solver}")
-    if analysis.outcome_rule == "observed" and analysis.orders_unsettled_base:
-        print(
-            "\nNOTE: under --outcome-rule observed the baseline is charged for its own\n"
-            "settlement failures while every counterfactual replacement is assumed to\n"
-            "settle, so this delta is a lower bound. --outcome-rule inherited (the default)\n"
-            "hands a replacement the settlement of the slot it displaced instead."
-        )
 
     print("\nwinners that never won for real, so nothing was recorded about them:")
     print(
@@ -753,6 +749,7 @@ def write_analysis_json(
         "start": args.start,
         "end": args.end,
         "mode": analysis.mode,
+        "sign_convention": aggregate.SIGN_CONVENTION_ID,
         "settlement": analysis.outcome_rule,
         "outcome_rule": counterfactual.OUTCOME_RULE[analysis.outcome_rule],
         "auctions": analysis.auctions,

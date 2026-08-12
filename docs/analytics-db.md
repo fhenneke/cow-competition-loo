@@ -348,8 +348,8 @@ largest single unsettled winner scored 143.6 ETH. So a counterfactual that assum
 settle roughly doubles the surplus on both sides of its comparison, and how it treats a
 *replacement* winner — for which no settlement was ever recorded — moves the headline by
 several ETH. The leave-one-out analysis therefore attaches settlement to the token pair
-rather than to the solver, and reports two bounds either side of it
-([PLAN.md §5](../PLAN.md#5-m2--loo-ranking-and-surplus-deltas--done)).
+rather than to the solver, with everything-lands-in-time as the one alternative
+scenario ([PLAN.md §5](../PLAN.md#5-m2--loo-ranking-and-surplus-deltas--done), D4).
 
 ### A settled proposal is exact — the only divergence is settling at all
 

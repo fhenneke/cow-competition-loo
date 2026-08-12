@@ -22,18 +22,19 @@ Windows are date ranges, `--start` inclusive, `--end` exclusive; the three-day w
 below is ~7,700 mainnet auctions and each `analyse` run over it takes about five
 minutes.
 
-**Signs:** every delta is **with-solver − without-solver**. Positive Δsurplus means
-users gained from the solver's presence, positive Δrewards means the protocol paid
-more because of it — a solver's value carries a plus sign by construction. The tables
-state this convention with the numbers.
+**Signs:** every delta is **counterfactual − actual** (without-solver minus
+with-solver), so the numbers read directly as what the removal scenario changes:
+negative Δsurplus means users would have received less, positive Δrewards means the
+protocol would have paid more. How a change is turned into a *value of the solver* is
+deliberately left to the reader. The tables state this convention with the numbers.
 
 **1. The counterfactual**, once per solver and outcome rule. Only `inherited` is
-required; `observed` and `assume-settled` supply the bounds around it (what the rules
-mean and why they exist: [below](#the-outcome-rule)):
+required; `assume-settled` is the optional everything-lands-in-time scenario (what the
+rules mean: [below](#the-outcome-rule)):
 
 ```bash
 for solver in Fractal Sector; do
-  for rule in inherited observed assume-settled; do
+  for rule in inherited assume-settled; do
     uv run loo analyse --solver "$solver" --start 2026-08-01 --end 2026-08-04 \
         --outcome-rule "$rule" --out "out/$(echo $solver | tr 'A-Z' 'a-z')-$rule.json"
   done
@@ -76,7 +77,7 @@ matched exactly — `Arc` and `Arctic` are different solvers and both compete.
 
 | flag | |
 | --- | --- |
-| `--outcome-rule` | `inherited` (default), `observed` or `assume-settled` — see below |
+| `--outcome-rule` | `inherited` (default) or `assume-settled` — see below |
 | `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus |
 | `--limit N` | only the first N auctions — start here |
 | `--out report.json` | per-auction records, including both sides' reference scores and rewards |
@@ -87,26 +88,25 @@ window.
 
 #### The outcome rule
 
-A winner that never won for real never settled either, so the counterfactual has to decide
-what its orders do. That decision is worth several ETH — 14.9% of winning solutions never
-settled and they carry half of all winning score — so instead of hiding one assumption in
-the code, the rule is explicit and the flow runs all three:
+A winner that never won for real never settled either, so the counterfactual has to
+decide what its orders do. That decision is not a footnote — 14.9% of winning solutions
+never settled and they carry half of all winning score — so instead of hiding one
+assumption in the code, the rule is an explicit choice between the two defensible
+scenarios:
 
 - `inherited` (**default**) — settlement belongs to the **slot**, not the solver. A
   replacement inherits the outcome of the recorded winner that held its token pairs, so a
   batch that really reverted stays reverted whoever replaces it. Settlement cancels out of
-  Δsurplus and what is left is the competition's *decision*.
-- `observed` — settlement belongs to the **solution**. A replacement has no record, so it is
-  assumed to settle. This charges the baseline for real reverts while assuming the
-  counterfactual never reverts, so it is a **lower bound**, provably below `inherited`.
-- `assume-settled` — every winner settles on both sides, so failures are ignored entirely.
-  Normally the upper bound.
+  Δsurplus and what is left is the competition's *decision*. This is the one scenario
+  grounded in the record.
+- `assume-settled` — everything lands in time, on both sides, so the comparison is about
+  proposals alone and settlement risk is excluded entirely.
 
-`compare` quantifies what the choice costs as its own statistic — the *rule spread*,
-the width of the [`observed`, `assume-settled`] bracket. Measured on the M1 window it
-is 2–4× the headline itself (for Sector: +1.33 ETH headline inside a [−3.79, +1.44]
-bracket), which is exactly why a single figure quoted without its rule would be a
-choice disguised as a result. See [PLAN.md §7.1](PLAN.md#71-m4-result).
+A third rule (`observed` — replacements assumed to settle while recorded winners keep
+their real outcomes) existed through M3 as a "lower bound" and was removed: settlement
+attached to the solution is not a counterfactual anyone would defend, and a number
+nobody should quote is not made useful by calling it a bound. See
+[PLAN.md §7.1](PLAN.md#71-m4-result).
 
 Two things the rule names do **not** vary, both measured facts
 ([details](docs/analytics-db.md#observed-outcomes-what-actually-settled)): executed
@@ -154,11 +154,10 @@ uv run loo compare out/*.json
 ```
 
 Aggregates `analyse --out` reports into the comparison: one column per solver-window,
-the outcome rules as bounds around the `inherited` headline with their spread
-quantified, medians, the sign split and the largest auction's share beside every sum,
-and the caveats and sign convention attached. Give every outcome-rule run of a
-solver-window together; a group without an `inherited` run is refused rather than
-silently led by another rule.
+the `assume-settled` scenario beside the `inherited` headline, medians, the sign split
+and the largest auction's share beside every sum, and the caveats and sign convention
+attached. Give every outcome-rule run of a solver-window together; a group without an
+`inherited` run is refused rather than silently led by another rule.
 
 USD columns are display-only conversions at each auction's own stablecoin-implied rate
 (the analytics DB has no USD table —
@@ -253,7 +252,7 @@ See [PLAN.md §4.1](PLAN.md#41-m1-result) for the full argument.
 uv run --extra dev pytest
 ```
 
-170 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
+168 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
 `loo/counterfactual.py`, `loo/rewards.py` and `loo/aggregate.py` take plain dataclasses
 and files and hold no connection.
 

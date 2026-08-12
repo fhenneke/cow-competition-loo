@@ -10,12 +10,13 @@ Three shapes of statement come out of one report, and the table keeps them apart
 - **Sums** answer the window question but are whale-dominated — one auction carried 82%
   of Sector's Δsurplus — so every sum is reported with the median non-zero auction and
   the largest auction's share next to it.
-- **The outcome rule is part of the number.** The headline is `inherited`; `observed`
-  rides along as the provable lower bound and `assume-settled` as the usual upper one.
-  A figure quoted without its rule would be a choice disguised as a result (PLAN §7).
+- **The outcome rule is part of the number.** The headline is `inherited` — settlement
+  attaches to the slot, the one scenario grounded in the record; `assume-settled`
+  (everything lands in time) is the alternative reading. A figure quoted without its
+  rule would be a choice disguised as a result (PLAN §7).
 - **Two reward figures, never one.** Uncapped is the mechanism's exact accounting,
   three orders of magnitude away from payouts; capped is the payout answer but an
-  estimate. Net value is always labelled with which one it nets against.
+  estimate. The net-change row is always labelled with which one it nets against.
 
 USD figures are display only. The analytics DB has no USD price table, so the rate is
 implied per auction by the median stablecoin price in the auction's own price vector
@@ -40,29 +41,36 @@ getcontext().prec = 78
 WEI = Decimal(10) ** 18
 
 HEADLINE_RULE = "inherited"
-BOUND_RULES = ("observed", "assume-settled")
+ALTERNATIVE_RULES = ("assume-settled",)
+
+SIGN_CONVENTION_ID = "counterfactual-minus-actual"
+"""Written into every `analyse --out` JSON and required by `load_report`, so a report
+from before the convention flip fails loudly instead of being tabulated with every
+sign silently inverted."""
 
 SIGN_CONVENTION = (
-    "every delta is with-solver minus without-solver — positive Δsurplus means users "
-    "gained from the solver's presence, positive Δrewards means the protocol paid more "
-    "because of it, so a solver's value carries a plus sign by construction"
+    "every delta is counterfactual minus actual — negative Δsurplus means users would "
+    "have received less without the solver, positive Δrewards means the protocol would "
+    "have paid more. Deltas describe the removal scenario; turning them into a value "
+    "of the solver is the reader's step"
 )
 """Stated on every rendering rather than assumed: the same numbers under the equally
-sensible loo-minus-baseline convention would flip every sign."""
+sensible with-minus-without convention would flip every sign."""
 
 CAVEATS = (
     "No behavioural response: rivals' bids are held fixed, and "
     "max_solutions_per_solver is applied before arbitration, so no suppressed rival "
     "solution can step in.",
-    "Settlement risk: the headline attaches settlement to the slot (`inherited`); "
-    "`observed` is the provable lower bound. 14.9% of winners never settled and they "
-    "carry 50.2% of winning score, so the rule is first-order, not a footnote.",
+    "Settlement risk: the headline attaches settlement to the slot (`inherited`), the "
+    "one scenario grounded in the record; `assume-settled` is the everything-lands "
+    "reading. 14.9% of winners never settled and they carry 50.2% of winning score, "
+    "so the rule is first-order, not a footnote.",
     "Filter proxy: the fairness filter is fed per-pair surplus, measured against the "
     "recorded filter at 7 differences in 7,745 auctions (M1, PLAN §4.1).",
     "Quote rewards are excluded: no data on counterfactual quoting.",
     "Two reward figures: uncapped is exact accounting but not a payout; capped is the "
     "payout answer but an estimate (a replacement inherits the displaced slot's cap). "
-    "Net value here nets against the figure named in its row label.",
+    "The net-change row nets against the figure named in its label.",
     "Price-suspect auctions are excluded from every statistic and counted in the "
     "table; they carried 82% of Sector's pre-exclusion Δsurplus (D14).",
     "USD figures are display-only conversions at each auction's own stablecoin-implied "
@@ -86,8 +94,9 @@ class AuctionMove:
 class Report:
     """One `analyse --out` JSON, with the wei strings turned back into numbers.
 
-    Every delta is baseline minus counterfactual: positive Δsurplus means users were
-    better off with the solver, positive Δrewards means the protocol paid more with it.
+    Every delta is counterfactual minus actual (`SIGN_CONVENTION_ID`, checked at load):
+    negative Δsurplus means users would have received less without the solver, positive
+    Δrewards means the protocol would have paid more.
     """
 
     path: str
@@ -139,6 +148,17 @@ def load_report(path: str) -> Report:
     """
     with open(path) as handle:
         payload = json.load(handle)
+
+    convention = payload.get("sign_convention")
+    if convention != SIGN_CONVENTION_ID:
+        # Tabulating an old report would present every number with its sign silently
+        # inverted — the one corruption a totals check cannot catch, since both sides
+        # of it flip together.
+        raise ValueError(
+            f"{path}: sign convention is {convention!r}, expected "
+            f"{SIGN_CONVENTION_ID!r} — the report predates the counterfactual-minus-"
+            f"actual convention (or the observed-rule removal); re-run analyse"
+        )
 
     uncapped = bool(payload["rewards_uncapped"])
     capped = bool(payload["capped_estimate"])
@@ -317,7 +337,8 @@ def group_reports(reports: Sequence[Report]) -> list[SolverWindow]:
     """Group reports by (solver, window); each group must contain the headline rule.
 
     Refusing to tabulate a group without `inherited` is deliberate: the alternative is
-    a headline number whose rule is whatever happened to be on disk (PLAN §7)."""
+    a headline number whose rule is whatever happened to be on disk (PLAN §7).
+    `assume-settled` is optional; its row reads "not run" when absent."""
     grouped: dict[tuple, dict[str, Report]] = {}
     for report in reports:
         key = (report.solver, *report.window)
@@ -428,15 +449,14 @@ def comparison(
     bid = row("solver bid")
     won = row("solver won")
     surplus = row("Δsurplus (inherited)")
-    bounds = {rule: row(f"  {rule}") for rule in BOUND_RULES}
-    spread = row("  rule spread (upper − lower)")
+    alternatives = {rule: row(f"  {rule}") for rule in ALTERNATIVE_RULES}
     surplus_median = row("  median non-zero auction")
     surplus_signs = row("  auctions moved + / −")
     surplus_whale = row("  largest single auction")
     rewards_uncapped = row("Δrewards uncapped")
     rewards_capped = row("Δrewards capped (estimate)")
-    net = row("net value (Δsurplus − capped Δrewards)")
-    saved = row("orders saved")
+    net = row("net change (Δsurplus − capped Δrewards)")
+    saved = row("orders executed only with the solver")
     only_without = row("orders executed only without")
     affected = row("auctions where anything moved")
     relaxed = row("fairness filter relaxed")
@@ -461,10 +481,9 @@ def comparison(
         )
 
         surplus.append(_surplus_cell(report, usd))
-        for rule, cells in bounds.items():
-            bound = window.by_rule.get(rule)
-            cells.append(_surplus_cell(bound, usd) if bound else "not run")
-        spread.append(_spread_cell(window))
+        for rule, cells in alternatives.items():
+            alternative = window.by_rule.get(rule)
+            cells.append(_surplus_cell(alternative, usd) if alternative else "not run")
 
         moved = distribution({m.auction_id: m.delta_surplus for m in report.moves})
         if moved.median_abs is not None:
@@ -536,26 +555,11 @@ def _rewards_cell(report: Report, usd: UsdContext | None, *, capped: bool) -> st
     return f"{signed_eth(delta)} ETH{detail}"
 
 
-def _spread_cell(window: SolverWindow) -> str:
-    """How much the settlement assumption alone can move the headline: the width of
-    the [observed, assume-settled] bracket, and its size relative to the headline.
-    This is the cost of the one judgement call the counterfactual cannot avoid (D4) —
-    measured on the M1 window it is 2–4× the headline itself."""
-    lower = window.by_rule.get("observed")
-    upper = window.by_rule.get("assume-settled")
-    if lower is None or upper is None:
-        return "needs observed and assume-settled runs"
-    width = upper.delta_surplus - lower.delta_surplus
-    cell = f"{signed_eth(width)} ETH"
-    headline = window.headline.delta_surplus
-    if headline:
-        cell += f" — {abs(width) / abs(headline):.1f}× the headline"
-    return cell
-
-
 def _net_cell(report: Report, usd: UsdContext | None) -> str:
-    """Net value = Δsurplus − Δrewards, capped by caveat 5: capped is the payout-scale
-    figure, and netting user value against an accounting identity would be nonsense."""
+    """Net change = Δsurplus − Δrewards, capped by caveat 5: capped is the payout-scale
+    figure, and netting user value against an accounting identity would be nonsense.
+    Under the counterfactual-minus-actual convention, negative means the scenario
+    leaves users and the protocol treasury combined worse off."""
     if report.delta_rewards_capped is None:
         return "n/a without a capped estimate"
     net = Decimal(report.delta_surplus) - report.delta_rewards_capped

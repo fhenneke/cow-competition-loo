@@ -186,20 +186,19 @@ class TestSideOutcomes:
         )
 
     def test_a_recorded_winner_takes_its_own_failed_settlement(self):
-        """True under every rule but `assume-settled`: a solution that won for real is judged on
-        what it actually did."""
-        for rule in ("inherited", "observed"):
-            side = side_outcomes(
-                [self.winner(0, "a", "o1", 100)],
-                outcome_rule=rule,
-                settled={0: NOT_SETTLED},
-                recorded_winner_uids=frozenset({0}),
-                inherit={A: False},
-            )
-            assert side.orders["o1"].executed is False
-            assert side.orders["o1"].surplus_native is None
-            assert side.orders["o1"].observed is True
-            assert side.replacements == frozenset()
+        """Under `inherited` a solution that won for real is judged on what it actually
+        did — only `assume-settled` overrides the record."""
+        side = side_outcomes(
+            [self.winner(0, "a", "o1", 100)],
+            outcome_rule="inherited",
+            settled={0: NOT_SETTLED},
+            recorded_winner_uids=frozenset({0}),
+            inherit={A: False},
+        )
+        assert side.orders["o1"].executed is False
+        assert side.orders["o1"].surplus_native is None
+        assert side.orders["o1"].observed is True
+        assert side.replacements == frozenset()
 
     def test_a_late_settlement_counts_as_a_failure(self):
         """A batch that lands after its deadline really does fill the order, so the user does
@@ -209,7 +208,7 @@ class TestSideOutcomes:
         8,784 landings in the M1 window were late."""
         side = side_outcomes(
             [self.winner(0, "a", "o1", 100)],
-            outcome_rule="observed",
+            outcome_rule="inherited",
             settled={0: LANDED_LATE},
             recorded_winner_uids=frozenset({0}),
         )
@@ -317,27 +316,12 @@ class TestSideOutcomes:
         assert side.orphans == frozenset({3})
         assert side.orders["o1"].executed is True
 
-    def test_observed_rule_assumes_every_replacement_settles(self):
-        """Kept as the pessimistic bound: the baseline is charged for real reverts while the
-        counterfactual is credited with never reverting."""
-        side = side_outcomes(
-            [self.winner(3, "a", "o1", 100)],
-            outcome_rule="observed",
-            settled={},
-            recorded_winner_uids=frozenset({0}),
-            inherit={A: False},
-        )
-        assert side.orders["o1"].executed is True
-        assert side.orders["o1"].observed is False
-        assert side.replacements == frozenset({3})
-        assert side.orphans == frozenset({3})
-
     def test_a_recorded_winner_without_a_settlement_row_is_loud(self):
         """Defaulting either way would move baseline surplus and read as a finding."""
         with pytest.raises(MissingSettlementError, match="no settlement outcome"):
             side_outcomes(
                 [self.winner(0, "a", "o1", 100)],
-                outcome_rule="observed",
+                outcome_rule="inherited",
                 settled={},
                 recorded_winner_uids=frozenset({0}),
             )
@@ -393,17 +377,17 @@ class TestDiffOutcomes:
         assert diff.executed_base and not diff.executed_loo
         assert diff.surplus_base == 100 and diff.surplus_loo is None
         assert diff.only_with_solver and not diff.only_without_solver
-        assert diff.delta_surplus == 100
+        assert diff.delta_surplus == -100  # the counterfactual loses the fill
 
     def test_delta_substitutes_zero_only_when_aggregating(self):
         (diff,) = diff_outcomes({}, {"o1": self.outcome(70)})
         assert diff.surplus_base is None
-        assert diff.delta_surplus == -70
+        assert diff.delta_surplus == 70
         assert diff.only_without_solver
 
     def test_an_order_traded_on_both_sides_nets_out(self):
         (diff,) = diff_outcomes({"o1": self.outcome(100)}, {"o1": self.outcome(60)})
-        assert diff.delta_surplus == 40
+        assert diff.delta_surplus == -40
         assert not diff.only_with_solver and not diff.only_without_solver
 
     def test_contributes_is_true_if_either_side_says_so(self):
@@ -447,7 +431,7 @@ class TestAnalyseAuction:
         assert result.solver_won_baseline and result.solver_won_db
         assert result.baseline_winner_uids == frozenset({0})
         assert result.loo_winner_uids == frozenset({1})
-        assert result.delta_surplus == 100
+        assert result.delta_surplus == -100  # the worse fill: users lose 100
         assert result.replacements_loo == frozenset({1})
         assert result.replacements_base == frozenset()
         # `x`'s batch settled, so the replacement inherits a settled slot.
@@ -457,11 +441,10 @@ class TestAnalyseAuction:
     def test_a_reverted_slot_stays_reverted_in_the_counterfactual(self):
         """The whole point of the `inherited` rule. `x` won the slot and reverted, so the
         user got nothing. Its replacement inherits that revert, so removing `x` neither
-        gains nor loses the user anything — the auction simply produced no fill.
-
-        Under `observed` the same auction reports a *gain* from removing `x`, because the
-        replacement would be credited with settling. That is the asymmetry `inherited`
-        exists to remove, and it is asserted here so the two cannot drift back together.
+        gains nor loses the user anything — the auction simply produced no fill. A rule
+        that attached settlement to the solution instead would credit the replacement
+        with settling and book a phantom gain from removing `x`; that rule (`observed`)
+        was removed in the M4 review.
         """
         auction = bundle(
             [
@@ -476,17 +459,6 @@ class TestAnalyseAuction:
         assert (diff.executed_base, diff.executed_loo) == (False, False)
         assert inherited.inherited_reverts_loo == frozenset({1})
         assert inherited.delta_surplus == 0
-
-        observed = analyse_auction(
-            auction,
-            WETH,
-            frozenset({"x"}),
-            outcome_rule="observed",
-            settled={0: NOT_SETTLED},
-        )
-        (diff,) = observed.order_diffs
-        assert (diff.executed_base, diff.executed_loo) == (False, True)
-        assert observed.delta_surplus == -100
 
     def test_an_order_executed_only_because_of_the_solver(self):
         """`x` batches two pairs; the only other bid covers one of them, so the DAI order
@@ -510,7 +482,7 @@ class TestAnalyseAuction:
         )
         saved = [d.order_uid for d in result.order_diffs if d.only_with_solver]
         assert saved == ["o2"]
-        assert result.delta_surplus == 100  # o1 nets out, o2 is lost entirely
+        assert result.delta_surplus == -100  # o1 nets out, o2's fill is lost entirely
 
     def test_a_surviving_winner_cancels_even_when_it_failed_to_settle(self):
         """The reason the outcome rule is applied to both sides identically. `b` wins with
@@ -532,38 +504,12 @@ class TestAnalyseAuction:
         assert by_uid["o2"].executed_base is False
         assert by_uid["o2"].executed_loo is False
         assert by_uid["o2"].delta_surplus == 0
-        assert result.delta_surplus == 100  # o1 alone
+        assert result.delta_surplus == -100  # o1 alone
 
-    def test_the_observed_rule_still_reports_that_bias_when_asked_for(self):
-        """`observed` is retained as the pessimistic bound, so its bias is pinned down rather
-        than removed: `x` won and never settled, its replacement is assumed to settle anyway,
-        and the delta comes out *negative* — removing `x` looks like a gain. The order is
-        counted separately so the bound cannot be read as the headline."""
-        result = analyse_auction(
-            bundle(
-                [
-                    bid(0, "x", 200, [sell_order("o1", executed_buy=2200)], is_winner=True),
-                    bid(1, "b", 100, [sell_order("o1", executed_buy=2100)]),
-                ]
-            ),
-            WETH,
-            frozenset({"x"}),
-            outcome_rule="observed",
-            settled={0: NOT_SETTLED},
-        )
-        (diff,) = result.order_diffs
-        assert diff.unsettled_base
-        assert diff.executed_base is False and diff.executed_loo is True
-        assert result.delta_surplus == -100
-
-        analysis = Analysis(outcome_rule="observed")
-        analysis.add(result)
-        assert analysis.orders_unsettled_base == 1
-        assert analysis.orders_only_without_solver == 1
-
-    def test_the_proposed_rule_removes_that_asymmetry(self):
-        """Same auction, both sides assumed to settle: the sign flips back and the delta is
-        the price difference alone. This is why the two rules are reported together."""
+    def test_assume_settled_scores_the_reverted_auction_on_proposals_alone(self):
+        """The everything-lands-in-time scenario: `x`'s revert is ignored on both sides,
+        so the delta is the price difference between the two proposals — the user loses
+        the better fill in the counterfactual."""
         result = analyse_auction(
             bundle(
                 [
@@ -578,7 +524,7 @@ class TestAnalyseAuction:
         )
         (diff,) = result.order_diffs
         assert not diff.unsettled_base
-        assert result.delta_surplus == 100
+        assert result.delta_surplus == -100
 
     def test_un_filtering_is_reported(self):
         result = analyse_auction(
@@ -694,4 +640,4 @@ class TestAnalysis:
         assert analysis.orders_only_with_solver == 1
         assert analysis.jit_orders_only_with_solver == 1
         assert analysis.orders_compared == 1
-        assert analysis.delta_surplus == 100  # the JIT order's surplus is not the user's
+        assert analysis.delta_surplus == -100  # the JIT order's surplus is not the user's

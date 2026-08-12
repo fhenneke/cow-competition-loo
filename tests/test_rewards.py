@@ -258,7 +258,7 @@ class TestRewardsInCounterfactual:
         assert "x" not in result.loo_rewards
         assert result.loo_rewards["b"].uncapped_reward == 150
         assert result.loo_rewards["b"].reference_score == 0
-        assert result.delta_rewards == 50 - 150
+        assert result.delta_rewards == 150 - 50  # without x the protocol pays more
 
     def test_the_reward_side_sees_the_same_settlement_as_the_surplus_side(self):
         """D5 in one assertion: the batch landed late, so the surplus side carries the
@@ -282,9 +282,7 @@ class TestRewardsInCounterfactual:
 
     def test_a_replacement_inheriting_a_reverted_slot_earns_nothing(self):
         """Under `inherited` the replacement's `observed_score` is 0 like the batch it
-        displaced; under `observed` it is credited with settling and earns its full
-        marginal value. The reward gap between the rules is the same asymmetry M2
-        measured on the surplus side."""
+        displaced, so it earns nothing — the same slot logic as the surplus side (D12)."""
         auction = bundle(
             [
                 bid(0, "x", 200, [sell_order("o1", executed_buy=2200)], is_winner=True),
@@ -296,16 +294,6 @@ class TestRewardsInCounterfactual:
         )
         assert inherited.baseline_rewards["x"].uncapped_reward == -150
         assert inherited.loo_rewards["b"].uncapped_reward == 0
-
-        observed = analyse_auction(
-            auction,
-            WETH,
-            frozenset({"x"}),
-            outcome_rule="observed",
-            settled={0: NOT_SETTLED},
-        )
-        assert observed.baseline_rewards["x"].uncapped_reward == -150
-        assert observed.loo_rewards["b"].uncapped_reward == 150
 
     def test_a_moved_reference_score_moves_a_reward_without_moving_the_win(self):
         """The D8 case with money attached: x never wins, but its bid sets b's
@@ -326,7 +314,7 @@ class TestRewardsInCounterfactual:
         assert result.reference_scores_moved
         assert result.baseline_rewards["b"].uncapped_reward == 100 - 80
         assert result.loo_rewards["b"].uncapped_reward == 100
-        assert result.delta_rewards == 20 - 100
+        assert result.delta_rewards == 100 - 20  # b earns more once x's bid is gone
 
     def test_surplus_mode_computes_no_rewards(self):
         result = analyse_auction(
@@ -489,7 +477,7 @@ class TestAnalysisAggregation:
         )
         assert analysis.rewards_base == -150
         assert analysis.rewards_loo == 0
-        assert analysis.delta_rewards == -150
+        assert analysis.delta_rewards == 150
         assert analysis.removed_reward_base == -150
         assert analysis.auctions_rewards_moved == 1
         assert (analysis.negative_rewards_base, analysis.negative_reward_sum_base) == (
