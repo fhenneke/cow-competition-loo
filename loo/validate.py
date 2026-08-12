@@ -20,15 +20,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from .extract import AuctionBundle, Bid
+from .extract import AuctionBundle
 from .primitives import MAX_WINNERS, Pair
 from .valuation import (
     Mode,
     SolutionValuation,
     ValuationError,
+    ValuedBid,
+    build_solutions,
     order_surplus,
-    solution_total,
-    value_solution,
 )
 from .winner_selection import (
     Ranking,
@@ -269,58 +269,6 @@ class AuctionReport:
         return max(c.db_score for c in db_only) - max(c.db_score for c in ours_only)
 
 
-@dataclass(frozen=True)
-class ValuedBid:
-    bid: Bid
-    solution: Solution
-    valuation: SolutionValuation
-
-
-def build_solutions(
-    bundle: AuctionBundle,
-    weth: str,
-    *,
-    mode: Mode = "score",
-) -> tuple[list[ValuedBid], dict[int, str]]:
-    """Value every bid in an auction.
-
-    Returns the valued bids and the per-uid valuation failures. A bid whose valuation
-    fails is left out entirely, which is what the Rust does (`arbitrator.rs:155`
-    discards the whole solution when any contributing order cannot be scored). Because
-    the DB only ever stores solutions whose score computation succeeded, any failure
-    here is a reproduction defect and is reported rather than swallowed.
-    """
-    valued: list[ValuedBid] = []
-    failures: dict[int, str] = {}
-
-    for bid in bundle.bids:
-        try:
-            valuation = value_solution(
-                bid.orders, bid.contributes, bundle.native_prices, weth
-            )
-            total = solution_total(valuation, mode, bid.score)
-        except ValuationError as error:
-            failures[bid.uid] = str(error)
-            continue
-
-        valued.append(
-            ValuedBid(
-                bid=bid,
-                solution=Solution(
-                    solver=bid.solver,
-                    solution_uid=bid.uid,
-                    total=total,
-                    pair_values=dict(valuation.pair_surplus),
-                    order_uids=valuation.order_uids,
-                    winner_pairs=valuation.winner_pairs,
-                ),
-                valuation=valuation,
-            )
-        )
-
-    return valued, failures
-
-
 def score_baselines(valued: Iterable[ValuedBid]) -> dict[Pair, int]:
     """Exact per-pair baselines: the best recorded score among single-pair solutions.
 
@@ -391,7 +339,9 @@ def check_auction(
     max_winners: int = MAX_WINNERS,
 ) -> AuctionReport:
     """Reproduce one auction and diff it against the DB."""
-    valued, failures = build_solutions(bundle, weth, mode=mode)
+    valued, failures = build_solutions(
+        bundle.bids, bundle.native_prices, weth, mode=mode
+    )
     solutions = [v.solution for v in valued]
     ranking = arbitrate(solutions, max_winners)
     exact_baselines = score_baselines(valued)

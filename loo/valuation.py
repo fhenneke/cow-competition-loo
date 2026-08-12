@@ -12,9 +12,13 @@ Integer arithmetic throughout.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Literal
+from typing import TYPE_CHECKING, Iterable, Literal, Sequence
 
 from .primitives import Pair, as_erc20, ceil_div, price_in_eth
+from .winner_selection import Solution
+
+if TYPE_CHECKING:  # `extract` imports this module, so the runtime import would cycle.
+    from .extract import Bid
 
 Side = Literal["sell", "buy"]
 Mode = Literal["score", "surplus"]
@@ -224,3 +228,60 @@ def solution_total(valuation: SolutionValuation, mode: Mode, db_score: int | Non
     if db_score is None:
         raise ValueError("score mode needs the solution's DB score")
     return db_score
+
+
+@dataclass(frozen=True)
+class ValuedBid:
+    """A bid, its valuation, and the `Solution` the arbitrator sees."""
+
+    bid: "Bid"
+    solution: Solution
+    valuation: SolutionValuation
+
+
+def build_solutions(
+    bids: Sequence["Bid"],
+    native_prices: dict[str, int],
+    weth: str,
+    *,
+    mode: Mode = "score",
+) -> tuple[list[ValuedBid], dict[int, str]]:
+    """Value every bid in an auction, in `bid` order.
+
+    Returns the valued bids and the per-uid valuation failures. A bid whose valuation
+    fails is left out entirely, which is what the Rust does (`arbitrator.rs:155`
+    discards the whole solution when any contributing order cannot be scored). Because
+    the DB only ever stores solutions whose score computation succeeded, any failure
+    here is a defect in this reproduction rather than a property of the data, and every
+    caller reports rather than swallows it.
+
+    Bids arrive in `uid` order, which is best-to-worst, so ties in `total` break the way
+    the autopilot recorded them — see docs/analytics-db.md.
+    """
+    valued: list[ValuedBid] = []
+    failures: dict[int, str] = {}
+
+    for bid in bids:
+        try:
+            valuation = value_solution(bid.orders, bid.contributes, native_prices, weth)
+            total = solution_total(valuation, mode, bid.score)
+        except ValuationError as error:
+            failures[bid.uid] = str(error)
+            continue
+
+        valued.append(
+            ValuedBid(
+                bid=bid,
+                solution=Solution(
+                    solver=bid.solver,
+                    solution_uid=bid.uid,
+                    total=total,
+                    pair_values=dict(valuation.pair_surplus),
+                    order_uids=valuation.order_uids,
+                    winner_pairs=valuation.winner_pairs,
+                ),
+                valuation=valuation,
+            )
+        )
+
+    return valued, failures

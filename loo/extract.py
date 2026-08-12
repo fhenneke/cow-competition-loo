@@ -26,6 +26,39 @@ class MissingOrderError(Exception):
     """A traded order uid is in neither `orders` nor `jit_orders`."""
 
 
+class SolverResolutionError(Exception):
+    """`--solver` did not name exactly one solver that bid in the window."""
+
+
+@dataclass(frozen=True)
+class Settlement:
+    """On-chain outcome of one winning solution.
+
+    `settled` and `in_time` come apart: a batch that lands after its deadline still
+    executes its orders — the user gets their fill — but the solver earns no reward for
+    it. So the surplus question uses `settled` and the reward question (M3) uses
+    `in_time`. Measured over the M1 window: 8,768 of 10,301 winners settled, of which 16
+    were late.
+    """
+
+    settled: bool
+    in_time: bool
+    tx_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class SolverMatch:
+    """One catalogue entry for a `--solver` argument, with its activity in the window."""
+
+    address: str
+    name: str
+    environment: str
+    active: bool
+    solutions: int
+    auctions_bid: int
+    winning_solutions: int
+
+
 @dataclass(frozen=True)
 class Bid:
     """One proposed solution, with the orders it trades."""
@@ -139,6 +172,81 @@ from dbt.int_backend_data__proposed_solution_data
 where auction_id = any(%(ids)s)
 """
 
+# One row per *winning* solution, always — the model left-joins settlements onto the
+# winners, so a winner that never settled is a row with a null `tx_hash` rather than a
+# missing row. That distinction is what lets a missing row mean "no data" and fail loudly.
+# Verified over the M1 window: 10,301 winners, 10,301 rows, no duplicates, no rows for
+# non-winners.
+SETTLEMENTS_SQL = """
+select
+    auction_id,
+    solution_uid,
+    (tx_hash is not null)     as settled,
+    is_settled_in_time        as in_time,
+    encode(tx_hash, 'hex')    as tx_hash
+from dbt.int_backend_data__winning_solutions_with_onchain_status
+where auction_id = any(%(ids)s)
+"""
+
+# `--solver` takes a name or an address. Names are matched **exactly** (case-insensitively):
+# among solvers active in the M1 window `Arc` is a substring of `Arctic` and both bid, so
+# any `like '%…%'` match would silently remove two competitors. `Uncatalogued` is excluded
+# because it is `coalesce(name, 'Uncatalogued')` — a bucket for addresses missing from the
+# Dune seed, not a solver; those must be named by address.
+#
+# The catalogue holds several addresses per name where a solver has rotated keys, so the
+# result is intersected with what actually bid in the window. Rotations never overlap, so
+# in practice this collapses to one address; when it does not, all of them are the same
+# competitor and all must go — `compute_reference_scores` removes *all* of a solver's
+# solutions, so splitting a rotation across two "solvers" would give wrong reference scores.
+SOLVER_SQL = """
+with window_auctions as (
+    select distinct auction_id
+    from dbt.pre_stg__orders_per_auction_with_at_least_one_bid
+    where block_deadline between
+          (select min(block_number) from dbt.stg_rpc_data__block_timestamp where time >= %(start)s)
+      and (select max(block_number) from dbt.stg_rpc_data__block_timestamp where time <  %(end)s)
+),
+needle as (
+    -- `substr(raw, 3)` rather than `ltrim(raw, '0x')`: ltrim strips a character *set*, so
+    -- an address of leading zeroes would lose them and silently mismatch.
+    select
+        %(solver)s::text as raw,
+        lower(case
+            when %(solver)s like '0x%%' or %(solver)s like '0X%%' then substr(%(solver)s, 3)
+            else %(solver)s
+        end) as hexish
+),
+candidates as (
+    select s.address, s.name, s.environment, s.active
+    from dbt.dune_data__cow_protocol__solvers s, needle n
+    where (lower(s.name) = lower(n.raw) and s.name <> 'Uncatalogued')
+       or encode(s.address, 'hex') = n.hexish
+),
+activity as (
+    select
+        ps.solver,
+        count(*)                             as solutions,
+        count(distinct ps.auction_id)        as auctions_bid,
+        count(*) filter (where ps.is_winner) as winning_solutions
+    from dbt.stg_backend_data__proposed_solutions ps
+    join window_auctions using (auction_id)
+    where ps.solver in (select address from candidates)
+    group by 1
+)
+select
+    encode(c.address, 'hex')          as address,
+    c.name,
+    c.environment,
+    c.active,
+    coalesce(a.solutions, 0)          as solutions,
+    coalesce(a.auctions_bid, 0)       as auctions_bid,
+    coalesce(a.winning_solutions, 0)  as winning_solutions
+from candidates c
+left join activity a on a.solver = c.address
+order by coalesce(a.solutions, 0) desc, c.name
+"""
+
 
 def auctions_in_window(conn, start: str, end: str) -> list[tuple[int, int]]:
     """Auction ids with at least one bid in `[start, end)`, with their block deadlines.
@@ -250,6 +358,60 @@ def _build_bid(row: dict, execution_rows: list[dict], jit_owners: frozenset[str]
         orders=tuple(orders),
         contributes=contributes,
     )
+
+
+def load_settlement_outcomes(
+    conn, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
+) -> dict[int, dict[int, Settlement]]:
+    """On-chain outcome per winning solution, keyed by auction then `solution_uid`.
+
+    Only winners have rows, which is all the counterfactual needs: a solution that did not
+    win never had a chance to settle. An auction absent from the result had no recorded
+    winners at all.
+    """
+    outcomes: dict[int, dict[int, Settlement]] = {}
+    for chunk in chunked(list(auction_ids), chunk_size):
+        for row in fetch(conn, SETTLEMENTS_SQL, {"ids": list(chunk)}):
+            outcomes.setdefault(row["auction_id"], {})[row["solution_uid"]] = Settlement(
+                settled=bool(row["settled"]),
+                in_time=bool(row["in_time"]),
+                tx_hash=row["tx_hash"],
+            )
+    return outcomes
+
+
+def solver_matches(conn, solver: str, start: str, end: str) -> list[SolverMatch]:
+    """Catalogue entries matching `solver`, with how much each one bid in the window."""
+    rows = fetch(conn, SOLVER_SQL, {"solver": solver, "start": start, "end": end})
+    return [SolverMatch(**row) for row in rows]
+
+
+def resolve_solver(conn, solver: str, start: str, end: str) -> tuple[frozenset[str], list[SolverMatch]]:
+    """Submission addresses to remove for `--solver`, and the matches behind them.
+
+    Returns every matching address that bid in the window — see `SOLVER_SQL` on why a
+    single competitor can hold more than one. Raises `SolverResolutionError` when nothing
+    matched or when the matches never bid, rather than quietly analysing the removal of a
+    solver that was not there: that would produce a clean run of all-zero deltas, which
+    reads as a finding.
+    """
+    matches = solver_matches(conn, solver, start, end)
+    if not matches:
+        raise SolverResolutionError(
+            f"{solver!r} matches no solver in dune_data__cow_protocol__solvers. Names are "
+            f"matched exactly and are case-insensitive; addresses may be given with or "
+            f"without a 0x prefix."
+        )
+
+    live = [m for m in matches if m.solutions]
+    if not live:
+        listed = ", ".join(f"{m.name}/{m.address[:8]} ({m.environment})" for m in matches)
+        raise SolverResolutionError(
+            f"{solver!r} matches {len(matches)} catalogued address(es) — {listed} — but "
+            f"none of them submitted a solution in [{start}, {end}). Check the window."
+        )
+
+    return frozenset(m.address for m in live), live
 
 
 def load_db_order_surplus(
