@@ -34,9 +34,9 @@ WETH = "c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
 USDC = "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 DAI = "6b175474e89094c44da98b954eedeac495271d0f"
 
-SETTLED = Settlement(settled=True, in_time=True)
-NOT_SETTLED = Settlement(settled=False, in_time=False)
-SETTLED_LATE = Settlement(settled=True, in_time=False)
+SETTLED = Settlement(landed=True, in_time=True)
+NOT_SETTLED = Settlement(landed=False, in_time=False)
+LANDED_LATE = Settlement(landed=True, in_time=False)
 
 A = (WETH, USDC)
 B = (DAI, USDC)
@@ -220,7 +220,7 @@ class TestSideOutcomes:
         )
 
     def test_a_recorded_winner_takes_its_own_failed_settlement(self):
-        """True under every rule but `proposed`: a solution that won for real is judged on
+        """True under every rule but `assume-settled`: a solution that won for real is judged on
         what it actually did."""
         for rule in ("inherited", "observed"):
             side = side_outcomes(
@@ -235,24 +235,49 @@ class TestSideOutcomes:
             assert side.orders["o1"].observed is True
             assert side.replacements == frozenset()
 
-    def test_a_late_settlement_still_executed_its_orders(self):
-        """`is_settled_in_time` is the reward-side flag, not the execution one: a batch that
-        lands after its deadline still fills the order, so the user keeps the surplus even
-        though the solver earns nothing. 16 of 8,768 settlements in the M1 window were
-        late."""
+    def test_a_late_settlement_counts_as_a_failure(self):
+        """A batch that lands after its deadline really does fill the order, so the user does
+        receive surplus — but the protocol pays nothing for it, and the surplus and reward
+        sides have to agree on which winners delivered. So it is carried as a failure with
+        zero surplus, and `landed_late` records that the discarded surplus was real. 16 of
+        8,784 landings in the M1 window were late."""
         side = side_outcomes(
             [self.winner(0, "a", "o1", 100)],
             outcome_rule="observed",
-            settled={0: SETTLED_LATE},
+            settled={0: LANDED_LATE},
             recorded_winner_uids=frozenset({0}),
         )
-        assert side.orders["o1"].executed is True
-        assert side.orders["o1"].surplus_native == 100
+        assert side.orders["o1"].executed is False
+        assert side.orders["o1"].surplus_native is None
+        assert side.orders["o1"].landed_late is True
+
+    def test_lateness_is_counted_so_the_discarded_surplus_stays_visible(self):
+        result = analyse_auction(
+            bundle(
+                [
+                    bid(0, "x", 200, [sell_order("o1", executed_buy=2200)], is_winner=True),
+                    bid(1, "b", 100, [sell_order("o1", executed_buy=2100)]),
+                ]
+            ),
+            WETH,
+            frozenset({"x"}),
+            settled={0: LANDED_LATE},
+        )
+        (diff,) = result.order_diffs
+        assert diff.late_base and diff.unsettled_base
+        # The slot was late, so the replacement inherits a failure too: nothing executes.
+        assert (diff.executed_base, diff.executed_loo) == (False, False)
+        assert result.delta_surplus == 0
+
+        analysis = Analysis()
+        analysis.add(result)
+        assert analysis.orders_lost_to_lateness == 1
+        assert analysis.orders_unsettled_base == 1
 
     def test_proposed_rule_ignores_settlement(self):
         side = side_outcomes(
             [self.winner(0, "a", "o1", 100)],
-            outcome_rule="proposed",
+            outcome_rule="assume-settled",
             settled={0: NOT_SETTLED},
             recorded_winner_uids=frozenset({0}),
         )
@@ -354,7 +379,7 @@ class TestSideOutcomes:
     def test_zero_surplus_on_an_executed_order_keeps_the_flag(self):
         side = side_outcomes(
             [self.winner(0, "a", "o1", 0)],
-            outcome_rule="proposed",
+            outcome_rule="assume-settled",
             settled={},
             recorded_winner_uids=frozenset(),
         )
@@ -367,7 +392,7 @@ class TestSideOutcomes:
         entry = valued(bid(0, "a", 100, [sell_order("jit")], contributes=False), {})
         side = side_outcomes(
             [entry],
-            outcome_rule="proposed",
+            outcome_rule="assume-settled",
             settled={},
             recorded_winner_uids=frozenset(),
         )
@@ -381,7 +406,7 @@ class TestSideOutcomes:
         with pytest.raises(AssertionError, match="claimed twice"):
             side_outcomes(
                 [self.winner(0, "a", "o1", 100), self.winner(1, "b", "o1", 90)],
-                outcome_rule="proposed",
+                outcome_rule="assume-settled",
                 settled={},
                 recorded_winner_uids=frozenset(),
             )
@@ -582,7 +607,7 @@ class TestAnalyseAuction:
             ),
             WETH,
             frozenset({"x"}),
-            outcome_rule="proposed",
+            outcome_rule="assume-settled",
             settled={0: NOT_SETTLED},
         )
         (diff,) = result.order_diffs

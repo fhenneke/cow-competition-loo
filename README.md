@@ -46,11 +46,24 @@ settled and they carry half of all winning score — so the rule is explicit:
 - `observed` — settlement belongs to the **solution**. A replacement has no record, so it is
   assumed to settle. This charges the baseline for real reverts while assuming the
   counterfactual never reverts, so it is a **lower bound**, provably below `inherited`.
-- `proposed` — every winner settles on both sides, so reverts are ignored entirely. Normally
-  the upper bound.
+- `assume-settled` — every winner settles on both sides, so failures are ignored entirely.
+  Normally the upper bound.
 
 Report the default and quote the bound you care about; for Sector the three give 8.01, 2.89
 and 8.13 ETH. See [PLAN.md §5.1](PLAN.md#51-m2-result).
+
+Two things the rule names do **not** vary:
+
+- **Executed amounts are always the proposed ones**, from
+  `stg_backend_data__proposed_trade_executions`. Never on-chain trade amounts. That is
+  exact rather than an approximation: a batch that lands executes the amounts its solution
+  proposed, checked to the atom on every order row of every landed winner. So the only thing
+  chain data adds is *whether* it landed, and that is the single on-chain lookup the pipeline
+  makes (`tx_hash` and `is_settled_in_time`).
+- **"Settled" means landed in time.** A batch that lands after its deadline is carried as a
+  failure with zero surplus, even though its orders really filled, so that the surplus and
+  reward sides agree on which winners delivered. The discarded surplus is reported as
+  `of which merely late` rather than absorbed.
 
 ```bash
 uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04 --outcome-rule observed
@@ -58,7 +71,7 @@ uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04 --outcome
 
 | flag | |
 | --- | --- |
-| `--outcome-rule` | `inherited` (default), `observed` or `proposed` — see above |
+| `--outcome-rule` | `inherited` (default), `observed` or `assume-settled` — see above |
 | `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus |
 | `--limit N` | only the first N auctions — start here |
 | `--out report.json` | per-auction records, including both sides' reference scores |

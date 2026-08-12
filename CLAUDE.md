@@ -46,9 +46,12 @@ Both are read-only references here. Do not modify them.
    arbitrator's tie-breaks. Reference scores depend on that ordering, which is *not* plain
    score order — see
    [docs/winner-selection.md](docs/winner-selection.md#ranked-order-is-load-bearing).
-8. `is_settled_in_time` is **not** "did this execute". 16 winners in the M1 window settled
-   late: the orders traded and users kept the surplus, but the solver earned no reward. Use
-   `tx_hash is not null` for surplus questions and `is_settled_in_time` only for rewards.
+8. `is_settled_in_time` is **not** "did this execute" — 16 winners in the M1 window landed
+   late, so their orders traded and users kept the surplus while the solver earned no
+   reward. The two flags genuinely differ (`tx_hash is not null` vs `is_settled_in_time`), so
+   pick deliberately. The counterfactual picks `is_settled_in_time` for *both* the surplus
+   and the reward side, so the two agree on which winners delivered
+   ([why](loo/extract.py), `Settlement.counts_as_executed`).
 9. The lag in gotcha 5 is specific to `int_backend_data__proposed_solution_data`. Every
    other model on that path is level with staging — check the model, don't avoid `int_` as
    a class ([table](docs/analytics-db.md#coverage-and-lag)).

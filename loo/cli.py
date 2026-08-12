@@ -61,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     analyse.add_argument(
         "--outcome-rule",
-        choices=("inherited", "observed", "proposed"),
+        choices=("inherited", "observed", "assume-settled"),
         default="inherited",
         help=(
             "what a replacement winner is taken to do: inherit the settlement of the slot "
@@ -181,7 +181,7 @@ def run_analyse(args) -> int:
             return 1
 
         settled: dict[int, dict[int, extract.Settlement]] = {}
-        if args.outcome_rule != "proposed":
+        if args.outcome_rule != "assume-settled":
             settled = extract.load_settlement_outcomes(conn, auction_ids)
             print(
                 f"settlement outcomes for {sum(len(v) for v in settled.values())} "
@@ -289,7 +289,11 @@ def report_analysis(analysis: counterfactual.Analysis, args) -> None:
     )
     print(
         f"  lost to a failed settlement {analysis.orders_unsettled_base}"
-        "   <- the baseline's own reverted batches"
+        "   <- the baseline's own batches that did not land in time"
+    )
+    print(
+        f"    of which merely late     {analysis.orders_lost_to_lateness}"
+        "   <- really filled; surplus discarded by choice"
     )
     print(f"JIT orders only with solver   {analysis.jit_orders_only_with_solver}")
     print(f"JIT orders only without       {analysis.jit_orders_only_without_solver}")
@@ -383,6 +387,7 @@ def write_analysis_json(path: str, analysis: counterfactual.Analysis, args) -> N
         "orders_only_with_solver": analysis.orders_only_with_solver,
         "orders_only_without_solver": analysis.orders_only_without_solver,
         "orders_unsettled_base": analysis.orders_unsettled_base,
+        "orders_lost_to_lateness": analysis.orders_lost_to_lateness,
         "jit_orders_only_with_solver": analysis.jit_orders_only_with_solver,
         "jit_orders_only_without_solver": analysis.jit_orders_only_without_solver,
         "replacements_base": analysis.replacements_base,

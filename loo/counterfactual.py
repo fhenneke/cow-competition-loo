@@ -29,7 +29,7 @@ from .winner_selection import (
     pick_winners,
 )
 
-OutcomeRule = Literal["inherited", "observed", "proposed"]
+OutcomeRule = Literal["inherited", "observed", "assume-settled"]
 
 OUTCOME_RULE = {
     "inherited": (
@@ -44,7 +44,7 @@ OUTCOME_RULE = {
         "recorded outcome, and a replacement is assumed to settle because there is no "
         "record to consult"
     ),
-    "proposed": (
+    "assume-settled": (
         "every winning solution's orders execute at its proposed amounts on both "
         "sides, so settlement risk is excluded from the comparison entirely"
     ),
@@ -67,13 +67,13 @@ nothing was ever recorded about it — is taken to do. That is not a detail: 1,5
 - `observed` credits every replacement with settling. It charges the baseline for real
   reverts while assuming the counterfactual never reverts, so it is biased against the
   removed solver — it is kept only as the pessimistic bound.
-- `proposed` credits *everyone* with settling, baseline included, so it overstates what
+- `assume-settled` credits *everyone* with settling, baseline included, so it overstates what
   users really received wherever a winner reverted.
 
 `delta_surplus` under `observed` is a lower bound on `inherited` **by construction**: the
 two differ only on reverted slots, where `observed` credits the replacement with a positive
 surplus and `inherited` credits it with nothing, and the baseline is zero either way.
-`proposed` is *usually* the upper bound but not provably so — a reverted slot whose
+`assume-settled` is *usually* the upper bound but not provably so — a reverted slot whose
 replacement carries more user surplus than the winner it displaced pushes it below
 `inherited`, which score-mode ranking permits since score is not surplus. Measured on the
 window, the three came out ordered: 2.89 / 8.01 / 8.13 ETH for Sector.
@@ -178,6 +178,10 @@ class OrderOutcome:
     solver: str | None = None
     observed: bool = False
     """True when this came from the recorded competition rather than from a proposal."""
+    landed_late: bool = False
+    """This order's batch really did fill, but after its deadline, so
+    `Settlement.counts_as_executed` treats it as a failure. Tracked only where the record is
+    this solution's own, which is where the discarded surplus is real."""
 
 
 UNEXECUTED = OrderOutcome(executed=False, surplus_native=None, contributes=False)
@@ -207,10 +211,10 @@ def recorded_settlement_by_pair(
             raise MissingSettlementError(
                 f"auction {entry.bid.auction_id} solution {uid} won the recorded "
                 f"competition but has no settlement outcome; the settlement source does "
-                f"not cover this auction. Narrow the window or use --outcome-rule proposed."
+                f"not cover this auction. Narrow the window or use --outcome-rule assume-settled."
             )
         for pair in entry.solution.winner_pairs:
-            by_pair[pair] = settled[uid].settled
+            by_pair[pair] = settled[uid].counts_as_executed
     return by_pair
 
 
@@ -228,7 +232,7 @@ class SideOutcomes:
     """Replacements whose settlement had to be assumed rather than derived — PLAN.md
     section 5's "record how often the mapping fails". Under `inherited` these are the
     replacements claiming a pair no recorded winner held, so there was nothing to inherit;
-    under `observed` every replacement is one. Empty under `proposed`, which does not
+    under `observed` every replacement is one. Empty under `assume-settled`, which does not
     consult the record at all."""
 
 
@@ -247,9 +251,10 @@ def side_outcomes(
     a property of the auction rather than of the side being evaluated: a winner that won
     for real reads its own outcome out of it, since it held its own pairs.
 
-    An order is executed when its batch settled **at all**, late or not: a late settlement
-    still fills the order, so the user gets the surplus even though the solver earns no
-    reward for it. `Settlement.in_time` is the reward-side flag and is left to M3.
+    An order counts as executed only when its batch landed **in time**. A late settlement is
+    treated as a failure with zero surplus even though its orders really did fill — see
+    `Settlement.counts_as_executed` for why, and `Analysis.orders_lost_to_lateness` for the
+    cost of that choice.
 
     `pick_winners` gives winners disjoint token pairs and an order fixes its own pair, so
     no two winners can trade the same order. Asserted rather than assumed, and confirmed
@@ -267,7 +272,8 @@ def side_outcomes(
         if not recorded:
             replacements.add(uid)
 
-        if outcome_rule == "proposed":
+        late = False
+        if outcome_rule == "assume-settled":
             executed, observed = True, False
         elif recorded:
             if uid not in settled:
@@ -275,9 +281,11 @@ def side_outcomes(
                     f"auction {entry.bid.auction_id} solution {uid} won the recorded "
                     f"competition but has no settlement outcome; the settlement source "
                     f"does not cover this auction. Narrow the window or use "
-                    f"--outcome-rule proposed."
+                    f"--outcome-rule assume-settled."
                 )
-            executed, observed = settled[uid].settled, True
+            outcome = settled[uid]
+            executed, observed = outcome.counts_as_executed, True
+            late = outcome.landed and not outcome.in_time
         elif outcome_rule == "inherited" and inherit:
             # The slot rule: whatever really happened to the pairs this replacement
             # claims, happens to it. A batch spanning several slots needs all of them to
@@ -311,6 +319,7 @@ def side_outcomes(
                 solution_uid=uid,
                 solver=entry.bid.solver,
                 observed=observed,
+                landed_late=late,
             )
 
     return SideOutcomes(
@@ -343,6 +352,11 @@ class OrderDiff:
     order cancels out of `delta_surplus`; under `observed` the replacement is credited with
     settling and the order becomes a spurious gain from removing the solver.
     """
+
+    late_base: bool = False
+    late_loo: bool = False
+    """The batch really filled this order, but after its deadline, so it is carried as a
+    failure. The one place this analysis knowingly discards surplus a user did receive."""
 
     @property
     def unsettled_base(self) -> bool:
@@ -398,6 +412,8 @@ def diff_outcomes(
                 solver_loo=right.solver,
                 observed_base=left.observed,
                 observed_loo=right.observed,
+                late_base=left.landed_late,
+                late_loo=right.landed_late,
             )
         )
     return tuple(diffs)
@@ -621,6 +637,11 @@ class Analysis:
     replacement holding the same slot loses them too, so they cancel; under `observed` the
     replacement is credited with settling and they are exactly where `delta_surplus` is
     biased against the removed solver."""
+    orders_lost_to_lateness: int = 0
+    """Of those, the ones whose batch *did* fill, just after its deadline. These carry real
+    user surplus that `Settlement.counts_as_executed` deliberately discards, so this is the
+    price of aligning the surplus side with the reward side. Reported rather than folded in,
+    because it is the only figure here that is knowingly not what happened."""
     jit_orders_only_with_solver: int = 0
     jit_orders_only_without_solver: int = 0
     """Non-contributing orders, counted apart from user orders: their surplus accrues to
@@ -686,6 +707,7 @@ class Analysis:
                 self.orders_only_with_solver += diff.only_with_solver
                 self.orders_only_without_solver += diff.only_without_solver
                 self.orders_unsettled_base += diff.unsettled_base
+                self.orders_lost_to_lateness += diff.late_base
             else:
                 self.jit_orders_only_with_solver += diff.only_with_solver
                 self.jit_orders_only_without_solver += diff.only_without_solver

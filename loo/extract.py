@@ -34,16 +34,36 @@ class SolverResolutionError(Exception):
 class Settlement:
     """On-chain outcome of one winning solution.
 
-    `settled` and `in_time` come apart: a batch that lands after its deadline still
-    executes its orders — the user gets their fill — but the solver earns no reward for
-    it. So the surplus question uses `settled` and the reward question (M3) uses
-    `in_time`. Measured over the M1 window: 8,768 of 10,301 winners settled, of which 16
-    were late.
+    Only the *status* is read from chain. Executed amounts always come from
+    `proposed_trade_executions`, because a batch that lands executes exactly the amounts
+    its solution proposed — verified to the atom on every order row of every settled
+    winner ([docs](../docs/analytics-db.md#a-settled-proposal-is-exact--the-only-divergence-is-settling-at-all)).
+    So the only thing chain data adds is whether it landed at all.
+
+    `landed` and `in_time` come apart: a batch that arrives after its deadline still fills
+    its orders, so the user does receive surplus, but the solver earns no reward for it.
+    Measured over the M1 window: 8,768 of 10,301 winners landed, of which 16 were late.
     """
 
-    settled: bool
+    landed: bool
+    """Did a settlement transaction appear on chain at all (`tx_hash is not null`)?"""
     in_time: bool
+    """Did it arrive before its deadline (`is_settled_in_time`)?"""
     tx_hash: str | None = None
+
+    @property
+    def counts_as_executed(self) -> bool:
+        """Whether the counterfactual treats this batch as having executed.
+
+        **A late settlement counts as a failure with zero surplus**, even though its orders
+        really did fill. Deliberate, and the one place this analysis knowingly departs from
+        what happened: a batch the protocol did not reward is not a batch the mechanism can
+        be credited with, and the surplus and reward sides of M2/M3 have to agree on which
+        winners delivered. The cost is the real surplus of 16 late winners in the window —
+        `landed and not in_time` is kept so that cost stays visible rather than becoming
+        invisible rounding.
+        """
+        return self.in_time
 
 
 @dataclass(frozen=True)
@@ -181,7 +201,7 @@ SETTLEMENTS_SQL = """
 select
     auction_id,
     solution_uid,
-    (tx_hash is not null)     as settled,
+    (tx_hash is not null)     as landed,
     is_settled_in_time        as in_time,
     encode(tx_hash, 'hex')    as tx_hash
 from dbt.int_backend_data__winning_solutions_with_onchain_status
@@ -373,7 +393,7 @@ def load_settlement_outcomes(
     for chunk in chunked(list(auction_ids), chunk_size):
         for row in fetch(conn, SETTLEMENTS_SQL, {"ids": list(chunk)}):
             outcomes.setdefault(row["auction_id"], {})[row["solution_uid"]] = Settlement(
-                settled=bool(row["settled"]),
+                landed=bool(row["landed"]),
                 in_time=bool(row["in_time"]),
                 tx_hash=row["tx_hash"],
             )

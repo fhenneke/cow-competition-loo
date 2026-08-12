@@ -268,13 +268,18 @@ is_settled_in_time = coalesce(block_number <= block_deadline and tx_hash is not 
 **16 winners in that window settled late.** Their orders *did* trade — all 16 have rows in
 `int_backend_data__trade_with_tx_hash` — so the users got their fills, but the solver earns
 no reward (`observed_score` is 0 without `is_settled_in_time`, see
-[rewards.md](rewards.md)). So:
+[rewards.md](rewards.md)). Literally, then:
 
-- a **surplus** question wants `tx_hash is not null` — did it execute at all;
-- a **reward** question wants `is_settled_in_time`.
+- `tx_hash is not null` answers "did this execute at all";
+- `is_settled_in_time` answers "did the protocol pay for it".
 
-Using the reward flag for a surplus question silently deletes 16 auctions' worth of real
-user surplus.
+**The leave-one-out analysis uses `is_settled_in_time` for both questions**, so a late batch
+is carried as a failure with zero surplus. That is knowingly not what happened, and it is the
+one such place in the pipeline. The reason is consistency across milestones: a batch the
+protocol did not reward cannot be credited to the mechanism on the surplus side and written
+off on the reward side. The cost is those 16 winners' real user surplus, and it is reported
+as `orders_lost_to_lateness` rather than absorbed. Anyone asking a pure "what did users
+actually receive" question wants `tx_hash is not null` instead.
 
 ### Failures are concentrated in the biggest solutions
 

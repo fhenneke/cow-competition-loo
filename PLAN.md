@@ -226,7 +226,7 @@ attach settlement to the *solution*, and both are biased:
   every replacement settles, because no record exists to consult. So where `X` won and
   reverted it reports users *gaining* from `X`'s removal, on nothing but the assumption
   that the replacement would have landed. Biased against `X`.
-- (b) `--outcome-rule proposed` assumes *everyone* settles, baseline included, so it
+- (b) `--outcome-rule assume-settled` assumes *everyone* settles, baseline included, so it
   overstates what users actually received wherever a winner reverted.
 
 The default is `--outcome-rule inherited`, which attaches settlement to the **slot**
@@ -258,9 +258,17 @@ Two facts settled the design, both measured over the M1 window and now in
   proposed ones, to the atom, and no proposed order of a settled winner is missing from the
   trades. So "observed versus proposed" reduces entirely to *did it settle*, and no separate
   observed-amount lookup is needed.
-- **Execution is `tx_hash is not null`, not `is_settled_in_time`.** 16 winners settled late:
-  their orders traded and users kept the surplus, but the solver earns no reward. The
-  reward flag belongs to M3; using it here would delete real user surplus.
+- **Execution is `is_settled_in_time`, so a late batch counts as a failure.** The two flags
+  genuinely differ: 16 winners landed late, their orders traded, and users kept the surplus
+  while the solver earned nothing. Using the reward flag on the surplus side therefore
+  discards real user surplus — deliberately, so that M2 and M3 agree on which winners
+  delivered, since a batch the protocol did not pay for cannot be credited to the mechanism
+  on one side and written off on the other. The discarded amount is reported as
+  `orders_lost_to_lateness` rather than absorbed.
+
+**Only settlement *status* is read from chain.** Executed amounts always come from
+`proposed_trade_executions`, never from the trade events, which the first bullet is what
+licenses.
 
 ### 5.1 M2 result
 
@@ -277,11 +285,12 @@ Same 7,745 mainnet auctions as M1, score mode, all three outcome rules:
 | baseline winner set differs from the DB | 5 | 0 |
 | **Δsurplus, `inherited`** (the default) | **+0.2632 ETH** | **+8.0082 ETH** |
 | Δsurplus, `observed` (lower bound) | −0.0347 ETH | +2.8919 ETH |
-| Δsurplus, `proposed` | +0.5116 ETH | +8.1318 ETH |
+| Δsurplus, `assume-settled` | +0.5116 ETH | +8.1318 ETH |
 | user orders compared | 8,439 | 6,961 |
 | executed only with the solver (`inherited`) | 636 | 184 |
 | executed only *without* it (`inherited` / `observed`) | 10 / 95 | 13 / 52 |
-| user orders the baseline lost to a failed settlement | 1,174 | 818 |
+| user orders the baseline lost to a failed settlement | 1,187 | 827 |
+| …of which merely late, so their surplus was real | 13 | 9 |
 | replacements inheriting a reverted slot | 80 | 38 |
 | replacements with nothing to inherit (mapping failures) | **0** | **0** |
 | fairness filter relaxed (and a newly-kept solution won) | 3 (3) | 11 (11) |
@@ -298,7 +307,7 @@ settled and they carry **50.2% of all winning score**
 ([numbers](docs/analytics-db.md#failures-are-concentrated-in-the-biggest-solutions)), so this
 is where most of the money is. Under `inherited` a reverted slot contributes zero to
 *both* sides and drops out, Fractal's sign flips to positive, and the remaining gap to
-`proposed` is small (0.26 vs 0.51, 8.01 vs 8.13) — that residual is genuine uncertainty
+`assume-settled` is small (0.26 vs 0.51, 8.01 vs 8.13) — that residual is genuine uncertainty
 about whether reverted batches would have landed, not an accounting asymmetry.
 
 Two facts make the slot rule cheap rather than a modelling gamble:
@@ -310,9 +319,17 @@ Two facts make the slot rule cheap rather than a modelling gamble:
   to 10 for Fractal and 52 to 13 for Sector, so ~85-90% of those orders were the settlement
   asymmetry rather than a real effect. What is left is the blocked-batch mechanism below.
 
+Treating a late settlement as a failure cost nothing here, but only by luck: none of the
+window's 16 late winners belong to either solver measured (they are BRRRolver 5, Baseline 4,
+Barter 3, Helixbox 3, Wraxyn 1). For those two, every late batch was some other solver's
+winner that won on both sides and cancelled, so Δsurplus is identical to four decimals under
+either criterion — it moved only the `unsettled` count, by exactly the 9 and 13 late orders.
+Removing one of those five solvers would move the headline, so `orders_lost_to_lateness` is
+worth reading, not just carrying.
+
 `observed` is retained because it is a *provable* lower bound: it differs from `inherited`
 only on reverted slots, where it credits the replacement with positive surplus and
-`inherited` credits it with nothing, the baseline being zero either way. `proposed` is
+`inherited` credits it with nothing, the baseline being zero either way. `assume-settled` is
 usually but not provably the upper bound — a reverted slot whose replacement carries more
 user surplus than the winner it displaced would push it below `inherited`, which score-mode
 ranking permits since score is not surplus.
@@ -406,7 +423,7 @@ State these caveats with the results:
    settlement of the slot it displaced, so a reverted batch stays reverted and settlement
    cancels out of Δsurplus; quote `observed` alongside it as the provable lower bound.
    14.9% of winners never settled and they hold 50.2% of winning score, so this is a
-   first-order caveat, not a footnote — the residual `inherited`-to-`proposed` gap is real
+   first-order caveat, not a footnote — the residual `inherited`-to-`assume-settled` gap is real
    uncertainty about whether those batches would ever have landed.
 3. **Filter proxy** — the measured per-pair surplus proxy error from M1 step 5.
 4. **Quote rewards excluded** — no data on counterfactual quoting.
