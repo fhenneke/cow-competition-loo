@@ -11,6 +11,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+notebook = ["jupyterlab>=4.0", "matplotlib>=3.8"]
 
 [project.scripts]
 loo = "loo.cli:main"

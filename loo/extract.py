@@ -13,12 +13,13 @@ joins `proposed_solutions.uid`, never `.id`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from statistics import median
 from typing import Iterator, Sequence
 
 from decimal import Decimal
 
 from .db import as_int, chunked, fetch
-from .primitives import order_owner
+from .primitives import order_owner, usd_per_native, usd_reference_tokens
 from .rewards import SolverReward, Win
 from .valuation import Order
 
@@ -254,6 +255,16 @@ CONVERSION_RATES_SQL = """
 select block_number, conversion_rate_cow_to_native
 from dbt.int_accounting_period_data__conversion_rates
 where block_number = any(%(blocks)s)
+"""
+
+# USD reference prices for display conversion (M4). The analytics DB has no USD price
+# table; a major stablecoin's native price in the auction's own price vector implies
+# the rate — see `primitives.USD_REFERENCE_TOKENS`.
+USD_PRICES_SQL = """
+select auction_id, encode(token, 'hex') as token, price
+from dbt.stg_backend_data__auction_prices
+where auction_id = any(%(ids)s)
+  and token = any(%(tokens)s)
 """
 
 # `--solver` takes a name or an address. Names are matched **exactly** (case-insensitively):
@@ -579,6 +590,31 @@ def load_conversion_rates(
             # DB displays rather than the binary expansion of the float.
             rates[row["block_number"]] = Decimal(str(rate)) if rate is not None else None
     return rates
+
+
+def load_usd_rates(
+    conn, auction_ids: Sequence[int], network: str = "mainnet", chunk_size: int = CHUNK_SIZE
+) -> dict[int, Decimal]:
+    """USD per native token, per auction, implied by stablecoin native prices.
+
+    Per auction the median across the network's reference stablecoins is taken, so one
+    bad price cannot set the rate (the D14 lesson, applied to the one place a price is
+    used without a counterparty to cross-check it). Auctions where no reference token
+    was priced are simply absent — callers fall back to a window median rather than
+    treating that as an error, since USD figures are display only.
+    """
+    reference = usd_reference_tokens(network)
+    token_bytes = [bytes.fromhex(token) for token in reference]
+    per_auction: dict[int, list[Decimal]] = {}
+    for chunk in chunked(list(auction_ids), chunk_size):
+        rows = fetch(conn, USD_PRICES_SQL, {"ids": list(chunk), "tokens": token_bytes})
+        for row in rows:
+            per_auction.setdefault(row["auction_id"], []).append(
+                usd_per_native(as_int(row["price"]), reference[row["token"]])
+            )
+    return {
+        auction_id: median(rates) for auction_id, rates in per_auction.items()
+    }
 
 
 def solver_matches(conn, solver: str, start: str, end: str) -> list[SolverMatch]:

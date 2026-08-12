@@ -42,7 +42,7 @@ from .winner_selection import (
     compute_reference_scores,
 )
 
-OutcomeRule = Literal["inherited", "observed", "assume-settled"]
+OutcomeRule = Literal["inherited", "assume-settled"]
 
 OUTCOME_RULE = {
     "inherited": (
@@ -52,49 +52,42 @@ OUTCOME_RULE = {
         "if the batch that really occupied those pairs reverted, the replacement reverts "
         "too"
     ),
-    "observed": (
-        "settlement belongs to the solution: a winner that won for real takes its own "
-        "recorded outcome, and a replacement is assumed to settle because there is no "
-        "record to consult"
-    ),
     "assume-settled": (
-        "every winning solution's orders execute at its proposed amounts on both "
-        "sides, so settlement risk is excluded from the comparison entirely"
+        "every winning solution on both sides is assumed to settle in time and execute "
+        "its proposed amounts, so settlement risk is excluded from the comparison "
+        "entirely"
     ),
 }
 """How a winner's orders are given an outcome. `inherited` is the default.
 
-All three apply to **both** sides identically, which is what makes the difference
+Both rules apply to **both** sides identically, which is what makes the difference
 meaningful: a solution that wins in the baseline and again without the removed solver gets
 the same outcome in both, so it cancels exactly and only genuinely changed orders move
 `delta_surplus`.
 
-The three differ only in what a *replacement* — a winner that never won for real, so
-nothing was ever recorded about it — is taken to do. That is not a detail: 1,533 of the
-10,301 winners in the M1 window never settled, so the assumption is load-bearing.
+They differ only in what a *replacement* — a winner that never won for real, so nothing
+was ever recorded about it — is taken to do. That is not a detail: 1,533 of the 10,301
+winners in the M1 window never settled, so the assumption is load-bearing.
 
 - `inherited` reads settlement off the auction's token pairs. Whatever really happened to
   the pairs a replacement claims, happens to the replacement. Settlement therefore cancels
   out of `delta_surplus` entirely and the result measures the competition's *decision*,
   which is the question M2 asks.
-- `observed` credits every replacement with settling. It charges the baseline for real
-  reverts while assuming the counterfactual never reverts, so it is biased against the
-  removed solver — it is kept only as the pessimistic bound.
-- `assume-settled` credits *everyone* with settling, baseline included, so it overstates what
-  users really received wherever a winner reverted.
+- `assume-settled` is the everything-lands-in-time scenario: every winner on both sides
+  settles, so the comparison is about proposals alone.
 
-`delta_surplus` under `observed` is a lower bound on `inherited` **by construction**: the
-two differ only on reverted slots, where `observed` credits the replacement with a positive
-surplus and `inherited` credits it with nothing, and the baseline is zero either way.
-`assume-settled` is *usually* the upper bound but not provably so — a reverted slot whose
-replacement carries more user surplus than the winner it displaced pushes it below
-`inherited`, which score-mode ranking permits since score is not surplus. Measured on the
-window, the three came out ordered: 2.89 / 8.01 / 8.13 ETH for Sector.
+A third rule, `observed` — a replacement assumed to settle while recorded winners keep
+their real outcomes — existed through M3 as a "lower bound" and was **removed in the M4
+review**: settlement attached to the solution is not a counterfactual anyone would defend
+(it charges the baseline for real reverts while crediting the counterfactual with never
+reverting), and a number nobody should quote is not made useful by calling it a bound.
+Measured before removal it moved the answer by 2–4× the headline, which is the measure of
+how wrong an unrealistic settlement assumption can be — not a bracket worth reporting.
 """
 
 
 class MissingSettlementError(Exception):
-    """A recorded winner has no settlement outcome under the `observed` rule.
+    """A recorded winner has no settlement outcome under the `inherited` rule.
 
     Loud rather than defaulted: silently assuming a missing winner settled would inflate
     baseline surplus, and assuming it did not would deflate it. Both would read as a
@@ -320,9 +313,8 @@ class SideOutcomes:
     orphans: frozenset[int]
     """Replacements whose settlement had to be assumed rather than derived — PLAN.md
     section 5's "record how often the mapping fails". Under `inherited` these are the
-    replacements claiming a pair no recorded winner held, so there was nothing to inherit;
-    under `observed` every replacement is one. Empty under `assume-settled`, which does not
-    consult the record at all."""
+    replacements claiming a pair no recorded winner held, so there was nothing to
+    inherit. Empty under `assume-settled`, which does not consult the record at all."""
     solution_executed: dict[int, bool] = field(default_factory=dict)
     """The per-winner settlement decision the orders above were given, by solution uid.
     This is what the reward formula's `observed_score` consumes — keeping it here rather
@@ -382,21 +374,17 @@ def side_outcomes(
             outcome = settled[uid]
             executed, observed = outcome.counts_as_executed, True
             late = outcome.landed and not outcome.in_time
-        elif outcome_rule == "inherited":
-            # The slot rule: whatever really happened to the pairs this replacement
-            # claims, happens to it. A batch spanning several slots needs all of them to
-            # have settled, since one reverting leg would have taken the batch with it.
+        else:
+            # `inherited`, the slot rule: whatever really happened to the pairs this
+            # replacement claims, happens to it. A batch spanning several slots needs all
+            # of them to have settled, since one reverting leg would have taken the batch
+            # with it.
             displaced = [inherit[p] for p in entry.solution.winner_pairs if p in inherit]
             executed, observed = (all(displaced) if displaced else True), False
             if not displaced:
                 orphans.add(uid)
             elif not executed:
                 inherited_reverts.add(uid)
-        else:
-            # `observed`: nothing was ever recorded about a replacement, so it is
-            # assumed to settle — the asymmetry that makes this rule the lower bound.
-            executed, observed = True, False
-            orphans.add(uid)
 
         solution_executed[uid] = executed
 
@@ -449,9 +437,8 @@ class OrderDiff:
     inherited from the slot or assumed?
 
     `observed_base and not executed_base` marks an order the baseline really did lose to a
-    reverted batch. Under `inherited` the replacement holding that slot reverts too, so the
-    order cancels out of `delta_surplus`; under `observed` the replacement is credited with
-    settling and the order becomes a spurious gain from removing the solver.
+    reverted batch. Under `inherited` the replacement holding that slot reverts too, so
+    the order cancels out of `delta_surplus`.
     """
 
     late_base: bool = False
@@ -465,11 +452,13 @@ class OrderDiff:
 
     @property
     def delta_surplus(self) -> int:
-        """Baseline minus counterfactual, substituting 0 for an unexecuted order.
+        """Counterfactual minus actual, substituting 0 for an unexecuted order.
 
-        Positive means users were better off *with* the removed solver in the auction.
+        Negative means the user would have received less without the removed solver.
+        How a change is turned into a statement about the solver is the reader's step,
+        not the pipeline's — deltas describe the scenario.
         """
-        return (self.surplus_base or 0) - (self.surplus_loo or 0)
+        return (self.surplus_loo or 0) - (self.surplus_base or 0)
 
     @property
     def only_with_solver(self) -> bool:
@@ -485,10 +474,6 @@ class OrderDiff:
         Remove that rival and the whole batch wins, including the orders no one else bid
         on. Observed on auction 13488369: a two-order batch was blocked by a single-order
         winner, and removing the winner filled both orders.
-
-        Under `observed` a settlement failure is a second route into this, since the
-        baseline winner is only credited if it really settled while its replacement is
-        assumed to. `inherited` closes that route.
         """
         return self.executed_loo and not self.executed_base
 
@@ -619,7 +604,8 @@ class AuctionCounterfactual:
 
     @property
     def delta_surplus(self) -> int:
-        """Native surplus users got with the solver, minus without it, over user orders."""
+        """Change in native user surplus in the counterfactual: without-solver minus
+        with-solver, over user orders. Negative means users would have received less."""
         return sum(d.delta_surplus for d in self.order_diffs if d.contributes)
 
     @property
@@ -640,12 +626,13 @@ class AuctionCounterfactual:
 
     @property
     def delta_rewards(self) -> int:
-        """Uncapped native rewards the protocol pays with the solver, minus without it.
+        """Change in uncapped native rewards in the counterfactual: without-solver minus
+        with-solver.
 
-        Positive means the solver's presence costs the protocol money — the usual case,
-        since its own reward drops out and rivals' rewards *grow* without it (their
-        reference scores fall when its solutions leave the without-`s` pick)."""
-        return self.rewards_base - self.rewards_loo
+        Positive means the protocol would pay more without the solver — the usual case,
+        since rivals' reference scores fall when its solutions leave the without-`s`
+        pick, so their rewards grow."""
+        return self.rewards_loo - self.rewards_base
 
     @staticmethod
     def _capped_total(rewards: dict[str, SolverReward]) -> Decimal | None:
@@ -669,7 +656,7 @@ class AuctionCounterfactual:
         base, loo = self.rewards_base_capped, self.rewards_loo_capped
         if base is None or loo is None:
             return None
-        return base - loo
+        return loo - base
 
     @property
     def price_suspect(self) -> bool:
@@ -927,9 +914,8 @@ class Analysis:
     orders_only_without_solver: int = 0
     orders_unsettled_base: int = 0
     """User orders the baseline lost to a settlement failure. Under `inherited` a
-    replacement holding the same slot loses them too, so they cancel; under `observed` the
-    replacement is credited with settling and they are exactly where `delta_surplus` is
-    biased against the removed solver."""
+    replacement holding the same slot loses them too, so they cancel out of
+    `delta_surplus`; under `assume-settled` neither side loses them."""
     orders_lost_to_lateness: int = 0
     """Of those, the ones whose batch *did* fill, just after its deadline. These carry real
     user surplus that `Settlement.counts_as_executed` deliberately discards, so this is the
@@ -946,8 +932,7 @@ class Analysis:
     settlement. On the counterfactual side this is most of them, by construction."""
     inherited_reverts_loo: int = 0
     """Of those, how many the `inherited` rule takes as reverting because the batch that
-    really held their token pairs reverted. This is the count `observed` would instead have
-    credited with settling."""
+    really held their token pairs reverted."""
     orphans_base: int = 0
     orphans_loo: int = 0
     """Replacements whose settlement had to be assumed rather than derived, because no
@@ -965,18 +950,21 @@ class Analysis:
 
     @property
     def delta_surplus(self) -> int:
-        """Positive means users were better off with the solver in the competition."""
-        return self.surplus_base - self.surplus_loo
+        """Counterfactual minus actual: negative means users would have received less
+        without the solver. All deltas describe the scenario's change; turning a change
+        into a statement about the solver is deliberately left to the reader."""
+        return self.surplus_loo - self.surplus_base
 
     @property
     def delta_rewards(self) -> int:
-        """Positive means the protocol pays more with the solver than without it."""
-        return self.rewards_base - self.rewards_loo
+        """Counterfactual minus actual: positive means the protocol would pay more
+        without the solver."""
+        return self.rewards_loo - self.rewards_base
 
     @property
     def delta_rewards_capped(self) -> Decimal:
         """The capped estimate of `delta_rewards`, over `auctions_capped`."""
-        return self.rewards_base_capped - self.rewards_loo_capped
+        return self.rewards_loo_capped - self.rewards_base_capped
 
     def add(self, result: AuctionCounterfactual) -> None:
         self.auctions += 1

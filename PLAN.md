@@ -33,7 +33,7 @@ stays in the sections and docs each row links to; the milestone sections cite th
 | D1 | Rank solutions on the **recorded score**; surplus mode is a separate, self-consistent answer to the user-value question, not an approximation of the competition ([§2](#2-two-valuations-deliberately-separate)) | recomputing scores — impossible, fee policies only exist for executed orders | `valuation.solution_total` | `--mode surplus` exists |
 | D2 | The fairness filter compares per-pair **user surplus on both sides**, in both modes ([§2](#2-two-valuations-deliberately-separate), [measured](docs/winner-selection.md#the-filter-runs-on-surplus)) | `scaled` / `raw` score-scale splits — built, measured 30× worse, removed | `build_solutions` filling `Solution.pair_values` from `pair_surplus` | feed a different per-pair decomposition; the measured cost of this one is the proxy error rate ([§4.1](#41-m1-result)) |
 | D3 | The LOO ranking is a **full re-arbitration** — steps 3–6, so removing a solver can lower a baseline and un-filter solutions ([§5](#5-m2--loo-ranking-and-surplus-deltas--done)) | re-picking on the recorded kept set, as reference scores do — would have missed all 14 un-filter wins | `counterfactual.leave_one_out` | — |
-| D4 | A winner's settlement attaches to the **slot**, not the solver: a replacement inherits the recorded outcome of the token pairs it claims ([§5](#5-m2--loo-ranking-and-surplus-deltas--done)) | `observed` — kept as the provable lower bound; `assume-settled` — kept as the usual upper bound | `counterfactual.OUTCOME_RULE`, `side_outcomes` | `--outcome-rule` exists |
+| D4 | A winner's settlement attaches to the **slot**, not the solver: a replacement inherits the recorded outcome of the token pairs it claims ([§5](#5-m2--loo-ranking-and-surplus-deltas--done)). `assume-settled` (everything lands in time) is the one alternative scenario kept | `observed` (settlement attached to the solution) — carried through M3 as a "lower bound", **removed in the M4 review**: charging the baseline for real reverts while crediting every replacement is not a counterfactual anyone would defend, and calling it a bound kept inviting it to be quoted ([§7.1](#71-m4-result)) | `counterfactual.OUTCOME_RULE`, `side_outcomes` | `--outcome-rule` exists |
 | D5 | "Executed" means **`is_settled_in_time`** on both the surplus and the reward side; a late batch counts as a failure and its real surplus is reported, not absorbed ([why](docs/analytics-db.md#settled-and-settled_in_time-come-apart-and-which-one-you-want-depends)) | `tx_hash is not null` — what users actually received | `extract.Settlement.counts_as_executed` | flip that one property |
 | D6 | Executed amounts always come from **`proposed_trade_executions`**; only the settlement *status* is read from chain ([verified exact](docs/analytics-db.md#a-settled-proposal-is-exact--the-only-divergence-is-settling-at-all)) | reading on-chain trade amounts — redundant, a settled proposal executes exactly, to the atom | `extract.py` | — |
 | D7 | Tie-breaks reproduce the record by feeding solutions in **`uid` order** through stable sorts ([why](docs/analytics-db.md#proposed_solutionsuid-encodes-the-ranking)) | — the autopilot's pre-sort shuffle is not recoverable from anything else | uid-ordered extraction, stable sorts in `arbitrate` | not revisable |
@@ -44,6 +44,8 @@ stays in the sections and docs each row links to; the milestone sections cite th
 | D12 | The reward side consumes the **same per-solution settlement decision** as the surplus side, under whatever outcome rule is in force, so the two views of one auction cannot disagree about which winners delivered (D5 extended to M3) | reading `is_settled_in_time` again independently | `SideOutcomes.solution_executed` feeding `Win.settled` | — |
 | D13 | Δrewards converts native → COW **per auction**, at the accounting-period rate of its `block_deadline`; an unsnapshotted rate leaves the auction unconverted and reported, never guessed | one window-level rate — wrong whenever a window straddles a Tuesday period boundary | `cli.convert_delta_rewards` | — |
 | D14 | Every solution's executed amounts are valued through **both** tokens' native prices; an auction with a >2× disagreement is **excluded from every statistic** and named in the report — a wrong price fabricates every number it touches, so quoting it at all misleads ([§6.1](#61-m3-result)) | trusting `auction_prices` — one token was ~15,300× off for a whole window, fabricating the M2 "whale"; cross-auction median checks — fail exactly there, the wrong price is the persistent one; with-and-without reporting — built first, dropped as noise once the with-suspects numbers proved purely artefactual ([details](docs/analytics-db.md#native-prices-can-be-plain-wrong)) | `counterfactual.price_imbalanced`, `Analysis.exclude_price_suspect` | `--include-price-suspects`, `PRICE_IMBALANCE_THRESHOLD` |
+| D15 | USD figures are **display-only conversions**, per auction, at the rate implied by the auction's own stablecoin prices (median of USDC/USDT/DAI in `auction_prices`, window-median fallback); networks without curated reference tokens skip USD rather than guess ([source](docs/analytics-db.md#no-usd-prices--stablecoin-native-prices-imply-the-rate)) | an external price feed — a new dependency and a second trust domain for a cosmetic number; a single window rate — the per-auction rate costs nothing more (D13's logic) | `primitives.USD_REFERENCE_TOKENS`, `extract.load_usd_rates`, `aggregate.usd_total` | extend `USD_REFERENCE_TOKENS` after verifying addresses |
+| D16 | Every delta is **counterfactual − actual** (without-solver minus with-solver), so numbers read as what the removal scenario changes and turning them into a "value of the solver" is left to the reader; the convention is printed on every rendering and stamped into report JSONs, which `compare` refuses without the marker (M4 review) | with − without, M2–M3's convention (a solver's value carries a plus sign by construction) — §5.1 and §6.1 keep their historical signs; flip them to compare with §7.1 | `counterfactual` delta properties, `aggregate.SIGN_CONVENTION_ID`, `load_report` | not worth revising again — a second flip would strand two conventions in the wild |
 
 ## 2. Two valuations, deliberately separate
 
@@ -85,13 +87,15 @@ loo/
   validate.py          # M1: reproduce the recorded competition and attribute every diff
   counterfactual.py    # baseline vs. LOO per auction -> per-order and per-auction diffs
   rewards.py           # uncapped (+ later capped) rewards
-  cli.py               # --network --solver <name|addr> --start --end --mode --out
+  aggregate.py         # M4: analyse reports -> medians, USD, per-solver comparison
+  cli.py               # subcommands: validate, validate-rewards, analyse, compare
 tests/
   test_winner_selection.py
   test_valuation.py
   test_validate.py
   test_counterfactual.py
   test_rewards.py
+  test_aggregate.py
 notebooks/analysis.ipynb
 ```
 
@@ -301,6 +305,11 @@ M2 and M3 agree on which winners delivered, with the discarded amount reported a
 > the suspects still in; do not quote Sector's without that warning —
 > [§6.1](#61-m3-result),
 > [details](docs/analytics-db.md#native-prices-can-be-plain-wrong).
+>
+> **Addendum (M4 review, D4/D16):** the `observed` rule discussed at length below was
+> **removed** — see D4 — and the sign convention has since flipped to counterfactual −
+> actual (D16). The numbers in this section keep their historical with − without signs
+> and include `observed`; the current-convention result is [§7.1](#71-m4-result).
 
 ```bash
 uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04
@@ -449,6 +458,9 @@ fabricated the M2 "whale" ([§5.1 addendum](#51-m2-result)).
 
 ### 6.1 M3 result
 
+> **Addendum (M4 review, D16):** signs in this section are the historical
+> with − without convention; flip them to compare with [§7.1](#71-m4-result).
+
 ```bash
 uv run loo validate-rewards --start 2026-08-01 --end 2026-08-04
 uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04
@@ -520,18 +532,45 @@ can add them if a bound is wanted.
 Not built, deferred: `notebooks/analysis.ipynb` (M4). Cap backfill via fee policies
 (D11's revision path) stays unneeded while orphans are 0.
 
-## 7. M4 — aggregation and write-up
+## 7. M4 — aggregation and write-up — **done**
 
-Window aggregation, USD conversion, per-solver comparison table, notebook.
+Window aggregation, USD conversion, per-solver comparison table, notebook. Results in
+[§7.1](#71-m4-result); what follows is the spec and what was built.
 
 Headline row per solver-window: Δsurplus (native/USD), Δrewards, net value =
 Δsurplus − Δrewards, orders saved, auctions affected, share of auctions won,
 filter-relaxation count.
 
-**Lead with `inherited` and carry `observed` as the lower bound.** M2 found that how a
-replacement's settlement is modelled moves the headline by several ETH and, under the
-solution-attached rule, flips a sign ([§5.1](#51-m2-result)). Quoting a single figure without
-naming its rule would be a choice disguised as a result.
+**Built as post-processing, not a new pipeline.** `loo compare out/*.json` aggregates
+reports written by `analyse --out`: the report already carries every changed auction's
+deltas, and an auction where nothing moved cancels identically, so the whole window
+lives in those files and a comparison costs seconds rather than six 5-minute re-runs.
+`loo/aggregate.py` re-derives every sum from the per-auction moves and **rejects a
+report whose totals disagree with its own auctions** (truncated, edited, or from an
+incompatible `analyse`), and likewise rejects a report not stamped with the current
+sign convention — both flanks of a stale file fail loudly instead of tabulating
+wrong. A comparison refuses to tabulate a solver-window that lacks an `inherited`
+run — the headline rule is a property of the method, not of whichever file happens to
+exist. Direction stays visible beside the magnitude statistics as the per-auction
+sign split, and the sign convention (counterfactual − actual, D16) is printed on
+every rendering. The same module drives `notebooks/analysis.ipynb` (concentration
+curve, per-auction distribution); the CLI and the notebook render one
+`aggregate.comparison(...)` result.
+
+USD conversion is D15: per auction, at the rate implied by the auction's own
+stablecoin prices — the analytics DB has no USD table, and the three mainnet reference
+tokens agree to ~0.1% over the window
+([source](docs/analytics-db.md#no-usd-prices--stablecoin-native-prices-imply-the-rate)).
+Δrewards is converted over the same changed auctions, so every USD figure is the exact
+per-auction conversion of the ETH figure beside it.
+
+**Lead with `inherited`; `assume-settled` is the one alternative scenario.** M2 found
+that how a replacement's settlement is modelled moves the headline by several ETH
+([§5.1](#51-m2-result)), so the rule is named with every figure. The M4 review then
+removed the third rule (`observed`) outright — settlement attached to the solution is
+not a counterfactual anyone would defend, and its number kept being misread as an
+answer (D4). What remains are the two readings that mean something: the record's own
+settlements (`inherited`) and everything-lands-in-time (`assume-settled`).
 
 Report **medians alongside sums**: a single auction supplies 82% of Sector's net Δsurplus,
 against a median non-zero auction of 0.000056 ETH, so a sum on its own says more about one
@@ -547,9 +586,9 @@ State these caveats with the results:
    ([why](docs/winner-selection.md#max_solutions_per_solver-is-applied-before-arbitrate)).
 2. **Settlement risk** — which §5 rule was used. `inherited` hands a replacement the
    settlement of the slot it displaced, so a reverted batch stays reverted and settlement
-   cancels out of Δsurplus; quote `observed` alongside it as the provable lower bound.
+   cancels out of Δsurplus; `assume-settled` is the everything-lands-in-time reading.
    14.9% of winners never settled and they hold 50.2% of winning score, so this is a
-   first-order caveat, not a footnote — the residual `inherited`-to-`assume-settled` gap is real
+   first-order caveat, not a footnote — the `inherited`-to-`assume-settled` gap is real
    uncertainty about whether those batches would ever have landed.
 3. **Filter proxy** — the measured per-pair surplus proxy error from M1 step 5.
 4. **Quote rewards excluded** — no data on counterfactual quoting.
@@ -564,3 +603,93 @@ State these caveats with the results:
    uncapped Δrewards. Every statistic is over the clean set; name the excluded
    auctions and their count (0.6% of the window) rather than quoting any number that
    includes them.
+
+These plus D15's display-only USD caveat are rendered by `compare` and the notebook
+with every table — the numbers are not supposed to travel without them.
+
+### 7.1 M4 result
+
+```bash
+for solver in Fractal Sector; do
+  for rule in inherited assume-settled; do
+    uv run loo analyse --solver "$solver" --start 2026-08-01 --end 2026-08-04 \
+        --outcome-rule "$rule" --out "out/$(echo $solver | tr 'A-Z' 'a-z')-$rule.json"
+  done
+done
+uv run loo compare out/*.json --markdown
+```
+
+Same 7,745 mainnet auctions as M1–M3, score mode, every statistic over the 7,701-auction
+clean set (D14). USD at each auction's stablecoin-implied rate, window median
+$1,863.76/ETH (D15). Signs are D16's convention, stated on every rendering: **every
+delta is counterfactual − actual**, so the numbers read as what the removal scenario
+changes — negative Δsurplus means users would have received less — and turning a
+change into a value of the solver is the reader's step. The table below is `compare`'s
+output verbatim:
+
+| | Fractal | Sector |
+| --- | --- | --- |
+| auctions analysed | 7,701 of 7,745 (44 price-suspect excluded) | 7,701 of 7,745 (44 price-suspect excluded) |
+| solver bid | 5,846 (75.9%) | 4,845 (62.9%) |
+| solver won | 1,005 (13.1%) | 1,011 (13.1%) |
+| Δsurplus (inherited) | -0.2631 ETH (-$488.69) | -1.3259 ETH (-$2,463.34) |
+| &nbsp;&nbsp;assume-settled | -0.5114 ETH (-$949.92) | -1.4449 ETH (-$2,684.29) |
+| &nbsp;&nbsp;median non-zero auction | 0.000094 ETH ($0.18) over 750 auctions | 0.000058 ETH ($0.11) over 970 auctions |
+| &nbsp;&nbsp;auctions moved + / − | 0 (0.0000 ETH) / 750 (-0.2631 ETH) | 7 (+0.0003 ETH) / 963 (-1.3262 ETH) |
+| &nbsp;&nbsp;largest single auction | -0.0518 ETH — 20% of the total (auction 13509837) | -0.2595 ETH — 20% of the total (auction 13500787) |
+| Δrewards uncapped | +0.1784 ETH (2951.69 COW, $329.26) | +3.0783 ETH (50921.50 COW, $5,738.93) |
+| Δrewards capped (estimate) | +0.0187 ETH (308.99 COW, $34.46) | +0.0981 ETH (1622.03 COW, $184.29) |
+| net change (Δsurplus − capped Δrewards) | -0.2818 ETH (-$523.15) | -1.4239 ETH (-$2,647.62) |
+| orders executed only with the solver | 635 (7.6% of 8,386 compared) | 183 (2.7% of 6,897 compared) |
+| orders executed only without | 10 | 12 |
+| auctions where anything moved | 1,275 | 1,780 |
+| fairness filter relaxed | 3 (newly kept won 3) | 10 (newly kept won 10) |
+
+Four findings:
+
+- **Removing either solver leaves users and the protocol worse off, at small dollar
+  scale.** In the counterfactual, users lose 0.26 ETH ($489) without Fractal and
+  1.33 ETH ($2,463) without Sector over three days, while capped payments *rise*
+  (+0.02 / +0.10 ETH — rivals' reference scores fall, so their capped rewards grow):
+  the net change, Δsurplus minus the *capped* reward delta per caveat 5, is
+  −0.28 ETH ($523) and −1.42 ETH ($2,648). The reward side reinforces rather than
+  offsets the surplus side, at a tenth-of-an-ETH scale.
+- **The settlement scenario matters, and it is named with every figure.** The
+  everything-lands-in-time reading (`assume-settled`) deepens the loss to −0.51 /
+  −1.44 ETH; its gap to `inherited` (−0.25 / −0.12) is genuine uncertainty about
+  whether reverted batches would ever have landed, which is caveat 2. The third rule
+  M2 had carried as a "lower bound" (`observed`) was removed in this review (D4):
+  charging the baseline for real reverts while crediting every replacement with
+  settling is not a counterfactual anyone would defend, and on the clean set it
+  swung Sector's answer by 5.1 ETH — a measure of how wrong an indefensible
+  settlement assumption can be, not a bracket worth reporting.
+- **Even the clean set is whale-shaped, which is why the medians ride in the table.**
+  The largest single auction is 20% of the headline for both solvers, and the median
+  non-zero auction moves $0.18 (Fractal) / $0.11 (Sector) — five orders of magnitude
+  below the sum it contributes to. The direction, kept visible in the sign-split
+  row, is near-uniform: all 750 of Fractal's moved auctions and 963 of Sector's 970
+  lose surplus in the counterfactual. The notebook's concentration curve makes the
+  whale point graphically: a handful of auctions carry the window, so any one of
+  them being wrong (the D14 lesson) moves the headline materially, and per-auction
+  inspection of the top movers stays part of reading a result.
+- **Coverage is where the two solvers genuinely differ.** 635 orders (7.6% of those
+  compared) trade only when Fractal is present, against Sector's 183 (2.7%) —
+  Fractal wins fewer, smaller auctions but is more often the only bidder on an
+  order. At near-identical win rates on the clean set (13.1% each), the coverage
+  question and the surplus question give opposite rankings, which is the reason M4
+  reports them side by side rather than collapsing them into one score.
+
+Clean-set bookkeeping against §5.1/§6.1 (mind D16 — those sections keep the old
+with − without signs): recomputed wins drop to 1,005 / 1,011 (from 1,007 / 1,025 with
+suspects in), Sector's filter relaxations to 10 (from 11 — one was in a suspect
+auction), and orders compared to 8,386 / 6,897. `compare` re-derives every total from
+the per-auction moves and refuses a report whose own sums disagree or that predates
+the sign convention, so the table cannot silently drift from the files behind it.
+
+Deliverables land with this milestone: `loo/aggregate.py`, the `compare` subcommand,
+`tests/test_aggregate.py`, and `notebooks/analysis.ipynb` (`uv run --extra notebook
+jupyter lab`). The rendered `out/comparison.{txt,md}` are regenerable run artifacts —
+`out/` stays untracked, and the table above is the record. Not covered, recorded
+rather than implied: §1's secondary question on concentration by token pair and app
+code (the per-order diffs carry no token pair in the report JSON), and multi-window /
+multi-network sweeps — both are post-processing extensions of the same reports.
