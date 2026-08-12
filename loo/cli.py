@@ -86,8 +86,7 @@ def run_validate(args) -> int:
     conn = db.connect(args.network)
 
     try:
-        window = extract.auctions_in_window(conn, args.start, args.end)
-        auction_ids = [auction_id for auction_id, _ in window]
+        auction_ids = extract.auctions_in_window(conn, args.start, args.end)
         if args.limit:
             auction_ids = auction_ids[: args.limit]
 
@@ -169,8 +168,7 @@ def run_analyse(args) -> int:
                 file=sys.stderr,
             )
 
-        window = extract.auctions_in_window(conn, args.start, args.end)
-        auction_ids = [auction_id for auction_id, _ in window]
+        auction_ids = extract.auctions_in_window(conn, args.start, args.end)
         if args.limit:
             auction_ids = auction_ids[: args.limit]
         print(

@@ -10,7 +10,7 @@ Everything here mirrors `arbitrator.rs`; deviations are called out in comments.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Sequence
+from typing import Iterable, NamedTuple, Sequence
 
 from .primitives import MAX_WINNERS, Pair
 
@@ -183,47 +183,53 @@ def arbitrate(
     )
 
 
-def arbitrate_fixed_filter(
-    kept: Iterable[Solution], max_winners: int = MAX_WINNERS
-) -> Ranking:
-    """Winner picking only, on a kept set someone else decided.
+class ReferenceScore(NamedTuple):
+    """One winning solver's reference score, and who supplied it."""
 
-    Re-runs step 5 without recomputing baselines, so a solution that was unfair only
-    because of a removed solver stays unfair. A true leave-one-out re-runs `arbitrate`
-    instead; both variants are needed (see docs/winner-selection.md).
-
-    Unlike `compute_reference_scores` this re-sorts by descending total, because the
-    caller is starting a fresh pick. The reference-score path deliberately does *not*
-    sort — it re-picks on `Ranking.ranked`, which is winner-first, not total-ordered.
-    """
-    scored = [s for s in kept if s.total != 0]
-    scored.sort(key=lambda s: -s.total)
-    ranked, winner_uids = _rank(scored, max_winners)
-    return Ranking(ranked=ranked, filtered_out=(), winner_uids=winner_uids)
+    score: int
+    setters: frozenset[str]
+    """Solvers whose solutions make up the score — i.e. whose removal moves it."""
 
 
-def compute_reference_scores(
+def compute_reference_outcomes(
     ranking: Ranking, max_winners: int = MAX_WINNERS
-) -> dict[str, int]:
-    """Reference score per winning solver (`arbitrator.rs:607`).
+) -> dict[str, ReferenceScore]:
+    """Reference score per winning solver (`arbitrator.rs:607`), with its setters.
 
     For each winning solver, re-pick winners over `ranking.ranked` with **all** of that
-    solver's solutions removed, and sum their totals. Walks `ranked` in its stored
-    order — see `_rank` for why that order matters.
+    solver's solutions removed; the reference score is the sum of those winners' totals.
+    Walks `ranked` in its stored order — see `_rank` for why that order matters.
+
+    The Rust returns only the scores. The setters ride along because the counterfactual
+    needs "whose reward moves when a solver disappears", and answering it separately
+    would mean a second copy of this walk re-doing every pick.
     """
-    reference_scores: dict[str, int] = {}
+    outcomes: dict[str, ReferenceScore] = {}
 
     for solution in ranking.ranked:
         solver = solution.solver
-        if len(reference_scores) >= max_winners:
-            return reference_scores
-        if solver in reference_scores:
+        if len(outcomes) >= max_winners:
+            return outcomes
+        if solver in outcomes:
             continue
         if solution.solution_uid not in ranking.winner_uids:
             continue
 
         without_solver = [s for s in ranking.ranked if s.solver != solver]
         winner_indices = pick_winners(without_solver, max_winners)
-        reference_scores[solver] = sum(without_solver[i].total for i in winner_indices)
+        outcomes[solver] = ReferenceScore(
+            score=sum(without_solver[i].total for i in winner_indices),
+            setters=frozenset(without_solver[i].solver for i in winner_indices),
+        )
 
-    return reference_scores
+    return outcomes
+
+
+def compute_reference_scores(
+    ranking: Ranking, max_winners: int = MAX_WINNERS
+) -> dict[str, int]:
+    """Just the scores of `compute_reference_outcomes` — the shape the Rust returns."""
+    return {
+        solver: ref.score
+        for solver, ref in compute_reference_outcomes(ranking, max_winners).items()
+    }

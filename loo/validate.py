@@ -39,65 +39,39 @@ from .winner_selection import (
 )
 
 
-@dataclass(frozen=True)
-class FilterBracket:
+def filter_bracket(
+    valuation: SolutionValuation, db_score: int, baselines: dict[Pair, int]
+) -> str:
     """What the *true* per-pair score split can and cannot imply about the filter.
 
     The per-pair split is unknown — scores are stored per solution, not per pair — but
-    it is not unconstrained. For each pair `i` of a solution with total score `S` and
-    native user surplus `u_i`, the true per-pair score `v_i` satisfies
+    it is not unconstrained: each pair's true score `v_i` is at least its user surplus
+    `u_i` (protocol fees are non-negative) and the `v_i` sum to the recorded score `S`.
+    The recorded filter kept the solution iff `v_i >= baseline_i` on every pair, so a
+    split it could have kept exists iff the requirements fit inside the score:
 
-        u_i  <=  v_i  <=  S - sum(u_j for j != i)
+        sum(max(baseline_i, u_i))  <=  S
 
-    because protocol fees are non-negative and the `v_j` sum to `S`. Comparing that
-    interval against the (exact) baselines decides the filter outright in some cases:
-
-    - `must_keep`   — every pair clears its baseline at its *lower* bound.
-    - `must_filter` — some pair misses its baseline even at its *upper* bound.
-    - `undetermined` — both filter outcomes are consistent with some valid split.
+    - `must_filter`  — they do not fit: unfair under every valid split.
+    - `must_keep`    — every pair's surplus alone clears its baseline (`u_i >= baseline_i`),
+      so any valid split is fair.
+    - `undetermined` — both outcomes are consistent with some valid split: a keeping
+      split fits, and setting the failing pair's `v_i = u_i` is a filtering one.
 
     The baselines passed here must be the **score** baselines from `score_baselines`, not
     whatever the configured proxy fed the filter. They are exact — only single-pair
     solutions set a baseline, and for those the pair's value is the recorded score — which
     is what makes the verdict a statement about the protocol rather than about our model.
     """
-
-    verdict: str
-    binding_pair: Pair | None = None
-    margin: int = 0
-    """For `must_filter`, how far the binding pair's upper bound falls short of its
-    baseline; for `must_keep`, the smallest lower-bound surplus over a baseline."""
-
-
-def filter_bracket(
-    valuation: SolutionValuation, db_score: int, baselines: dict[Pair, int]
-) -> FilterBracket:
-    """Bracket the fairness decision for one multi-pair solution."""
     surplus = valuation.pair_surplus
     if len(surplus) <= 1:
         # Single-pair solutions are exempt from the filter entirely.
-        return FilterBracket("must_keep")
-
-    total_surplus = sum(surplus.values())
-
-    worst_upper_margin: tuple[int, Pair] | None = None
-    worst_lower_margin: tuple[int, Pair] | None = None
-    for pair, pair_surplus in surplus.items():
-        baseline = baselines.get(pair, 0)
-        upper = db_score - (total_surplus - pair_surplus)
-        upper_margin = upper - baseline
-        lower_margin = pair_surplus - baseline
-        if worst_upper_margin is None or upper_margin < worst_upper_margin[0]:
-            worst_upper_margin = (upper_margin, pair)
-        if worst_lower_margin is None or lower_margin < worst_lower_margin[0]:
-            worst_lower_margin = (lower_margin, pair)
-
-    assert worst_upper_margin is not None and worst_lower_margin is not None
-    if worst_upper_margin[0] < 0:
-        return FilterBracket("must_filter", worst_upper_margin[1], worst_upper_margin[0])
-    if worst_lower_margin[0] >= 0:
-        return FilterBracket("must_keep", worst_lower_margin[1], worst_lower_margin[0])
-    return FilterBracket("undetermined")
+        return "must_keep"
+    if sum(max(baselines.get(pair, 0), u) for pair, u in surplus.items()) > db_score:
+        return "must_filter"
+    if all(u >= baselines.get(pair, 0) for pair, u in surplus.items()):
+        return "must_keep"
+    return "undetermined"
 
 
 @dataclass(frozen=True)
@@ -369,7 +343,7 @@ def check_auction(
         bracket = (
             filter_bracket(entry.valuation, bid.score, exact_baselines)
             if entry
-            else FilterBracket("undetermined")
+            else "undetermined"
         )
         report.checks.append(
             SolutionCheck(
@@ -385,7 +359,7 @@ def check_auction(
                 partially_fillable=any(o.partially_fillable for o in bid.orders),
                 pair_values=dict(entry.solution.pair_values) if entry else {},
                 pair_surplus=dict(entry.valuation.pair_surplus) if entry else {},
-                bracket=bracket.verdict,
+                bracket=bracket,
             )
         )
 

@@ -8,8 +8,8 @@ from __future__ import annotations
 from loo.winner_selection import (
     Solution,
     arbitrate,
-    arbitrate_fixed_filter,
     compute_baseline_scores,
+    compute_reference_outcomes,
     compute_reference_scores,
     is_fair,
     pick_winners,
@@ -224,22 +224,70 @@ class TestReferenceScores:
         assert len(compute_reference_scores(ranking, max_winners=2)) == 2
 
 
-class TestFixedFilter:
-    def test_re_picks_on_a_given_kept_set(self):
-        kept = [
-            solution("a", 0, 100, {WETH_USDC: 100}),
-            solution("b", 1, 90, {WETH_USDC: 90}),
-            solution("c", 2, 80, {DAI_USDC: 80}),
-        ]
-        ranking = arbitrate_fixed_filter([s for s in kept if s.solver != "a"])
-        assert ranking.winner_uids == frozenset({1, 2})
-        assert ranking.winning_score == 170
+class TestReferenceOutcomes:
+    """`compute_reference_outcomes` carries the setters alongside each score — the
+    solvers whose solutions supply it, i.e. whose removal moves it."""
 
-    def test_does_not_recompute_baselines(self):
-        """Unlike `arbitrate`, nothing here can become unfair or newly fair — the kept
-        set is taken as given."""
-        kept = [solution("a", 0, 10, {WETH_USDC: 5, DAI_USDC: 5})]
-        assert arbitrate_fixed_filter(kept).filtered_out == ()
+    def test_names_the_solvers_supplying_a_reference_score(self):
+        ranking = arbitrate(
+            [
+                solution("a", 0, 100, {WETH_USDC: 100}),
+                solution("x", 1, 90, {WETH_USDC: 90}),
+                solution("b", 2, 80, {WETH_USDC: 80}),
+            ]
+        )
+        outcomes = compute_reference_outcomes(ranking)
+        assert outcomes["a"].score == 90
+        assert outcomes["a"].setters == frozenset({"x"})
+
+    def test_a_solver_with_no_alternative_has_no_setters(self):
+        ranking = arbitrate([solution("a", 0, 100, {WETH_USDC: 100})])
+        outcomes = compute_reference_outcomes(ranking)
+        assert outcomes["a"].score == 0
+        assert outcomes["a"].setters == frozenset()
+
+    def test_follows_ranked_order_like_the_scores(self):
+        """`ranked` is winner-first, not score-descending, and `pick_winners` is
+        order-dependent — the subtlety docs/winner-selection.md flags as load-bearing.
+
+        `x` is single-pair for scoring, so the fairness filter exempts it, but it claims
+        a second pair when winners are picked via an order that does not contribute to
+        score.
+        """
+        ranking = arbitrate(
+            [
+                solution("a", 0, 100, {WETH_USDC: 100}),
+                solution(
+                    "x",
+                    1,
+                    90,
+                    {WETH_USDC: 90},
+                    winner_pairs=frozenset({WETH_USDC, DAI_USDC}),
+                ),
+                solution("c", 2, 80, {DAI_USDC: 80}),
+            ]
+        )
+        assert [s.solution_uid for s in ranking.ranked] == [0, 2, 1]
+        # Walking `ranked` without `a`: `c` takes DAI->USDC first, so `x` conflicts and
+        # contributes nothing. `a`'s reference score comes from `c` alone.
+        outcomes = compute_reference_outcomes(ranking)
+        assert {s: o.setters for s, o in outcomes.items()} == {
+            "a": frozenset({"c"}),
+            "c": frozenset({"a"}),
+        }
+
+    def test_the_scores_are_the_outcomes_scores(self):
+        ranking = arbitrate(
+            [
+                solution("a", 0, 100, {WETH_USDC: 100}),
+                solution("b", 1, 90, {DAI_USDC: 90}),
+                solution("c", 2, 80, {WETH_USDC: 80}),
+            ]
+        )
+        outcomes = compute_reference_outcomes(ranking)
+        assert compute_reference_scores(ranking) == {
+            solver: o.score for solver, o in outcomes.items()
+        }
 
 
 def test_ranking_winning_score_sums_only_winners():

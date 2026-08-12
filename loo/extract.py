@@ -26,6 +26,16 @@ class MissingOrderError(Exception):
     """A traded order uid is in neither `orders` nor `jit_orders`."""
 
 
+class MissingAuctionContextError(Exception):
+    """An auction has proposed solutions but no `competition_auctions` row.
+
+    Tolerating it would corrupt the run twice over, both times silently: `jit_owners`
+    would come out empty, flipping `contributes` for surplus-capturing JIT orders, and
+    because `EXECUTIONS_SQL` inner-joins the table every execution would vanish — leaving
+    zero-order bids whose empty `winner_pairs` are disjoint from everything, which
+    `pick_winners` therefore always selects."""
+
+
 class SolverResolutionError(Exception):
     """`--solver` did not name exactly one solver that bid in the window."""
 
@@ -97,7 +107,6 @@ class Bid:
 @dataclass(frozen=True)
 class AuctionBundle:
     auction_id: int
-    block_deadline: int
     jit_owners: frozenset[str]
     native_prices: dict[str, int]
     bids: tuple[Bid, ...]
@@ -107,7 +116,7 @@ class AuctionBundle:
 
 
 WINDOW_SQL = """
-select distinct auction_id, block_deadline
+select distinct auction_id
 from dbt.pre_stg__orders_per_auction_with_at_least_one_bid
 where block_deadline between
       (select min(block_number) from dbt.stg_rpc_data__block_timestamp where time >= %(start)s)
@@ -152,7 +161,6 @@ where pte.auction_id = any(%(ids)s)
 AUCTIONS_SQL = """
 select
     auction_id,
-    block_deadline,
     array(
         select encode(owner, 'hex')
         from unnest(surplus_capturing_jit_order_owners) as owner
@@ -268,14 +276,14 @@ order by coalesce(a.solutions, 0) desc, c.name
 """
 
 
-def auctions_in_window(conn, start: str, end: str) -> list[tuple[int, int]]:
-    """Auction ids with at least one bid in `[start, end)`, with their block deadlines.
+def auctions_in_window(conn, start: str, end: str) -> list[int]:
+    """Auction ids with at least one bid in `[start, end)`.
 
     This is the same auction universe the dbt reward models use. Auction ids are sparse
     — do not assume the returned range is contiguous.
     """
     rows = fetch(conn, WINDOW_SQL, {"start": start, "end": end})
-    return [(row["auction_id"], row["block_deadline"]) for row in rows]
+    return [row["auction_id"] for row in rows]
 
 
 def load_auctions(
@@ -322,7 +330,12 @@ def load_auctions(
             if auction_id not in solutions:
                 continue
             context = contexts.get(auction_id)
-            jit_owners = frozenset(context["jit_owners"] if context else [])
+            if context is None:
+                raise MissingAuctionContextError(
+                    f"auction {auction_id} has proposed solutions but no row in "
+                    f"stg_backend_data__competition_auctions"
+                )
+            jit_owners = frozenset(context["jit_owners"])
 
             bids = tuple(
                 _build_bid(row, executions.get((auction_id, row["uid"]), []), jit_owners)
@@ -331,7 +344,6 @@ def load_auctions(
 
             yield AuctionBundle(
                 auction_id=auction_id,
-                block_deadline=context["block_deadline"] if context else 0,
                 jit_owners=jit_owners,
                 native_prices=prices.get(auction_id, {}),
                 bids=bids,

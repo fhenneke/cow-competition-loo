@@ -32,37 +32,36 @@ def valuation(pair_surplus: dict) -> SolutionValuation:
 
 class TestFilterBracket:
     def test_single_pair_is_exempt(self):
-        assert filter_bracket(valuation({A: 1}), 100, {A: 10**9}).verdict == "must_keep"
+        assert filter_bracket(valuation({A: 1}), 100, {A: 10**9}) == "must_keep"
 
     def test_must_keep_when_surplus_alone_clears_every_baseline(self):
         """Fees are non-negative, so surplus is a lower bound on the per-pair score. If
         even that clears the baselines, no split can make the solution unfair."""
-        bracket = filter_bracket(valuation({A: 60, B: 40}), 200, {A: 50, B: 30})
-        assert bracket.verdict == "must_keep"
+        assert filter_bracket(valuation({A: 60, B: 40}), 200, {A: 50, B: 30}) == "must_keep"
 
     def test_must_filter_when_a_pair_cannot_reach_its_baseline(self):
-        """Pair A's score is at most `200 - 40 = 160`, below a baseline of 500, however
-        the fees are distributed."""
-        bracket = filter_bracket(valuation({A: 60, B: 40}), 200, {A: 500, B: 0})
-        assert bracket.verdict == "must_filter"
-        assert bracket.binding_pair == A
-        assert bracket.margin == 160 - 500
+        """Pair A needs 500 and pair B its own surplus of 40, which no split of 200 can
+        provide, however the fees are distributed."""
+        assert filter_bracket(valuation({A: 60, B: 40}), 200, {A: 500, B: 0}) == "must_filter"
+
+    def test_must_filter_when_the_baselines_jointly_exceed_the_score(self):
+        """Each pair could reach its baseline of 60 alone (the other pair's surplus of 10
+        leaves up to 90), but not both at once: keeping needs 60 + 60 > 100. The
+        pair-by-pair interval test missed exactly this case."""
+        assert filter_bracket(valuation({A: 10, B: 10}), 100, {A: 60, B: 60}) == "must_filter"
 
     def test_undetermined_between_the_bounds(self):
-        """A's surplus (60) is under its baseline (100) but its upper bound
-        (200 - 40 = 160) is over it, so both filter outcomes are consistent."""
-        bracket = filter_bracket(valuation({A: 60, B: 40}), 200, {A: 100, B: 0})
-        assert bracket.verdict == "undetermined"
+        """A's surplus (60) is under its baseline (100), but a keeping split exists
+        (100 + 40 <= 200), so both filter outcomes are consistent."""
+        assert filter_bracket(valuation({A: 60, B: 40}), 200, {A: 100, B: 0}) == "undetermined"
 
     def test_a_pair_without_a_baseline_never_binds(self):
-        bracket = filter_bracket(valuation({A: 60, B: 40}), 200, {})
-        assert bracket.verdict == "must_keep"
+        assert filter_bracket(valuation({A: 60, B: 40}), 200, {}) == "must_keep"
 
-    def test_upper_bound_uses_the_recorded_score_not_the_surplus_total(self):
-        """With no fees at all the upper bound collapses onto the surplus, so a solution
-        whose score equals its surplus is decided outright."""
-        bracket = filter_bracket(valuation({A: 60, B: 40}), 100, {A: 61, B: 0})
-        assert bracket.verdict == "must_filter"
+    def test_the_requirement_is_bounded_by_the_recorded_score_not_the_surplus_total(self):
+        """With no fees at all the score is the surplus, so a baseline one atom above a
+        pair's surplus is decided outright."""
+        assert filter_bracket(valuation({A: 60, B: 40}), 100, {A: 61, B: 0}) == "must_filter"
 
 
 def check(**kwargs) -> SolutionCheck:
@@ -158,7 +157,6 @@ class TestObservedPick:
     def bundle(self, bids) -> AuctionBundle:
         return AuctionBundle(
             auction_id=1,
-            block_deadline=1,
             jit_owners=frozenset(),
             native_prices={},
             bids=tuple(bids),

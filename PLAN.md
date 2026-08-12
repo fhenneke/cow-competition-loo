@@ -22,10 +22,29 @@ For a solver `X`, a network, and a time window:
 Secondary: how often `X` won, how often `X` set another solver's reference score, how often
 removing `X` relaxes the fairness filter, concentration of impact by token pair and app code.
 
+## Design decisions
+
+Every judgement call in the pipeline, in one place: what was chosen, what it was chosen
+over, where it lives in code, and what to touch to revise it. The narrative rationale
+stays in the sections and docs each row links to; the milestone sections cite these IDs.
+
+| | decision | chosen over | lives in | to revise |
+| --- | --- | --- | --- | --- |
+| D1 | Rank solutions on the **recorded score**; surplus mode is a separate, self-consistent answer to the user-value question, not an approximation of the competition ([§2](#2-two-valuations-deliberately-separate)) | recomputing scores — impossible, fee policies only exist for executed orders | `valuation.solution_total` | `--mode surplus` exists |
+| D2 | The fairness filter compares per-pair **user surplus on both sides**, in both modes ([§2](#2-two-valuations-deliberately-separate), [measured](docs/winner-selection.md#the-filter-runs-on-surplus)) | `scaled` / `raw` score-scale splits — built, measured 30× worse, removed | `build_solutions` filling `Solution.pair_values` from `pair_surplus` | feed a different per-pair decomposition; the measured cost of this one is the proxy error rate ([§4.1](#41-m1-result)) |
+| D3 | The LOO ranking is a **full re-arbitration** — steps 3–6, so removing a solver can lower a baseline and un-filter solutions ([§5](#5-m2--loo-ranking-and-surplus-deltas--done)) | re-picking on the recorded kept set, as reference scores do — would have missed all 14 un-filter wins | `counterfactual.leave_one_out` | — |
+| D4 | A winner's settlement attaches to the **slot**, not the solver: a replacement inherits the recorded outcome of the token pairs it claims ([§5](#5-m2--loo-ranking-and-surplus-deltas--done)) | `observed` — kept as the provable lower bound; `assume-settled` — kept as the usual upper bound | `counterfactual.OUTCOME_RULE`, `side_outcomes` | `--outcome-rule` exists |
+| D5 | "Executed" means **`is_settled_in_time`** on both the surplus and the reward side; a late batch counts as a failure and its real surplus is reported, not absorbed ([why](docs/analytics-db.md#settled-and-settled_in_time-come-apart-and-which-one-you-want-depends)) | `tx_hash is not null` — what users actually received | `extract.Settlement.counts_as_executed` | flip that one property |
+| D6 | Executed amounts always come from **`proposed_trade_executions`**; only the settlement *status* is read from chain ([verified exact](docs/analytics-db.md#a-settled-proposal-is-exact--the-only-divergence-is-settling-at-all)) | reading on-chain trade amounts — redundant, a settled proposal executes exactly, to the atom | `extract.py` | — |
+| D7 | Tie-breaks reproduce the record by feeding solutions in **`uid` order** through stable sorts ([why](docs/analytics-db.md#proposed_solutionsuid-encodes-the-ranking)) | — the autopilot's pre-sort shuffle is not recoverable from anything else | uid-ordered extraction, stable sorts in `arbitrate` | not revisable |
+| D8 | Retain an auction when **reference scores move**, not only when the winner set changes — rewards move on a reference score alone ([§5.1](#51-m2-result)) | winner-set-only retention — silently drops 43% of the auctions whose rewards move | `AuctionCounterfactual.anything_moved` | — |
+| D9 | `--solver` matches names **exactly** and removes **every** rotated address together ([traps](docs/analytics-db.md#resolving-a-solver-name)) | substring match — `Arc` ⊂ `Arctic`, both bid, two competitors silently removed | `extract.SOLVER_SQL`, `resolve_solver` | — |
+| D10 | Auctions the solver never bid in are **skipped but stay in the denominator**, so rates describe the window rather than the solver's own subset | rates over the solver's auctions only | `analyse_auction` early return, `Analysis.add` | — |
+
 ## 2. Two valuations, deliberately separate
 
-The competition ranks on **score** = user surplus + protocol fees. Our surplus question is
-about **user surplus** alone. These are not interchangeable: over 17.6k single-order bids
+Decisions D1 and D2. The competition ranks on **score** = user surplus + protocol fees.
+Our surplus question is about **user surplus** alone. These are not interchangeable: over 17.6k single-order bids
 the median score/surplus ratio is 1.08, p90 is 2.70, and 3.2% of bids are fee-dominated
 (surplus under 1% of score) — see [docs/winner-selection.md](docs/winner-selection.md#measured-divergence--surplus-is-not-a-stand-in-for-score).
 
@@ -114,8 +133,10 @@ Integer arithmetic throughout the valuation path — no floats.
    Build `pair_values` on raw tokens and `winner_pairs` on `as_erc20`-normalised tokens.
 
 4. **Implement `arbitrate`** — steps 1–6 of
-   [docs/winner-selection.md](docs/winner-selection.md#the-algorithm), plus
-   `arbitrate_fixed_filter` (step 5 only, on a given kept set) for reference scores.
+   [docs/winner-selection.md](docs/winner-selection.md#the-algorithm). For the comparison,
+   `validate.py` re-runs single steps against the DB's own decisions: `observed_pick`
+   re-picks winners on the recorded kept set, and `observed_ranking` rebuilds the
+   recorded ranking for `compute_reference_scores`.
 
 5. **Compare against the DB, in score mode:**
 
@@ -123,7 +144,7 @@ Integer arithmetic throughout the valuation path — no floats.
    | --- | --- |
    | winner set | `proposed_solutions.is_winner` |
    | `filtered_out` | `proposed_solutions.filtered_out` |
-   | reference scores (via `arbitrate_fixed_filter`) | `stg_backend_data__reference_scores` |
+   | reference scores (via the observed ranking) | `stg_backend_data__reference_scores` |
 
    **Inspect every auction where the winner set differs, individually — this is not a
    percentage gate.** For each, record: number of solutions, whether any order is
@@ -156,20 +177,22 @@ only when nothing is left unexplained.
 | solutions that could not be valued | **0** |
 | per-order surplus vs. the dbt model | 93941 / 94565, every difference exactly −1 |
 | end-to-end winner set / `filtered_out` | 7740 / 7738 of 7745 |
-| filter decisions differing from the DB | **7**, all proxy-attributable |
+| filter decisions differing from the DB | **7** — 2 provably the deliberate surplus-filter difference, 5 proxy-attributable |
 
 The comparison is structured so a cause is *proven* rather than asserted. Two of the three
 checks hold the DB's own filter decisions fixed and re-run a single step, so no
 approximation is in their path — both are exact, which clears steps 5 and 6 outright and
 localises every remaining difference to step 4.
 
-For step 4, the true per-pair split is unknown but bounded: per-pair score is at least the
-pair's user surplus (fees are non-negative) and at most the solution's score minus the
-other pairs' surplus. Comparing that interval against the exact score baselines decides 79%
-of multi-pair solutions regardless of fees. All 7 differences fall in the undetermined 21%,
-none where the bracket forces an answer, and all 7 go the same way: the recorded filter
-dropped a batch that the surplus filter keeps, always on a partially fillable order. Full
-numbers in
+For step 4, the true per-pair split is unknown but constrained: each pair's score is at
+least its user surplus (fees are non-negative) and the splits sum to the recorded score,
+so a split the recorded filter could have *kept* exists iff
+`Σ max(baseline, surplus) ≤ score`. That feasibility test decides **95%** of multi-pair
+solutions regardless of the fees. All 7 differences go the same way — the recorded filter
+dropped a batch the surplus filter keeps, always on a partially fillable order. For 2 of
+them keeping is provably infeasible, so they are the deliberate consequence of filtering
+on surplus (`model`); the other 5 fall in the undetermined 5% where the split genuinely
+decides (`proxy`). Full numbers in
 [docs/winner-selection.md](docs/winner-selection.md#the-filter-runs-on-surplus).
 
 Expected explanation (a), partial fills, turned out **not** to contribute: with exact
@@ -195,11 +218,11 @@ been run over a window, since M1's comparisons are all score-mode by definition.
 Results in [§5.1](#51-m2-result); what follows is what was built.
 
 1. `loo_ranking = arbitrate([s for s in solutions if s.solver != X])` — **full
-   re-arbitration**, steps 3–6, so removing `X` can lower a baseline and *un-filter*
+   re-arbitration** (D3), steps 3–6, so removing `X` can lower a baseline and *un-filter*
    solutions. Track auctions where the kept/filtered partition changes, and whether a
    newly-kept solution wins, as its own statistic. Expected to be rare and the most
    interesting case when it happens.
-2. Skip auctions where `X` submitted nothing; keep them in the denominator.
+2. Skip auctions where `X` submitted nothing; keep them in the denominator (D10).
 3. Per-order diff over the union of orders traded by baseline and LOO winners:
 
    | field | note |
@@ -219,8 +242,8 @@ proposed execution otherwise, or (b) always use the proposed execution. (a) is p
 should usually apply, since solutions rarely batch overlapping orders. Record how often the
 mapping fails, and state the choice in the output.
 
-**Decided — neither (a) nor (b), but a third rule.** Both options in the paragraph above
-attach settlement to the *solution*, and both are biased:
+**Decided — neither (a) nor (b), but a third rule (D4).** Both options in the paragraph
+above attach settlement to the *solution*, and both are biased:
 
 - (a) `--outcome-rule observed` charges the baseline for its own reverts while assuming
   every replacement settles, because no record exists to consult. So where `X` won and
@@ -251,24 +274,15 @@ claims, since those are exactly what makes one solution displace another. Three 
 
 `1,533` of the `10,301` winners in the window never settled, so this is not a corner case.
 
-Two facts settled the design, both measured over the M1 window and now in
-[docs/analytics-db.md](docs/analytics-db.md#observed-outcomes-what-actually-settled):
-
-- **A settled proposal is exact.** All 9,061 order rows have on-chain amounts equal to the
-  proposed ones, to the atom, and no proposed order of a settled winner is missing from the
-  trades. So "observed versus proposed" reduces entirely to *did it settle*, and no separate
-  observed-amount lookup is needed.
-- **Execution is `is_settled_in_time`, so a late batch counts as a failure.** The two flags
-  genuinely differ: 16 winners landed late, their orders traded, and users kept the surplus
-  while the solver earned nothing. Using the reward flag on the surplus side therefore
-  discards real user surplus — deliberately, so that M2 and M3 agree on which winners
-  delivered, since a batch the protocol did not pay for cannot be credited to the mechanism
-  on one side and written off on the other. The discarded amount is reported as
-  `orders_lost_to_lateness` rather than absorbed.
-
-**Only settlement *status* is read from chain.** Executed amounts always come from
-`proposed_trade_executions`, never from the trade events, which the first bullet is what
-licenses.
+Two facts measured over the M1 window settled the rest of the design; the details and
+verification live in
+[docs/analytics-db.md](docs/analytics-db.md#observed-outcomes-what-actually-settled). A
+settled proposal executes **exactly what it proposed, to the atom**, so executed amounts
+always come from `proposed_trade_executions` and the only thing read from chain is the
+settlement *status* (D6). And "executed" means **`is_settled_in_time`**, so a late batch
+counts as a failure — deliberately discarding the real surplus of 16 late winners so that
+M2 and M3 agree on which winners delivered, with the discarded amount reported as
+`orders_lost_to_lateness` rather than absorbed (D5).
 
 ### 5.1 M2 result
 
@@ -362,8 +376,8 @@ Scope notes. A counterfactual cannot resurrect solutions the arbitrator never sa
 `max_solutions_per_solver` is a pre-arbitration filter in the autopilot
 ([why](docs/winner-selection.md#max_solutions_per_solver-is-applied-before-arbitrate)).
 `--solver` resolves a name to *every* submission address that bid in the window, because
-several solvers have rotated keys and all of a rotation must be removed together
-([traps](docs/analytics-db.md#resolving-a-solver-name)). Surplus mode runs but was not the
+several solvers have rotated keys and all of a rotation must be removed together (D9,
+[traps](docs/analytics-db.md#resolving-a-solver-name)). Surplus mode runs but was not the
 basis of these numbers; on a 200-auction slice it moved Sector's Δ from 0.00161 to 0.00206
 ETH and disagreed with the recorded winner set in 2 auctions, as expected from §2.
 
@@ -371,8 +385,8 @@ Not built, deferred: `rewards.py` (M3), `notebooks/analysis.ipynb` (M4). The per
 records carry both sides' winner sets, winning totals and reference scores, plus which
 solvers supplied each reference score, so M3 needs no further extraction.
 
-One trap that cost a rewrite: retention must key on **reference scores moving**, not on the
-winner set changing. Removing `X` moves a surviving solver's reference score in far more
+One trap that cost a rewrite (D8): retention must key on **reference scores moving**, not
+on the winner set changing. Removing `X` moves a surviving solver's reference score in far more
 auctions than it moves a win, because one of `X`'s *non-winning* solutions can be a winner of
 the without-`s` pick inside `compute_reference_scores`. For Sector that is 1,798 auctions
 retained against 1,025 with a changed winner set — and reference scores are the denominator of

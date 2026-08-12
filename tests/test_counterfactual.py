@@ -21,7 +21,6 @@ from loo.counterfactual import (
     analyse_auction,
     diff_outcomes,
     leave_one_out,
-    reference_setters,
     side_outcomes,
     un_filtered,
 )
@@ -99,7 +98,6 @@ def bid(
 def bundle(bids: list[Bid]) -> AuctionBundle:
     return AuctionBundle(
         auction_id=1,
-        block_deadline=1,
         jit_owners=frozenset(),
         native_prices={USDC: ONE},
         bids=tuple(bids),
@@ -178,38 +176,6 @@ class TestUnFiltered:
         broken = arbitrate([weak_baseline])
         with pytest.raises(RelaxationError, match="baselines can only fall"):
             un_filtered(baseline, broken, frozenset({"x"}))
-
-
-class TestReferenceSetters:
-    def test_names_the_solvers_supplying_a_reference_score(self):
-        ranking = arbitrate(
-            [solution("a", 0, 100), solution("x", 1, 90), solution("b", 2, 80)]
-        )
-        assert reference_setters(ranking) == {"a": frozenset({"x"})}
-
-    def test_a_solver_with_no_alternative_has_no_setters(self):
-        ranking = arbitrate([solution("a", 0, 100)])
-        assert reference_setters(ranking) == {"a": frozenset()}
-
-    def test_follows_ranked_order_like_compute_reference_scores(self):
-        """`ranked` is winner-first, not score-descending, and `pick_winners` is
-        order-dependent — the subtlety docs/winner-selection.md flags as load-bearing.
-
-        `x` is single-pair for scoring, so the fairness filter exempts it, but it claims a
-        second pair when winners are picked via an order that does not contribute to
-        score.
-        """
-        ranking = arbitrate(
-            [
-                solution("a", 0, 100, {A: 100}),
-                solution("x", 1, 90, {A: 90}, winner_pairs=frozenset({A, B})),
-                solution("c", 2, 80, {B: 80}),
-            ]
-        )
-        assert [s.solution_uid for s in ranking.ranked] == [0, 2, 1]
-        # Walking `ranked` without `a`: `c` takes B->USDC first, so `x` conflicts and
-        # contributes nothing. `a`'s reference score comes from `c` alone.
-        assert reference_setters(ranking) == {"a": frozenset({"c"}), "c": frozenset({"a"})}
 
 
 class TestSideOutcomes:

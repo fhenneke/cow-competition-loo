@@ -25,8 +25,8 @@ from .winner_selection import (
     Ranking,
     Solution,
     arbitrate,
+    compute_reference_outcomes,
     compute_reference_scores,
-    pick_winners,
 )
 
 OutcomeRule = Literal["inherited", "observed", "assume-settled"]
@@ -135,32 +135,6 @@ def un_filtered(baseline: Ranking, loo: Ranking, removed: frozenset[str]) -> fro
     return frozenset(loo_kept - baseline_kept)
 
 
-def reference_setters(
-    ranking: Ranking, max_winners: int = MAX_WINNERS
-) -> dict[str, frozenset[str]]:
-    """Per winning solver, the solvers whose solutions make up its reference score.
-
-    `compute_reference_scores` returns only the totals, but which solvers *supply* them
-    is what answers "how often did `X` set someone else's reference score" — and, in M3,
-    which rewards move when `X` disappears. This mirrors `compute_reference_scores`
-    exactly, including walking `ranking.ranked` in its stored order.
-    """
-    setters: dict[str, frozenset[str]] = {}
-
-    for solution in ranking.ranked:
-        solver = solution.solver
-        if len(setters) >= max_winners:
-            return setters
-        if solver in setters or solution.solution_uid not in ranking.winner_uids:
-            continue
-
-        without_solver = [s for s in ranking.ranked if s.solver != solver]
-        winners = pick_winners(without_solver, max_winners)
-        setters[solver] = frozenset(without_solver[i].solver for i in winners)
-
-    return setters
-
-
 @dataclass(frozen=True)
 class OrderOutcome:
     """What one order did under one side of the comparison."""
@@ -265,6 +239,7 @@ def side_outcomes(
     replacements: set[int] = set()
     inherited_reverts: set[int] = set()
     orphans: set[int] = set()
+    inherit = dict(inherit) if inherit else {}
 
     for entry in winners:
         uid = entry.bid.uid
@@ -286,7 +261,7 @@ def side_outcomes(
             outcome = settled[uid]
             executed, observed = outcome.counts_as_executed, True
             late = outcome.landed and not outcome.in_time
-        elif outcome_rule == "inherited" and inherit:
+        elif outcome_rule == "inherited":
             # The slot rule: whatever really happened to the pairs this replacement
             # claims, happens to it. A batch spanning several slots needs all of them to
             # have settled, since one reverting leg would have taken the batch with it.
@@ -297,6 +272,8 @@ def side_outcomes(
             elif not executed:
                 inherited_reverts.add(uid)
         else:
+            # `observed`: nothing was ever recorded about a replacement, so it is
+            # assumed to settle — the asymmetry that makes this rule the lower bound.
             executed, observed = True, False
             orphans.add(uid)
 
@@ -569,7 +546,7 @@ def analyse_auction(
         inherit=inherit,
     )
 
-    setters = reference_setters(baseline, max_winners)
+    baseline_references = compute_reference_outcomes(baseline, max_winners)
 
     return AuctionCounterfactual(
         auction_id=bundle.auction_id,
@@ -581,10 +558,12 @@ def analyse_auction(
         loo_winner_uids=loo.winner_uids,
         baseline_winning_total=baseline.winning_score,
         loo_winning_total=loo.winning_score,
-        baseline_reference_scores=compute_reference_scores(baseline, max_winners),
+        baseline_reference_scores={
+            solver: ref.score for solver, ref in baseline_references.items()
+        },
         loo_reference_scores=compute_reference_scores(loo, max_winners),
         solver_set_reference_for=frozenset(
-            solver for solver, supplied in setters.items() if supplied & removed
+            solver for solver, ref in baseline_references.items() if ref.setters & removed
         ),
         un_filtered_uids=relaxed,
         un_filtered_winner_uids=relaxed & loo.winner_uids,

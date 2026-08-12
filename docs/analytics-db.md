@@ -297,7 +297,7 @@ settle roughly doubles the surplus on both sides of its comparison, and how it t
 *replacement* winner — for which no settlement was ever recorded — moves the headline by
 several ETH. The leave-one-out analysis therefore attaches settlement to the token pair
 rather than to the solver, and reports two bounds either side of it
-([PLAN.md §5](../PLAN.md#5-m2--loo-ranking-and-surplus-deltas)).
+([PLAN.md §5](../PLAN.md#5-m2--loo-ranking-and-surplus-deltas--done)).
 
 ### A settled proposal is exact — the only divergence is settling at all
 

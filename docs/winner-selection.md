@@ -140,22 +140,30 @@ protocol fees, a systematic bias no split of the batch's score can correct for.
 #### Bounding what the missing split can cost
 
 The unknown split is not unconstrained. For a solution with recorded score `S` and per-pair
-user surplus `u_i`, the true per-pair score `v_i` satisfies
+user surplus `u_i`, every valid per-pair score split satisfies
 
 ```
-u_i  <=  v_i  <=  S - Σ_{j≠i} u_j
+u_i  <=  v_i,     Σ v_i  =  S
 ```
 
-since protocol fees are non-negative and the `v_i` sum to `S`. Comparing that interval
-against the **exact score baselines** — the best recorded score among single-pair solutions,
-which is what the protocol itself used — decides most solutions outright whatever the fees
-turn out to be:
+since protocol fees are non-negative. The recorded filter kept the solution iff
+`v_i >= baseline_i` on every pair, so a split it could have *kept* exists iff the
+requirements fit inside the score: `Σ max(baseline_i, u_i) <= S`. Conversely a filtering
+split always exists when some pair has `u_i < baseline_i` (set that pair's `v_i = u_i`).
+Against the **exact score baselines** — the best recorded score among single-pair
+solutions, which is what the protocol itself used — this decides most solutions outright
+whatever the fees turn out to be:
 
 | bracket | multi-pair solutions | meaning |
 | --- | --- | --- |
-| `must_filter` | 4,064 (78%) | unfair under every valid split |
-| `must_keep` | 66 (1.3%) | fair under every valid split |
-| `undetermined` | 1,081 (21%) | genuinely depends on the fee split |
+| `must_filter` | 4,882 (94%) | no valid split reaches every baseline: unfair under all of them |
+| `must_keep` | 66 (1.3%) | every pair's surplus alone clears its baseline: fair under all of them |
+| `undetermined` | 263 (5.0%) | genuinely depends on the fee split — both outcomes are reachable |
+
+(An earlier version tested each pair's interval `[u_i, S - Σ_{j≠i} u_j]` separately, which
+cannot see two baselines that are individually reachable but do not fit *together*; it
+decided only 79% and its `undetermined` band was 21%. The joint feasibility test is exact:
+each verdict now proves what it claims.)
 
 The bracket deliberately uses **score** baselines, not the surplus ones the filter itself
 compares against, which is what makes it a statement about the recorded competition rather
@@ -168,10 +176,13 @@ one direction only:
   *score* baseline, which is at least its surplus baseline, so the surplus filter keeps it
   too. Dropping it anyway means our baselines or valuation are wrong: `bug`.
 
-**All 7 differences fall in the `undetermined` band** — not one lands where the bracket
-forces an answer, and no `model` case occurred at all. They also have a uniform shape: every
-one is the recorded filter dropping a batched solution that the surplus filter keeps, and
-all 7 involve a partially fillable order, where surplus and score diverge most.
+All 7 differences have a uniform shape: every one is the recorded filter dropping a batched
+solution that the surplus filter keeps, and all 7 involve a partially fillable order, where
+surplus and score diverge most. **For 2 of the 7 the bracket is decisive** (`must_filter`,
+auctions 13488644 and 13490028): the recorded decision is forced, so keeping the solution
+is provably the deliberate consequence of filtering on surplus — `model`, not an unknown.
+The other 5 fall in the `undetermined` band, where the missing split genuinely decides:
+`proxy`.
 
 ### `max_solutions_per_solver` is applied before `arbitrate`
 
@@ -255,4 +266,4 @@ auction 13509006 solution 9: the order is filled at exactly its limit price plus
 Consequence: ranking by surplus and ranking by score are **not** interchangeable. A
 surplus-only run is a self-consistent analysis of *user-facing value*, but it is not an
 approximation of the real competition, and reward numbers derived from it would be wrong.
-See PLAN.md §3 for how the two are separated.
+See PLAN.md §2 for how the two are separated.

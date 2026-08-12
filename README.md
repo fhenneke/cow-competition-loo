@@ -52,18 +52,12 @@ settled and they carry half of all winning score — so the rule is explicit:
 Report the default and quote the bound you care about; for Sector the three give 8.01, 2.89
 and 8.13 ETH. See [PLAN.md §5.1](PLAN.md#51-m2-result).
 
-Two things the rule names do **not** vary:
-
-- **Executed amounts are always the proposed ones**, from
-  `stg_backend_data__proposed_trade_executions`. Never on-chain trade amounts. That is
-  exact rather than an approximation: a batch that lands executes the amounts its solution
-  proposed, checked to the atom on every order row of every landed winner. So the only thing
-  chain data adds is *whether* it landed, and that is the single on-chain lookup the pipeline
-  makes (`tx_hash` and `is_settled_in_time`).
-- **"Settled" means landed in time.** A batch that lands after its deadline is carried as a
-  failure with zero surplus, even though its orders really filled, so that the surplus and
-  reward sides agree on which winners delivered. The discarded surplus is reported as
-  `of which merely late` rather than absorbed.
+Two things the rule names do **not** vary, both measured facts
+([details](docs/analytics-db.md#observed-outcomes-what-actually-settled)): executed
+amounts are always the **proposed** ones — a batch that lands executes its proposal
+exactly, to the atom, so the only on-chain input the pipeline has is the settlement
+status — and "settled" means landed **in time**, so the real surplus of late batches is
+reported as `of which merely late` rather than absorbed.
 
 ```bash
 uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04 --outcome-rule observed
@@ -76,8 +70,9 @@ uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04 --outcome
 | `--limit N` | only the first N auctions — start here |
 | `--out report.json` | per-auction records, including both sides' reference scores |
 
-Exit code is 0 normally, 2 if any auction could not be valued, 4 if `--solver` did not
-resolve, 5 if the settlement source does not cover the window.
+Exit code is 0 normally, 1 if the window has no auctions, 2 if any auction could not be
+valued, 4 if `--solver` did not resolve, 5 if the settlement source does not cover the
+window.
 
 ### Validate
 
@@ -86,7 +81,8 @@ uv run loo validate --start 2026-08-01 --end 2026-08-02
 ```
 
 `--start` is inclusive, `--end` exclusive. Exit code is 0 when every difference has a
-named cause, 2 when something is unexplained, 3 on a bad cross-check window.
+named cause, 1 if the window has no auctions, 2 when something is unexplained, 3 on a bad
+cross-check window.
 
 Useful flags:
 
@@ -114,20 +110,23 @@ Everything else reads the staging tables and works up to the present.
 uv run --extra dev pytest
 ```
 
-101 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py` and
+109 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py` and
 `loo/counterfactual.py` take plain dataclasses and hold no connection.
 
 ## Reading a run
 
 ```
-winner set matches:         2670/2675
-filtered-out set matches:   2668/2675
-reference scores (observed): 2675/2675
-pick on observed kept set:  2675/2675
+=== 7745 auctions, 98669 solutions ===
+winner set matches:         7740/7745
+filtered-out set matches:   7738/7745
+reference scores (ours):    7740/7745
+reference scores (observed): 7745/7745
+pick on observed kept set:  7745/7745
 valuation failures:         0
-filter differs from DB:     7/1905 multi-pair solutions (0.3675%)
-multi-pair bracket:         must_filter=1465, must_keep=19, undetermined=421
-filter difference cause:    proxy=7
+
+filter differs from DB:     7/5211 multi-pair solutions (0.1343%)
+multi-pair bracket:         must_filter=4882, must_keep=66, undetermined=263
+filter difference cause:    model=2, proxy=5
 
 every difference has a named cause — M1 gate met.
 ```
@@ -142,7 +141,7 @@ filter compares user surplus on both sides instead. `bracket` bounds how much th
 split could possibly matter, and `cause` classifies each difference:
 
 - `proxy` — the split genuinely decides it and cannot be known
-- `model` — a deliberate consequence of filtering on surplus rather than score
+- `model` — provably a deliberate consequence of filtering on surplus rather than score
 - `bug` — no valid split explains it; the run exits 2
 
 See [PLAN.md §4.1](PLAN.md#41-m1-result) for the full argument.
