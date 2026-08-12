@@ -90,6 +90,15 @@ def main(argv: list[str] | None = None) -> int:
             "every winner on both sides settles (optimistic bound). See PLAN.md section 5"
         ),
     )
+    analyse.add_argument(
+        "--include-price-suspects",
+        action="store_true",
+        help=(
+            "keep auctions whose native prices fail the two-sided sanity check in "
+            "every statistic instead of excluding them (they are excluded by default "
+            "because a wrong price fabricates score, surplus and rewards)"
+        ),
+    )
     analyse.add_argument("--max-winners", type=int, default=MAX_WINNERS)
     analyse.add_argument("--limit", type=int, help="only the first N auctions in the window")
     analyse.add_argument("--out", help="write the full report as JSON")
@@ -183,7 +192,7 @@ def run_validate_rewards(args) -> int:
         references = extract.load_reference_scores(conn, auction_ids)
         fct = extract.load_fct_rewards(conn, auction_ids)
         print(
-            f"{sum(len(v) for v in inputs.values())} winning solutions, "
+            f"{sum(len(v.wins) for v in inputs.values())} winning solutions, "
             f"{sum(len(v) for v in fct.values())} mart reward rows",
             file=sys.stderr,
         )
@@ -193,10 +202,15 @@ def run_validate_rewards(args) -> int:
     validation = rewards.RewardValidation()
     try:
         for auction_id in auction_ids:
-            wins = inputs.get(auction_id, [])
+            auction_inputs = inputs.get(auction_id)
             ours = (
-                rewards.uncapped_rewards(wins, references.get(auction_id, {}))
-                if wins
+                rewards.uncapped_rewards(
+                    auction_inputs.wins,
+                    references.get(auction_id, {}),
+                    lower_cap=auction_inputs.lower_cap,
+                    excluded=auction_inputs.excluded,
+                )
+                if auction_inputs
                 else {}
             )
             validation.check_auction(auction_id, ours, fct.get(auction_id, {}))
@@ -250,12 +264,7 @@ def report_reward_validation(validation: rewards.RewardValidation, args) -> None
     )
     for mismatch in validation.mismatches[: args.show]:
         print(f"\nauction {mismatch.auction_id} solver {mismatch.solver[:8]}")
-        for name in (
-            "competition_score",
-            "observed_score",
-            "reference_score",
-            "uncapped_reward",
-        ):
+        for name in rewards.RewardMismatch.COMPARED_FIELDS:
             mine = getattr(mismatch.ours, name) if mismatch.ours else None
             theirs = getattr(mismatch.theirs, name) if mismatch.theirs else None
             marker = "  <-" if mine != theirs else ""
@@ -275,10 +284,8 @@ def write_reward_validation_json(path: str, validation: rewards.RewardValidation
                 "auction_id": m.auction_id,
                 "solver": m.solver,
                 "differing_fields": list(m.differing_fields),
-                "ours": {k: str(v) for k, v in asdict(m.ours).items()} if m.ours else None,
-                "theirs": (
-                    {k: str(v) for k, v in asdict(m.theirs).items()} if m.theirs else None
-                ),
+                "ours": reward_as_json(m.ours),
+                "theirs": reward_as_json(m.theirs),
             }
             for m in validation.mismatches
         ],
@@ -287,12 +294,22 @@ def write_reward_validation_json(path: str, validation: rewards.RewardValidation
         json.dump(payload, handle, indent=2, default=str)
 
 
+def reward_as_json(reward) -> dict | None:
+    """A `SolverReward` as JSON-safe strings, keeping `None` a null rather than 'None'."""
+    if reward is None:
+        return None
+    return {
+        k: (str(v) if v is not None else None) for k, v in asdict(reward).items()
+    }
+
+
 class CowConversion(NamedTuple):
     """Δrewards converted native -> COW at each auction's accounting-period rate."""
 
     cow_wei: Decimal
+    cow_wei_capped: Decimal
     converted_native: int
-    """The part of the native delta the conversion covers."""
+    """The part of the native uncapped delta the conversion covers."""
     auctions_without_rate: int
     native_without_rate: int
     """Auctions whose accounting period has no snapshotted rate yet, and their native
@@ -302,20 +319,27 @@ class CowConversion(NamedTuple):
 def convert_delta_rewards(conn, analysis: counterfactual.Analysis) -> CowConversion:
     """Only auctions retained in `changed` can carry a non-zero reward delta: rewards
     move only when the winner set or a reference score does, and both retain (D8)."""
-    moved = [r for r in analysis.changed if r.delta_rewards]
+    moved = [
+        r
+        for r in analysis.changed
+        if r.delta_rewards or (r.delta_rewards_capped or 0) != 0
+    ]
     rates = extract.load_conversion_rates(
         conn, sorted({r.block_deadline for r in moved})
     )
-    cow_wei, converted, missing, missing_native = Decimal(0), 0, 0, 0
+    cow_wei, cow_wei_capped = Decimal(0), Decimal(0)
+    converted, missing, missing_native = 0, 0, 0
     for result in moved:
         rate = rates.get(result.block_deadline)
         if rate:
             cow_wei += Decimal(result.delta_rewards) / rate
+            if result.delta_rewards_capped is not None:
+                cow_wei_capped += result.delta_rewards_capped / rate
             converted += result.delta_rewards
         else:
             missing += 1
             missing_native += result.delta_rewards
-    return CowConversion(cow_wei, converted, missing, missing_native)
+    return CowConversion(cow_wei, cow_wei_capped, converted, missing, missing_native)
 
 
 def run_analyse(args) -> int:
@@ -367,11 +391,22 @@ def run_analyse(args) -> int:
                 file=sys.stderr,
             )
 
+        caps: dict[int, dict[int, extract.SolutionCap]] = {}
+        if args.mode == "score":
+            caps = extract.load_solution_caps(conn, auction_ids)
+            print(
+                f"reward caps for {sum(len(v) for v in caps.values())} "
+                f"recorded winning solutions",
+                file=sys.stderr,
+            )
+
         analysis = counterfactual.Analysis(
             solver=args.solver,
             addresses=addresses,
             mode=args.mode,
             outcome_rule=args.outcome_rule,
+            capped_estimate=args.mode == "score",
+            exclude_price_suspect=not args.include_price_suspects,
         )
         try:
             for bundle in extract.load_auctions(conn, auction_ids):
@@ -384,6 +419,7 @@ def run_analyse(args) -> int:
                         max_winners=args.max_winners,
                         outcome_rule=args.outcome_rule,
                         settled=settled.get(bundle.auction_id, {}),
+                        solution_caps=caps.get(bundle.auction_id, {}),
                     )
                 )
         except counterfactual.MissingSettlementError as error:
@@ -424,8 +460,10 @@ def run_analyse(args) -> int:
     return 2 if analysis.auctions_skipped else 0
 
 
-def eth(wei: int, places: int = 6) -> str:
-    """Format native wei as a decimal string, by integer arithmetic only."""
+def eth(wei: int | Decimal, places: int = 6) -> str:
+    """Format native wei as a decimal string, by integer arithmetic only. Decimals
+    (the capped path) are truncated to whole wei first — display only."""
+    wei = int(wei)
     sign = "-" if wei < 0 else ""
     scaled = abs(wei) * 10**places // 10**18
     return f"{sign}{scaled // 10**places}.{scaled % 10**places:0{places}d}"
@@ -464,6 +502,21 @@ def report_analysis(
     if analysis.auctions_skipped:
         print(f"  ABANDONED (valuation)       {analysis.auctions_skipped}")
 
+    suspects = analysis.price_suspect_auctions
+    if suspects:
+        verb = "flagged but KEPT" if not analysis.exclude_price_suspect else "excluded"
+        print(
+            f"  price-suspect, {verb}     {len(suspects)} ({pct(len(suspects), total)})"
+            "   <- a native price fails the 2x two-sided check"
+        )
+        for start in range(0, len(suspects), 6):
+            print("      " + ", ".join(str(a) for a in suspects[start : start + 6]))
+        if not analysis.exclude_price_suspect:
+            print(
+                "      WARNING: --include-price-suspects keeps fabricated prices in "
+                "every number above and below."
+            )
+
     print(f"\nuser surplus with solver      {eth(analysis.surplus_base)} ETH")
     print(f"user surplus without solver   {eth(analysis.surplus_loo)} ETH")
     print(f"delta surplus                 {eth(analysis.delta_surplus)} ETH")
@@ -481,7 +534,7 @@ def report_analysis(
         print(
             f"  rivals' rewards change      "
             f"{eth(analysis.delta_rewards - analysis.removed_reward_base)} ETH"
-            "   <- negative: rivals earn more once the solver is gone"
+            "   <- negative means rivals earn more once the solver is gone"
         )
         print(f"  auctions where a reward moved {analysis.auctions_rewards_moved}")
         print(
@@ -490,9 +543,33 @@ def report_analysis(
             f"{analysis.negative_rewards_loo} loo ({eth(analysis.negative_reward_sum_loo)} ETH)"
         )
         print(
-            "  NOTE: uncapped only. The real payout is clamped into the reward caps, and\n"
-            "  a failed settlement's uncapped penalty is -reference_score against a real\n"
-            "  floor of -0.01 ETH — see docs/rewards.md#why-the-cap-is-hard-counterfactually."
+            "  NOTE: uncapped is the mechanism's accounting, not a payout — the real\n"
+            "  payment clamps into the reward caps. The capped estimate below is the\n"
+            "  payout-scale answer."
+        )
+
+        print(
+            f"\ncapped rewards (estimate)     {eth(analysis.rewards_base_capped)} ETH with, "
+            f"{eth(analysis.rewards_loo_capped)} ETH without"
+        )
+        capped_line = (
+            f"delta rewards (capped)        {eth(analysis.delta_rewards_capped)} ETH"
+        )
+        if cow is not None and not cow.auctions_without_rate:
+            capped_line += f"  = {cow_amount(cow.cow_wei_capped)} COW"
+        print(capped_line)
+        print(
+            f"  over {analysis.auctions_capped} auctions"
+            + (
+                f"; {analysis.auctions_capped_skipped} skipped, no cap estimate"
+                if analysis.auctions_capped_skipped
+                else ""
+            )
+        )
+        print(
+            f"  a replacement inherits the displaced slot's cap (realised fees follow "
+            f"the orders); double-inherited {analysis.cap_double_inherited}, "
+            f"orphans {analysis.cap_orphans}"
         )
         if cow is not None and cow.auctions_without_rate:
             print(
@@ -637,7 +714,20 @@ def write_analysis_json(
         "negative_rewards_loo": analysis.negative_rewards_loo,
         "negative_reward_sum_base_wei": str(analysis.negative_reward_sum_base),
         "negative_reward_sum_loo_wei": str(analysis.negative_reward_sum_loo),
+        "capped_estimate": analysis.capped_estimate,
+        "rewards_base_capped_wei": str(analysis.rewards_base_capped),
+        "rewards_loo_capped_wei": str(analysis.rewards_loo_capped),
+        "delta_rewards_capped_wei": str(analysis.delta_rewards_capped),
+        "auctions_capped": analysis.auctions_capped,
+        "auctions_capped_skipped": analysis.auctions_capped_skipped,
+        "cap_double_inherited": analysis.cap_double_inherited,
+        "cap_orphans": analysis.cap_orphans,
+        "price_suspects_excluded": analysis.exclude_price_suspect,
+        "price_suspect_auctions": analysis.price_suspect_auctions,
         "delta_rewards_cow_wei": str(cow.cow_wei) if cow is not None else None,
+        "delta_rewards_capped_cow_wei": (
+            str(cow.cow_wei_capped) if cow is not None else None
+        ),
         "cow_converted_native_wei": str(cow.converted_native) if cow is not None else None,
         "cow_auctions_without_rate": (
             cow.auctions_without_rate if cow is not None else None
@@ -677,14 +767,22 @@ def write_analysis_json(
                     k: str(v) for k, v in r.loo_reference_scores.items()
                 },
                 "delta_rewards_wei": str(r.delta_rewards),
+                "delta_rewards_capped_wei": (
+                    str(r.delta_rewards_capped)
+                    if r.delta_rewards_capped is not None
+                    else None
+                ),
                 "baseline_rewards": {
-                    solver: {k: str(v) for k, v in asdict(reward).items()}
+                    solver: reward_as_json(reward)
                     for solver, reward in r.baseline_rewards.items()
                 },
                 "loo_rewards": {
-                    solver: {k: str(v) for k, v in asdict(reward).items()}
+                    solver: reward_as_json(reward)
                     for solver, reward in r.loo_rewards.items()
                 },
+                "cap_double_inherited": r.cap_double_inherited,
+                "cap_orphans_loo": sorted(r.cap_orphans_loo),
+                "price_suspect_uids": sorted(r.price_suspect_uids),
                 "solver_set_reference_for": sorted(r.solver_set_reference_for),
                 "un_filtered_uids": sorted(r.un_filtered_uids),
                 "un_filtered_winner_uids": sorted(r.un_filtered_winner_uids),

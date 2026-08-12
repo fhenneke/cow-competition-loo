@@ -40,9 +40,10 @@ stays in the sections and docs each row links to; the milestone sections cite th
 | D8 | Retain an auction when **reference scores move**, not only when the winner set changes — rewards move on a reference score alone ([§5.1](#51-m2-result)) | winner-set-only retention — silently drops 43% of the auctions whose rewards move | `AuctionCounterfactual.anything_moved` | — |
 | D9 | `--solver` matches names **exactly** and removes **every** rotated address together ([traps](docs/analytics-db.md#resolving-a-solver-name)) | substring match — `Arc` ⊂ `Arctic`, both bid, two competitors silently removed | `extract.SOLVER_SQL`, `resolve_solver` | — |
 | D10 | Auctions the solver never bid in are **skipped but stay in the denominator**, so rates describe the window rather than the solver's own subset | rates over the solver's auctions only | `analyse_auction` early return, `Analysis.add` | — |
-| D11 | M3 stops at **uncapped** rewards and reports the negative-reward exposure next to every total, because the gap to capped payouts is first-order, not a refinement ([§6.1](#61-m3-result)) | caps — the upper cap needs the realised protocol fees of a settled batch, which a replacement winner does not have ([why](docs/rewards.md#why-the-cap-is-hard-counterfactually)) | `rewards.uncapped_rewards`, `Analysis.negative_*` | backfill fee policies per docs/rewards.md, then clamp |
+| D11 | Rewards are reported twice: **uncapped exactly**, and **capped as an estimate** in which a replacement inherits the displaced slot's recorded `upper_reward_cap` — realised fees follow the orders, and a reverted slot's cap is 0 exactly where its settlement is a revert ([§6.1](#61-m3-result)) | uncapped only — measured unusable as a payout answer (−410 ETH uncapped vs 0.75 ETH paid over the window); full fee-policy backfill — unnecessary while cap orphans are 0 | `rewards.uncapped_rewards` caps path, `counterfactual.winner_caps` | backfill fee policies per docs/rewards.md for orphans |
 | D12 | The reward side consumes the **same per-solution settlement decision** as the surplus side, under whatever outcome rule is in force, so the two views of one auction cannot disagree about which winners delivered (D5 extended to M3) | reading `is_settled_in_time` again independently | `SideOutcomes.solution_executed` feeding `Win.settled` | — |
 | D13 | Δrewards converts native → COW **per auction**, at the accounting-period rate of its `block_deadline`; an unsnapshotted rate leaves the auction unconverted and reported, never guessed | one window-level rate — wrong whenever a window straddles a Tuesday period boundary | `cli.convert_delta_rewards` | — |
+| D14 | Every solution's executed amounts are valued through **both** tokens' native prices; an auction with a >2× disagreement is **excluded from every statistic** and named in the report — a wrong price fabricates every number it touches, so quoting it at all misleads ([§6.1](#61-m3-result)) | trusting `auction_prices` — one token was ~15,300× off for a whole window, fabricating the M2 "whale"; cross-auction median checks — fail exactly there, the wrong price is the persistent one; with-and-without reporting — built first, dropped as noise once the with-suspects numbers proved purely artefactual ([details](docs/analytics-db.md#native-prices-can-be-plain-wrong)) | `counterfactual.price_imbalanced`, `Analysis.exclude_price_suspect` | `--include-price-suspects`, `PRICE_IMBALANCE_THRESHOLD` |
 
 ## 2. Two valuations, deliberately separate
 
@@ -291,6 +292,16 @@ M2 and M3 agree on which winners delivered, with the discarded amount reported a
 
 ### 5.1 M2 result
 
+> **Addendum (M3, D14):** the price-sanity check added in M3 later showed that
+> Sector's headline below is dominated by a *fabricated* native price, not by a whale:
+> auction 13498037's +6.56 ETH — 82% of the +8.01 — is a 0.80 ETH trade whose buy
+> token was priced ~15,300× too high across the whole window. `analyse` now excludes
+> such auctions from every statistic by default; on the clean set Sector's Δsurplus is
+> **+1.33 ETH** and Fractal is unchanged. The numbers below are kept as measured with
+> the suspects still in; do not quote Sector's without that warning —
+> [§6.1](#61-m3-result),
+> [details](docs/analytics-db.md#native-prices-can-be-plain-wrong).
+
 ```bash
 uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04
 ```
@@ -419,9 +430,22 @@ Score mode only. Results in [§6.1](#61-m3-result); what follows is what was bui
    wider retention was for.
 4. Caps only if the protocol-fee estimate for replacement winners proves tractable — see
    [docs/rewards.md](docs/rewards.md#why-the-cap-is-hard-counterfactually). Uncapped is a
-   legitimate stopping point; say so in the output if you stop there. **Stopped at
-   uncapped (D11), and the output says so** — with the negative-reward exposure printed
-   next to the totals, because §6.1 shows the gap to real payouts is first-order.
+   legitimate stopping point; say so in the output if you stop there. **It proved
+   tractable without any fee estimation (D11):** the recorded caps cover every winning
+   solution in the window, and a replacement inherits the displaced slot's cap the same
+   way it inherits the slot's settlement — realised fees follow the orders, and a
+   reverted slot's cap is 0 exactly where its settlement is a revert. The capped
+   formula is validated in the same gate as the uncapped one, against
+   `batch_reward_native`. What stays an estimate is only *whose* cap a replacement
+   gets; the mapping never falls back to a guess (a cap orphan drops its auction from
+   the capped aggregate, and there were 0).
+
+Added while answering step 4, because §6.1's first run made the need obvious (D14): a
+**price-sanity check**. Every solution's executed amounts are valued through both
+tokens' native prices; an auction with a >2× disagreement is excluded from every
+statistic and named in the report (`--include-price-suspects` overrides). This caught
+`auction_prices` being ~15,300× wrong on one token for the whole window — which had
+fabricated the M2 "whale" ([§5.1 addendum](#51-m2-result)).
 
 ### 6.1 M3 result
 
@@ -432,60 +456,69 @@ uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04
 
 **Gate met, exactly:** over the same 7,745 mainnet auctions as M1, all **9,809 / 9,809**
 (auction, solver) reward rows recomputed from recorded inputs match
-`fct_solver_rewards_per_auction.uncapped_reward` to the wei. The whole window sits in one
-accounting period (2026-07-28 → 2026-08-04, rate 6.045134508635538e-05 COW→native), so
-the COW figures below are single-rate.
+`fct_solver_rewards_per_auction` to the wei — `uncapped_reward`, `upper_reward_cap` and
+`batch_reward_native` all six compared fields. (One trap: Python's default 28-digit
+`Decimal` context rounds the cap sums the DB keeps exact; `loo.rewards` sets 78.) The
+whole window sits in one accounting period (2026-07-28 → 2026-08-04, rate
+6.045134508635538e-05 COW→native), so the COW figures below are single-rate.
 
-Counterfactual, `inherited` outcome rule, uncapped:
+Counterfactual, `inherited` outcome rule. **44 price-suspect auctions (0.6% of the
+window) are excluded from every figure (D14)** — the same 44 for both solvers, since
+the flag is a property of the auction:
 
 | | Fractal | Sector |
 | --- | --- | --- |
-| uncapped rewards with solver | −283.0310 ETH | −411.1515 ETH |
-| uncapped rewards without | −282.8497 ETH | −297.8702 ETH |
-| **Δrewards (uncapped)** | **−0.1813 ETH** (−2,999 COW) | **−113.2813 ETH** (−1,873,925 COW) |
-| the solver's own uncapped reward | +0.2099 ETH | +3.0277 ETH |
-| rivals' rewards change | −0.3911 ETH | −116.3089 ETH |
-| auctions where any reward moved | 1,278 | 1,798 |
-| negative reward rows, base / loo | 664 / 626 | 579 / 569 |
-| …their sums | −289.82 / −289.62 ETH | −426.10 / −392.20 ETH |
+| auctions analysed / solver bid | 7,701 / 5,846 | 7,701 / 4,845 |
+| Δsurplus | +0.2631 ETH | +1.3259 ETH |
+| uncapped rewards with / without | −9.15 / −8.97 ETH | −12.11 / −9.03 ETH |
+| Δrewards (uncapped) | −0.1784 ETH (−2,952 COW) | −3.0783 ETH (−50,921 COW) |
+| the solver's own uncapped reward | +0.2096 ETH | −3.6563 ETH |
+| capped rewards with / without | −0.2295 / −0.2108 ETH | +0.5248 / +0.6229 ETH |
+| **Δrewards (capped estimate)** | **−0.0187 ETH** (−309 COW) | **−0.0981 ETH** (−1,622 COW) |
+| cap double-inherited / orphans | 4 / 0 | 2 / 0 |
+| auctions where any reward moved | 1,275 | 1,780 |
+| negative uncapped rows, base / loo | 661 / 623 | 574 / 564 |
 
-Three findings, the first two of which decide how M4 may quote these numbers:
+Four findings, and each of the first three decides how M4 may quote a number:
 
-- **Δrewards is negative for both solvers: in uncapped terms the protocol would pay
-  *more* without the solver, not less.** The removed solver's own reward is small — a
-  settled winner earns `winning − reference`, a thin margin — while every surviving
-  rival's reference score falls once the solver's solutions leave the without-`s` pick,
-  and rewards are `winning − min(winning, reference)`. Removing a competitor makes the
-  remaining competition look weaker, so the mechanism pays everyone else more. The
-  decomposition makes that explicit: Sector's own +3.03 ETH is dwarfed by rivals'
-  −116.31 ETH.
-- **Uncapped is not a payout estimate, and in this window the distance is the headline.**
-  The totals are penalty-dominated: an unsettled winner is charged `−reference_score`
-  uncapped against a real floor of −0.01 ETH, and 14.9% of winners never settled while
-  carrying half the winning score. Three consecutive whale auctions
-  (13498033/36/37, the same ~139 ETH order) carry **−108.34 of Sector's −113.28 ETH**:
-  in two of them the whale winner never settled and only its *penalty* moved with the
-  reference score Sector was setting (real payout delta under the floor: ≈ 0), and in
-  the third Sector's replacement would earn +81.31 ETH uncapped where the real payout
-  clamps to the fee-derived upper cap. Flooring penalties at mainnet's −0.01 ETH — the
-  one cap that needs no fee data — moves Sector's Δ from −113.28 to −79.43 ETH and
-  collapses the unchanged-winner-set share from −20.21 to −2.05 ETH; the rest is the
-  missing upper cap. So M4 must present Δrewards(uncapped) as a property of the
-  *mechanism's accounting*, never as money saved or spent, and any dollar claim needs
-  the caps (D11's revision path).
-- **D8 priced out:** rewards moved in 1,798 Sector auctions against 1,025 with a changed
-  win, and the changed-win-free auctions still carry −20.21 ETH of uncapped delta.
-  Retaining on winner-set change alone would have dropped 43% of the auctions whose
-  rewards move, and with them most of the penalty phantom that the floored diagnostic
-  exposes.
+- **The capped estimate is the payout answer, and it is orders of magnitude below the
+  uncapped figure.** Sector: −0.098 ETH capped against −3.08 uncapped (and against
+  −113.28 before the price exclusion); Fractal −0.019 against −0.18. Both are
+  negative — actual payments would *rise* slightly without either solver, because
+  rivals' reference scores fall and their capped rewards grow — but at the scale of a
+  tenth of an ETH over three days. The uncapped number remains the mechanism's exact
+  accounting, penalty-dominated (−reference_score per failed settlement against a real
+  floor of −0.01 ETH). Quote uncapped as accounting, capped as money.
+- **44 auctions in the window have a fabricated native price, and before D14 they
+  carried M2's headline.** The two-sided check values each trade through both tokens;
+  the window's five biggest "whales" — including the auction that supplied **82% of
+  Sector's published +8.01 ETH Δsurplus** — are one token priced ~15,300× too high, a
+  0.80 ETH trade recorded as ~139 ETH of score. They are now excluded outright: with
+  them, Sector's Δsurplus reads +8.01 instead of +1.33 ETH, its uncapped Δrewards
+  −113.28 instead of −3.08, and even its own uncapped reward flips sign (+3.03 vs the
+  real −3.66 — the phantom win was carrying its whole positive balance). Fractal
+  barely moves. Ridiculous-with, plausible-without is exactly why exclusion is the
+  default rather than a side-by-side.
+- **The caps and the price check agree independently.** Before exclusion, the suspect
+  auctions contributed −110.20 ETH of Sector's uncapped delta but only −0.0010 ETH of
+  its capped delta: a fabricated score cannot fabricate realised fees, so the
+  fee-derived cap neutralises the phantom on its own. That the two guards give the
+  same answer by different routes is the best evidence either is right.
+- **D8 priced out:** rewards moved in 1,780 Sector auctions against 1,011 with a
+  changed win. Retaining on winner-set change alone would have dropped 43% of the
+  auctions whose rewards move.
 
-Numbers above are the default rule; a replacement inheriting a reverted slot earns no
-`observed_score` (38 such replacements for Sector, 80 for Fractal), which is what keeps
-the reward and surplus sides of one auction consistent (D12). Other outcome rules were
-not run over the window in M3 — the cap distortion dominates the rule sensitivity here,
-and M4 can add them if a bound is wanted.
+The slot rule extends to caps at almost no cost: caps were never orphaned (a
+replacement always claimed a recorded winner's pair — the same 0 as M2's settlement
+mapping) and double-inheritance, where two replacements split one displaced winner's
+pairs and each takes its whole cap, happened 2–4 times per solver in ~5,000 auctions.
+A replacement inheriting a reverted slot earns no `observed_score` and a 0 cap
+consistently (38 for Sector, 80 for Fractal; D12). Other outcome rules were not run
+over the window in M3 — the cap distortion dominates the rule sensitivity here, and M4
+can add them if a bound is wanted.
 
-Not built, deferred: capped rewards (D11), `notebooks/analysis.ipynb` (M4).
+Not built, deferred: `notebooks/analysis.ipynb` (M4). Cap backfill via fee policies
+(D11's revision path) stays unneeded while orphans are 0.
 
 ## 7. M4 — aggregation and write-up
 
@@ -520,8 +553,14 @@ State these caveats with the results:
    uncertainty about whether those batches would ever have landed.
 3. **Filter proxy** — the measured per-pair surplus proxy error from M1 step 5.
 4. **Quote rewards excluded** — no data on counterfactual quoting.
-5. **Rewards are uncapped** (D11) and M3 measured the gap to payouts as first-order:
-   penalties are unfloored (−reference_score against a real −0.01 ETH) and replacement
-   winners are uncrowned (+81 ETH uncapped on the window's whale against a fee-derived
-   cap). Quote Δrewards as mechanism accounting, not as money, and never net it against
-   Δsurplus without saying so — [§6.1](#61-m3-result).
+5. **Two reward figures, not one** (D11). Uncapped is the mechanism's exact accounting
+   but three orders of magnitude from payouts (−410 ETH uncapped vs 0.75 ETH paid over
+   the window); the capped figure is the money answer but an *estimate* — replacements
+   inherit the displaced slot's cap. Lead with capped for "what would payments do",
+   keep uncapped for "what does the mechanism think", and never net either against
+   Δsurplus without saying which — [§6.1](#61-m3-result).
+6. **Price-suspect auctions are excluded** (D14). 44 auctions in this window carry a
+   fabricated native price; they held 82% of Sector's M2 Δsurplus and 97% of its
+   uncapped Δrewards. Every statistic is over the clean set; name the excluded
+   auctions and their count (0.6% of the window) rather than quoting any number that
+   includes them.

@@ -68,6 +68,30 @@ workaround is to take an order's policies from another auction where it was exec
 Uncapped rewards need only scores and reference scores, both of which the winner-selection
 code produces directly. Start there.
 
+### The slot-inheritance estimate, and why the caps cannot be skipped
+
+Measured over 2026-08-01..04, the caps are not a refinement: the window's 9,809 reward
+rows sum to **−410.06 ETH uncapped and 0.7534 ETH actually paid**, with 54% of rows
+clamped at the upper cap and 209 at the lower. So the counterfactual estimates capped
+rewards rather than stopping at uncapped, by extending D4's slot rule to fees: a
+replacement winner takes the `upper_reward_cap` of the recorded winner(s) whose token
+pairs it claims, because realised fees follow the orders. This is self-consistent with
+settlement inheritance for free — `int_backend_data__solution_data.upper_reward_cap`
+is 0 for a batch that never settled (unrealised fees are no fees), so a replacement of
+a reverted slot inherits cap 0 exactly where it inherits the revert.
+
+Facts that make the estimate cheap, measured on the same window:
+
+- every winning solution has a cap row — 10,301 of 10,301, no NULLs;
+- the 16 late-landed winners have positive caps (their trades happened) but
+  `is_settled_in_time = false`, consistent with earning nothing;
+- `lower_reward_cap` and `is_excluded` are auction-level constants riding on every row.
+
+One implementation trap: the caps come out of Postgres with ~40 significant digits and
+Python's default `Decimal` context is 28 — per-solver sums silently round and the
+exact comparison against `batch_reward_native` fails on every capped row. `loo.rewards`
+sets the context to 78 digits (a full uint256).
+
 ## Native → COW
 
 `dbt.int_accounting_period_data__conversion_rates` holds the per-accounting-period rate.

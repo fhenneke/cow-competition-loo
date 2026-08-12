@@ -176,17 +176,20 @@ from dbt.stg_backend_data__competition_auctions
 where auction_id = any(%(ids)s)
 """
 
-# Only buy-token prices are needed: `compute_order_score` converts through the buy
-# token for both order sides. Restricting to traded tokens keeps this from returning
-# every price in every auction (~900 rows each).
+# The valuation itself only needs buy-token prices — `compute_order_score` converts
+# through the buy token for both order sides — but the price-sanity check values each
+# trade through *both* tokens and compares, so sell tokens ride along. Restricting to
+# traded tokens keeps this from returning every price in every auction (~900 rows each).
 PRICES_SQL = """
 with traded as (
-    select distinct
-        pte.auction_id,
-        coalesce(o.buy_token, j.buy_token) as token
+    select distinct pte.auction_id, t.token
     from dbt.stg_backend_data__proposed_trade_executions pte
     left join dbt.stg_backend_data__orders o on o.uid = pte.order_uid
     left join dbt.stg_backend_data__jit_orders j on j.uid = pte.order_uid
+    cross join lateral (values
+        (coalesce(o.sell_token, j.sell_token)),
+        (coalesce(o.buy_token, j.buy_token))
+    ) as t (token)
     where pte.auction_id = any(%(ids)s)
 )
 select ap.auction_id, encode(ap.token, 'hex') as token, ap.price
@@ -224,18 +227,20 @@ where auction_id = any(%(ids)s)
 """
 
 # The reward formula's own inputs, straight from the model `fct_solver_rewards_per_auction`
-# builds on: one row per winning solution with its score and settlement flag. Used by the
-# M3 gate, which recomputes uncapped rewards from these and compares against the mart —
+# builds on: one row per winning solution with its score, settlement flag and caps. Used
+# by the M3 gate, which recomputes both rewards from these and compares against the mart —
 # so the only thing in the comparison's path is the formula transcription itself.
 REWARD_INPUTS_SQL = """
-select auction_id, solution_uid, encode(solver, 'hex') as solver, score, is_settled_in_time
-from dbt.int_backend_data__winning_solutions_with_onchain_status
+select auction_id, solution_uid, encode(solver, 'hex') as solver, score,
+       is_settled_in_time, upper_reward_cap, lower_reward_cap, is_excluded
+from dbt.int_backend_data__solution_data
 where auction_id = any(%(ids)s)
 """
 
 FCT_REWARDS_SQL = """
 select auction_id, encode(solver, 'hex') as solver,
-       competition_score, observed_score, reference_score, uncapped_reward
+       competition_score, observed_score, reference_score, uncapped_reward,
+       upper_reward_cap, batch_reward_native
 from dbt.fct_solver_rewards_per_auction
 where auction_id = any(%(ids)s)
 """
@@ -448,22 +453,84 @@ def load_settlement_outcomes(
     return outcomes
 
 
+@dataclass(frozen=True)
+class SolutionCap:
+    """One recorded winning solution's cap inputs from `int_backend_data__solution_data`.
+
+    `upper` is that solution's contribution to its solver's upper reward cap —
+    `scaling_factor × realised protocol fees`, so genuinely fractional (`Decimal`) and
+    **0 for a batch that never settled**, since unrealised fees are no fees. `lower`
+    and `excluded` are auction-level facts that ride along on every row.
+    """
+
+    upper: Decimal
+    lower: int
+    excluded: bool
+
+
+@dataclass(frozen=True)
+class RewardInputs:
+    """Everything the reward formula consumes for one auction, from the DB's record."""
+
+    wins: tuple[Win, ...]
+    lower_cap: int
+    excluded: bool
+
+
 def load_reward_inputs(
     conn, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
-) -> dict[int, list[Win]]:
-    """The reward formula's inputs per auction: each winning solution's solver, score
-    and settled-in-time flag, from the same model the dbt rewards mart reads."""
-    inputs: dict[int, list[Win]] = {}
+) -> dict[int, RewardInputs]:
+    """The reward formula's inputs per auction — each winning solution's solver, score,
+    settled-in-time flag and cap — from the same model the dbt rewards mart reads."""
+    rows_by_auction: dict[int, list[dict]] = {}
     for chunk in chunked(list(auction_ids), chunk_size):
         for row in fetch(conn, REWARD_INPUTS_SQL, {"ids": list(chunk)}):
-            inputs.setdefault(row["auction_id"], []).append(
-                Win(
-                    solver=row["solver"],
-                    score=as_int(row["score"]),
-                    settled=bool(row["is_settled_in_time"]),
-                )
+            rows_by_auction.setdefault(row["auction_id"], []).append(row)
+
+    inputs: dict[int, RewardInputs] = {}
+    for auction_id, rows in rows_by_auction.items():
+        lower_caps = {as_int(r["lower_reward_cap"]) for r in rows}
+        excluded = {bool(r["is_excluded"]) for r in rows}
+        if len(lower_caps) != 1 or len(excluded) != 1:
+            # Both are auction-level facts; two values on one auction means the model
+            # changed shape and the comparison below would be against the wrong caps.
+            raise ValueError(
+                f"auction {auction_id}: inconsistent lower_reward_cap/is_excluded "
+                f"across its winning solutions"
             )
+        inputs[auction_id] = RewardInputs(
+            wins=tuple(
+                Win(
+                    solver=r["solver"],
+                    score=as_int(r["score"]),
+                    settled=bool(r["is_settled_in_time"]),
+                    upper_cap=Decimal(r["upper_reward_cap"]),
+                )
+                for r in rows
+            ),
+            lower_cap=lower_caps.pop(),
+            excluded=excluded.pop(),
+        )
     return inputs
+
+
+def load_solution_caps(
+    conn, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
+) -> dict[int, dict[int, SolutionCap]]:
+    """Cap inputs per recorded winning solution, keyed by auction then `solution_uid`.
+
+    Winners only, by construction of `int_backend_data__solution_data` — a
+    counterfactual replacement has no row here, which is exactly why its cap has to be
+    inherited from the slot it displaced."""
+    caps: dict[int, dict[int, SolutionCap]] = {}
+    for chunk in chunked(list(auction_ids), chunk_size):
+        for row in fetch(conn, REWARD_INPUTS_SQL, {"ids": list(chunk)}):
+            caps.setdefault(row["auction_id"], {})[row["solution_uid"]] = SolutionCap(
+                upper=Decimal(row["upper_reward_cap"]),
+                lower=as_int(row["lower_reward_cap"]),
+                excluded=bool(row["is_excluded"]),
+            )
+    return caps
 
 
 def load_reference_scores(
@@ -493,6 +560,8 @@ def load_fct_rewards(
                 observed_score=as_int(row["observed_score"]),
                 reference_score=as_int(row["reference_score"]),
                 uncapped_reward=as_int(row["uncapped_reward"]),
+                upper_cap=Decimal(row["upper_reward_cap"]),
+                capped_reward=Decimal(row["batch_reward_native"]),
             )
     return rewards
 

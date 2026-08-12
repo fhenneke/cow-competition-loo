@@ -134,6 +134,32 @@ native_amount = token_amount * price / 1e18
 matching `price_in_eth` (`services/crates/winner-selection/src/primitives.rs:20`). Prices
 are per auction; there is no global price table.
 
+## Native prices can be plain wrong
+
+`auction_prices` values can be off by orders of magnitude, and everything denominated
+in native — score, surplus, reference scores, rewards — is fabricated with them.
+Found on the 2026-08-01..04 window: token `050362ab1072cb2ce74d74770e22a3203ad04ee5`
+was priced **~15,300× too high for essentially the whole window** (7,747 auctions:
+median price 6.51e21 — the *wrong* value — with the plausible 4.25e17 appearing only
+occasionally). Selling 1,500 USDC (≈0.80 ETH) for it produced recorded scores of
+**~139 ETH**; the window's five largest winning scores were all this one token, and
+they dominated every whale-sensitive number in M2 and M3 before being caught.
+
+Two lessons on detection:
+
+- **Value each trade through both tokens and compare.** `executed_sell ×
+  price(sell_token)` and `executed_buy × price(buy_token)` describe the same trade, so
+  they must roughly agree — measured healthy winners sit within 1.04×, while the
+  artefacts were 14,000× apart. This is `counterfactual.price_imbalanced`
+  (threshold 2×), and every `analyse` headline is reported with and without the
+  flagged auctions.
+- **A cross-auction median or spike check does not work here**: the wrong price was
+  the persistent one, so the median *is* the error. Only the counterparty token inside
+  the same trade anchors reality.
+
+The check needs both tokens' prices, so `PRICES_SQL` loads sell tokens too even though
+the valuation itself converts through the buy token only.
+
 ## Coverage and lag
 
 - `int_backend_data__proposed_solution_data` starts at auction `12709602` and **lags the

@@ -8,10 +8,12 @@ as the surplus side, so the two can never disagree about which winners delivered
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
-from loo.counterfactual import Analysis, analyse_auction
-from loo.extract import AuctionBundle, Bid, Settlement
+from loo.counterfactual import Analysis, analyse_auction, price_imbalanced
+from loo.extract import AuctionBundle, Bid, Settlement, SolutionCap
 from loo.rewards import (
     MissingReferenceScoreError,
     RewardValidation,
@@ -67,11 +69,11 @@ def bid(
     )
 
 
-def bundle(bids: list[Bid]) -> AuctionBundle:
+def bundle(bids: list[Bid], prices: dict[str, int] | None = None) -> AuctionBundle:
     return AuctionBundle(
         auction_id=1,
         jit_owners=frozenset(),
-        native_prices={USDC: ONE},
+        native_prices=prices if prices is not None else {USDC: ONE},
         bids=tuple(bids),
         reference_scores={},
     )
@@ -136,6 +138,58 @@ class TestUncappedRewards:
 
     def test_no_winners_no_rewards(self):
         assert uncapped_rewards([], {}) == {}
+
+
+class TestCappedRewards:
+    def test_the_upper_cap_clamps(self):
+        rewards = uncapped_rewards(
+            [Win("a", 100, True, upper_cap=Decimal(10))], {"a": 60}, lower_cap=-5
+        )
+        assert rewards["a"].uncapped_reward == 40
+        assert rewards["a"].capped_reward == Decimal(10)
+
+    def test_the_lower_cap_floors_a_penalty(self):
+        rewards = uncapped_rewards(
+            [Win("a", 100, False, upper_cap=Decimal(0))], {"a": 60}, lower_cap=-5
+        )
+        assert rewards["a"].uncapped_reward == -60
+        assert rewards["a"].capped_reward == Decimal(-5)
+
+    def test_an_excluded_auction_pays_nothing(self):
+        rewards = uncapped_rewards(
+            [Win("a", 100, True, upper_cap=Decimal(10))],
+            {"a": 60},
+            lower_cap=-5,
+            excluded=True,
+        )
+        assert rewards["a"].uncapped_reward == 40
+        assert rewards["a"].capped_reward == Decimal(0)
+
+    def test_caps_sum_per_solver(self):
+        rewards = uncapped_rewards(
+            [
+                Win("a", 100, True, upper_cap=Decimal(10)),
+                Win("a", 50, True, upper_cap=Decimal(30)),
+            ],
+            {"a": 0},
+            lower_cap=-5,
+        )
+        assert rewards["a"].upper_cap == Decimal(40)
+        assert rewards["a"].capped_reward == Decimal(40)
+
+    def test_an_unknowable_cap_poisons_the_solver_not_the_formula(self):
+        """A `None` cap on any win makes the capped reward `None`; the uncapped side
+        is unaffected. Fabricating a cap would be a silent estimate error."""
+        rewards = uncapped_rewards(
+            [Win("a", 100, True, upper_cap=None)], {"a": 60}, lower_cap=-5
+        )
+        assert rewards["a"].uncapped_reward == 40
+        assert rewards["a"].upper_cap is None
+        assert rewards["a"].capped_reward is None
+
+    def test_without_a_lower_cap_the_capped_side_stays_off(self):
+        rewards = uncapped_rewards([Win("a", 100, True, upper_cap=Decimal(10))], {"a": 60})
+        assert rewards["a"].capped_reward is None
 
 
 class TestRewardValidation:
@@ -289,6 +343,134 @@ class TestRewardsInCounterfactual:
         )
         assert result.baseline_rewards == {} and result.loo_rewards == {}
         assert result.delta_rewards == 0
+
+
+class TestPriceSanity:
+    def test_a_balanced_solution_is_not_suspect(self):
+        entry = bid(0, "a", 100, [sell_order("o1")])
+        assert not price_imbalanced(entry, {WETH: 2 * ONE, USDC: ONE})
+
+    def test_an_imbalanced_solution_is_suspect(self):
+        """1000 of a 1-ETH token sold for 2100 of another 1-ETH token: the sides are
+        2.1x apart, which no real trade is — one of the two prices is wrong."""
+        entry = bid(0, "a", 100, [sell_order("o1")])
+        assert price_imbalanced(entry, {WETH: ONE, USDC: ONE})
+
+    def test_a_missing_price_makes_an_order_uncheckable_not_suspect(self):
+        entry = bid(0, "a", 100, [sell_order("o1")])
+        assert not price_imbalanced(entry, {USDC: ONE})
+
+    def suspect_result(self):
+        """An auction whose only orders trade at a 2.1x two-sided imbalance."""
+        return analyse_auction(
+            bundle(
+                [
+                    bid(0, "x", 200, [sell_order("o1", executed_buy=2200)], is_winner=True),
+                    bid(1, "b", 150, [sell_order("o1")]),
+                ],
+                prices={WETH: ONE, USDC: ONE},
+            ),
+            WETH,
+            frozenset({"x"}),
+            settled={0: SETTLED},
+            solution_caps={0: SolutionCap(upper=Decimal(10), lower=-5, excluded=False)},
+        )
+
+    def test_a_price_suspect_auction_is_excluded_from_every_statistic(self):
+        """A wrong price fabricates every native number the auction touches, so the
+        auction contributes nothing but its id — it stays in the window count and is
+        named, and even the recorded-win count skips it, keeping all remaining
+        statistics over one clean auction set."""
+        analysis = Analysis(solver="x", addresses=frozenset({"x"}), capped_estimate=True)
+        analysis.add(self.suspect_result())
+        assert analysis.price_suspect_auctions == [1]
+        assert analysis.auctions == 1
+        assert analysis.auctions_with_solver == 0
+        assert analysis.auctions_solver_won_db == 0
+        assert analysis.delta_surplus == 0
+        assert analysis.delta_rewards == 0
+        assert analysis.delta_rewards_capped == Decimal(0)
+        assert analysis.changed == []
+
+    def test_the_override_keeps_suspect_auctions_in_every_number(self):
+        analysis = Analysis(
+            solver="x",
+            addresses=frozenset({"x"}),
+            capped_estimate=True,
+            exclude_price_suspect=False,
+        )
+        analysis.add(self.suspect_result())
+        assert analysis.price_suspect_auctions == [1]
+        assert analysis.auctions_with_solver == 1
+        assert analysis.delta_surplus != 0
+
+class TestCapInheritance:
+    def test_a_replacement_inherits_the_displaced_slots_cap(self):
+        """The cap follows the orders like the settlement does: x's recorded cap
+        clamps its own baseline reward, and b's replacement reward inherits that same
+        cap, so the capped delta collapses to the cap difference — here zero."""
+        result = analyse_auction(
+            bundle(
+                [
+                    bid(0, "x", 200, [sell_order("o1", executed_buy=2200)], is_winner=True),
+                    bid(1, "b", 150, [sell_order("o1")]),
+                ]
+            ),
+            WETH,
+            frozenset({"x"}),
+            settled={0: SETTLED},
+            solution_caps={0: SolutionCap(upper=Decimal(10), lower=-5, excluded=False)},
+        )
+        assert result.baseline_rewards["x"].capped_reward == Decimal(10)
+        assert not result.baseline_rewards["x"].cap_inherited
+        assert result.loo_rewards["b"].upper_cap == Decimal(10)
+        assert result.loo_rewards["b"].capped_reward == Decimal(10)
+        assert result.loo_rewards["b"].cap_inherited
+        assert result.delta_rewards_capped == Decimal(0)
+        assert result.cap_double_inherited == 0 and not result.cap_orphans_loo
+
+    def test_a_winner_with_nothing_to_inherit_drops_the_capped_estimate(self):
+        """b wins a pair no recorded winner held, so its cap cannot be estimated and
+        the whole auction's capped delta is None rather than a guess."""
+        result = analyse_auction(
+            bundle(
+                [
+                    bid(0, "x", 200, [sell_order("o1")], is_winner=True),
+                    bid(1, "b", 150, [sell_order("o2", pair=B)]),
+                ]
+            ),
+            WETH,
+            frozenset({"x"}),
+            settled={0: SETTLED},
+            solution_caps={0: SolutionCap(upper=Decimal(10), lower=-5, excluded=False)},
+        )
+        # b wins on both sides (disjoint pair), but was never a recorded winner.
+        assert result.baseline_rewards["b"].capped_reward is None
+        assert result.rewards_base_capped is None
+        assert result.delta_rewards_capped is None
+
+class TestAnalysisAggregation:
+    def test_the_analysis_aggregates_capped_rewards(self):
+        analysis = Analysis(solver="x", addresses=frozenset({"x"}), capped_estimate=True)
+        analysis.add(
+            analyse_auction(
+                bundle(
+                    [
+                        bid(0, "x", 200, [sell_order("o1", executed_buy=2200)], is_winner=True),
+                        bid(1, "b", 150, [sell_order("o1")]),
+                    ]
+                ),
+                WETH,
+                frozenset({"x"}),
+                settled={0: SETTLED},
+                solution_caps={0: SolutionCap(upper=Decimal(10), lower=-5, excluded=False)},
+            )
+        )
+        assert analysis.auctions_capped == 1
+        assert analysis.auctions_capped_skipped == 0
+        assert analysis.rewards_base_capped == Decimal(10)
+        assert analysis.rewards_loo_capped == Decimal(10)
+        assert analysis.delta_rewards_capped == Decimal(0)
 
     def test_the_analysis_aggregates_rewards(self):
         analysis = Analysis(solver="x", addresses=frozenset({"x"}))

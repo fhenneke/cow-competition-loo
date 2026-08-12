@@ -76,19 +76,35 @@ window.
 
 ### Rewards
 
-In score mode `analyse` also reports **uncapped** solver rewards on both sides
-(M3): the removed solver's own reward drops out, and rivals' rewards grow because their
-reference scores fall without it. Δrewards is converted native → COW at each auction's
-accounting-period rate where the rate has been snapshotted.
+In score mode `analyse` reports solver rewards on both sides (M3), twice:
 
-Uncapped is a deliberate stopping point: the real payout is clamped into the reward
-caps, and the upper cap needs the realised protocol fees of a settled batch — which a
-replacement winner does not have
-([why](docs/rewards.md#why-the-cap-is-hard-counterfactually)). The report carries the
-count and sum of negative uncapped rewards so the distance to the real clamped payout
-stays visible; a failed settlement's uncapped penalty is `-reference_score` against a
-real floor of −0.01 ETH. Rewards use the same outcome rule as surplus, so the two sides
-of one auction never disagree about which winners delivered.
+- **Uncapped** — the mechanism's exact accounting. The removed solver's own reward
+  drops out, and rivals' rewards grow because their reference scores fall without it.
+  Not a payout: a failed settlement's uncapped penalty is `-reference_score` against a
+  real floor of −0.01 ETH, and over the M1 window uncapped rewards sum to −410 ETH
+  against 0.75 ETH actually paid.
+- **Capped (estimate)** — the payout-scale answer, clamping each reward into the
+  recorded caps. A replacement winner inherits the `upper_reward_cap` of the recorded
+  winner whose token pairs it claims — realised fees follow the orders, and a reverted
+  slot's cap is 0 exactly where its settlement is a revert
+  ([details](docs/rewards.md#the-slot-inheritance-estimate-and-why-the-caps-cannot-be-skipped)).
+  A winner with nothing to inherit drops its auction from the capped aggregate rather
+  than being guessed at; the report counts those.
+
+Both deltas are converted native → COW at each auction's accounting-period rate where
+the rate has been snapshotted. Rewards use the same outcome rule as surplus, so the two
+sides of one auction never disagree about which winners delivered.
+
+### Price sanity
+
+Native prices in `auction_prices` are sometimes plain wrong — one token was priced
+~15,300× too high for a whole window, fabricating 139 ETH scores on 0.80 ETH trades
+([details](docs/analytics-db.md#native-prices-can-be-plain-wrong)). Every solution is
+therefore cross-checked by valuing its executed amounts through both tokens' prices,
+and an auction where the two sides of a trade disagree by more than 2× is **excluded
+from every statistic** — the report names the excluded auction ids (0.6% of the M1
+window, which carried 82% of Sector's Δsurplus, all fabricated).
+`--include-price-suspects` keeps them in instead; the ids are printed either way.
 
 ### Validate
 
@@ -126,9 +142,9 @@ Everything else reads the staging tables and works up to the present.
 uv run loo validate-rewards --start 2026-08-01 --end 2026-08-04
 ```
 
-Recomputes every winning solver's uncapped reward from the DB's own inputs — winning
-solutions, settlement flags, reference scores — and diffs against
-`fct_solver_rewards_per_auction`, row by row. Unlike `validate` there is no
+Recomputes every winning solver's uncapped *and* capped reward from the DB's own
+inputs — winning solutions, settlement flags, caps, reference scores — and diffs
+against `fct_solver_rewards_per_auction`, row by row. Unlike `validate` there is no
 accepted-difference category: nothing in this path is approximated, so anything but an
 exact match on every row exits non-zero. Exit code 0 when every row matches, 1 on an
 empty window, 2 on a mismatch, 3 when the mart does not cover the window.
@@ -139,7 +155,7 @@ empty window, 2 on a mismatch, 3 when the mart does not cover the window.
 uv run --extra dev pytest
 ```
 
-127 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
+140 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
 `loo/counterfactual.py` and `loo/rewards.py` take plain dataclasses and hold no
 connection.
 
