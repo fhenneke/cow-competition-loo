@@ -151,6 +151,20 @@ are per auction; there is no global price table.
   `stg_backend_data__proposed_solutions` × `…__proposed_trade_executions` directly. The
   intermediate model also lacks `filtered_out`, so the staging join is the only route to
   the fairness-filter ground truth regardless of the window.
+
+  **The lag is specific to that one model — it is not a property of `int_` models.**
+  Measured on 2026-08-11, every other model on the path is level with staging:
+
+  | model | `max(auction_id)` |
+  | --- | --- |
+  | `stg_backend_data__proposed_solutions` | 13565433 |
+  | `stg_backend_data__settlements` | 13565433 |
+  | `int_backend_data__winning_solutions_with_onchain_status` | 13565433 |
+  | `int_backend_data__solution_data` | 13565433 |
+  | `int_backend_data__trade_with_tx_hash` | 13565433 |
+  | `int_backend_data__proposed_solution_data` | **13509867** |
+
+  So check the specific model rather than avoiding intermediate models as a class.
 - `stg_rpc_data__block_timestamp` covers block `24178030` onward (2026-01-06). Earlier
   windows need `stg_dune_data__block_timestamp`.
 - Auction ids are sparse — do not assume consecutive integers.
@@ -218,6 +232,130 @@ exempt). Consequences:
 - Where policies are genuinely needed for a non-executed order, backfill from another
   auction in which the same `order_uid` was executed — policies derive from order class,
   app data, and the quote, so they are stable across auctions for a given order.
+
+## Observed outcomes: what actually settled
+
+Everything above describes what solvers *proposed*. Three tables carry what happened on
+chain:
+
+| Table | Grain | Notes |
+| --- | --- | --- |
+| `stg_backend_data__settlements` | settlement event | `(block_number, log_index, solver, tx_hash, auction_id, solution_uid)`. No row means no settlement. |
+| `int_backend_data__winning_solutions_with_onchain_status` | **winning solution** | `(auction_id, solution_uid, solver, score, block_deadline, block_number, tx_hash, is_settled_in_time)` |
+| `int_backend_data__trade_with_tx_hash` | auction × order | the actual on-chain `sell_amount`, `buy_amount`, `fee_amount` per traded order, plus `solution_uid` |
+
+`…winning_solutions_with_onchain_status` is the one to use for "did this winner settle". It
+**left-joins** settlements onto the winners, so every winning solution has a row and a
+winner that never settled is a row with a null `tx_hash` rather than a missing row. That
+distinction is what lets a *missing* row mean "no data" and fail loudly. Verified over
+2026-08-01..2026-08-04:
+
+```
+winners                       10301
+rows in the status model      10301   <- exact 1:1, no gaps
+settled at all                 8768   (85.1%)
+settled in time                8752
+duplicate settlement rows         0
+status rows for non-winners       0
+```
+
+### `settled` and `settled_in_time` come apart, and which one you want depends
+
+```sql
+is_settled_in_time = coalesce(block_number <= block_deadline and tx_hash is not null, false)
+```
+
+**16 winners in that window settled late.** Their orders *did* trade — all 16 have rows in
+`int_backend_data__trade_with_tx_hash` — so the users got their fills, but the solver earns
+no reward (`observed_score` is 0 without `is_settled_in_time`, see
+[rewards.md](rewards.md)). Literally, then:
+
+- `tx_hash is not null` answers "did this execute at all";
+- `is_settled_in_time` answers "did the protocol pay for it".
+
+**The leave-one-out analysis uses `is_settled_in_time` for both questions**, so a late batch
+is carried as a failure with zero surplus. That is knowingly not what happened, and it is the
+one such place in the pipeline. The reason is consistency across milestones: a batch the
+protocol did not reward cannot be credited to the mechanism on the surplus side and written
+off on the reward side. The cost is those 16 winners' real user surplus, and it is reported
+as `orders_lost_to_lateness` rather than absorbed. Anyone asking a pure "what did users
+actually receive" question wants `tx_hash is not null` instead.
+
+### Failures are concentrated in the biggest solutions
+
+The 14.9% failure rate is not spread evenly, and anything that treats settlement as a small
+correction will be badly wrong:
+
+| | winners | Σ score | share of score |
+| --- | --- | --- | --- |
+| never settled | 1,533 (14.9%) | 439.6 ETH | **50.2%** |
+| settled | 8,768 (85.1%) | 435.5 ETH | 49.8% |
+
+**One seventh of the winners carry half the winning score and none of it executed.** The
+largest single unsettled winner scored 143.6 ETH. So a counterfactual that assumes winners
+settle roughly doubles the surplus on both sides of its comparison, and how it treats a
+*replacement* winner — for which no settlement was ever recorded — moves the headline by
+several ETH. The leave-one-out analysis therefore attaches settlement to the token pair
+rather than to the solver, and reports two bounds either side of it
+([PLAN.md §5](../PLAN.md#5-m2--loo-ranking-and-surplus-deltas)).
+
+### A settled proposal is exact — the only divergence is settling at all
+
+Over the same window, comparing `int_backend_data__trade_with_tx_hash` against
+`stg_backend_data__proposed_trade_executions` on `(auction_id, solution_uid, order_uid)`:
+
+```
+order rows compared                                          9061
+sell_amount = executed_sell and buy_amount = executed_buy    9061   <- all of them
+trades with a non-zero fee_amount                               0
+proposed orders of a settled winner missing from the trades      0
+```
+
+A solver commits its clearing prices in the settlement calldata, so **when a batch settles
+the proposed execution *is* the observed one**, to the atom. The entire content of
+"observed versus proposed" is the binary did-it-settle. A counterfactual therefore needs
+only the settlement flag plus the proposed amounts — there is no separate observed-amount
+lookup to build.
+
+Two caveats on `trade_with_tx_hash`: it filters trades to orders in
+`pre_stg__orders_per_auction_with_at_least_one_bid`, so **JIT orders are absent from it**;
+and `fee_amount` on the `Trade` event has been 0 since fees moved into the clearing price
+(`observed_fee` is marked `DEPRECATED after June 23, 2026` in
+`int_backend_data__trade_data_unprocessed`).
+
+## Resolving a solver name
+
+`dune_data__cow_protocol__solvers` is the only bridge from a submission address to a human
+name. `address` is **`bytea`**, so it joins `proposed_solutions.solver` directly with no
+`encode`. 267 rows on mainnet, one per address, 67 distinct names. Per network: xdai 89,
+base 98, only 10 addresses shared with mainnet.
+
+Four traps, all of them live in the 2026-08-01..2026-08-04 window:
+
+1. **Exact matching only.** `Arc` is a substring of `Arctic` and **both bid in the
+   window**; `Quasi` ⊂ `Quasilabs`, `Sector` ⊂ `Sector_Finance`, `Tsolver` ⊂ `TestSolver1`.
+   Any `ilike '%…%'` silently removes two competitors. Case-insensitive *exact* match is
+   safe — there are no `lower(name)` collisions.
+2. **One name, several addresses.** `Barter`, `Kipseli`, `Rizzolver` and `Tsolver` have
+   rotated submission keys, and neither `environment = 'prod'` nor `active` disambiguates
+   (Kipseli has three prod+active addresses). The ranges never overlap — no two same-name
+   addresses ever bid in the same auction — so intersecting with "addresses that actually
+   bid in the window" collapses it to one in practice. When a window straddles a rotation
+   it genuinely is one competitor under two addresses and **all of them must be removed
+   together**, or `compute_reference_scores` treats one half of the rotation as a rival of
+   the other.
+3. **`Uncatalogued` is not a solver.** The model does `coalesce(name, 'Uncatalogued')` and
+   `coalesce(environment, 'new')` for addresses missing from the Dune seed
+   (`dune_dbt/macros/general/solvers.sql`), so 36 addresses share that name, including
+   `0x000…0000`. Three of them really did bid at some point; those must be given by
+   address.
+4. **Do not write `ltrim(arg, '0x')`** to strip an address prefix — `ltrim` strips a
+   character *set*, so `0x0000…` loses every leading zero and mismatches silently. Use
+   `case when arg like '0x%' then substr(arg, 3) else arg end`.
+
+The table is a current-state snapshot with **no time dimension**: `active` means "the
+latest allow-list event for this address was an add". It cannot answer "was X active on
+2026-08-02".
 
 ## Reading the dbt model source
 

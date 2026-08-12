@@ -21,8 +21,65 @@ No scheme and no database name — the database is derived from `--network`.
 
 ## Run
 
-M1 ships one command: reproduce the recorded competition over a date window and account
-for every difference.
+Two commands. `validate` reproduces the recorded competition and accounts for every
+difference — it is the gate the counterfactual rests on. `analyse` is the counterfactual
+itself.
+
+```bash
+uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04
+```
+
+Removes one solver from every auction in the window, re-runs winner selection, and reports
+what users would have gained or lost. `--solver` takes a name or a submission address,
+matched exactly — `Arc` and `Arctic` are different solvers and both compete.
+
+### The outcome rule
+
+A winner that never won for real never settled either, so the counterfactual has to decide
+what its orders do. That decision is worth several ETH — 14.9% of winning solutions never
+settled and they carry half of all winning score — so the rule is explicit:
+
+- `inherited` (**default**) — settlement belongs to the **slot**, not the solver. A
+  replacement inherits the outcome of the recorded winner that held its token pairs, so a
+  batch that really reverted stays reverted whoever replaces it. Settlement cancels out of
+  Δsurplus and what is left is the competition's *decision*.
+- `observed` — settlement belongs to the **solution**. A replacement has no record, so it is
+  assumed to settle. This charges the baseline for real reverts while assuming the
+  counterfactual never reverts, so it is a **lower bound**, provably below `inherited`.
+- `assume-settled` — every winner settles on both sides, so failures are ignored entirely.
+  Normally the upper bound.
+
+Report the default and quote the bound you care about; for Sector the three give 8.01, 2.89
+and 8.13 ETH. See [PLAN.md §5.1](PLAN.md#51-m2-result).
+
+Two things the rule names do **not** vary:
+
+- **Executed amounts are always the proposed ones**, from
+  `stg_backend_data__proposed_trade_executions`. Never on-chain trade amounts. That is
+  exact rather than an approximation: a batch that lands executes the amounts its solution
+  proposed, checked to the atom on every order row of every landed winner. So the only thing
+  chain data adds is *whether* it landed, and that is the single on-chain lookup the pipeline
+  makes (`tx_hash` and `is_settled_in_time`).
+- **"Settled" means landed in time.** A batch that lands after its deadline is carried as a
+  failure with zero surplus, even though its orders really filled, so that the surplus and
+  reward sides agree on which winners delivered. The discarded surplus is reported as
+  `of which merely late` rather than absorbed.
+
+```bash
+uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04 --outcome-rule observed
+```
+
+| flag | |
+| --- | --- |
+| `--outcome-rule` | `inherited` (default), `observed` or `assume-settled` — see above |
+| `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus |
+| `--limit N` | only the first N auctions — start here |
+| `--out report.json` | per-auction records, including both sides' reference scores |
+
+Exit code is 0 normally, 2 if any auction could not be valued, 4 if `--solver` did not
+resolve, 5 if the settlement source does not cover the window.
+
+### Validate
 
 ```bash
 uv run loo validate --start 2026-08-01 --end 2026-08-02
@@ -57,7 +114,8 @@ Everything else reads the staging tables and works up to the present.
 uv run --extra dev pytest
 ```
 
-71 tests, no DB access — `loo/winner_selection.py` and `loo/valuation.py` are pure.
+101 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py` and
+`loo/counterfactual.py` take plain dataclasses and hold no connection.
 
 ## Reading a run
 

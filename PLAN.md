@@ -190,7 +190,9 @@ Not built, deferred to their milestones: `counterfactual.py` (M2), `rewards.py` 
 `notebooks/analysis.ipynb` (M4). Surplus mode is implemented and unit-tested but has not
 been run over a window, since M1's comparisons are all score-mode by definition.
 
-## 5. M2 — LOO ranking and surplus deltas
+## 5. M2 — LOO ranking and surplus deltas — **done**
+
+Results in [§5.1](#51-m2-result); what follows is what was built.
 
 1. `loo_ranking = arbitrate([s for s in solutions if s.solver != X])` — **full
    re-arbitration**, steps 3–6, so removing `X` can lower a baseline and *un-filter*
@@ -217,6 +219,167 @@ proposed execution otherwise, or (b) always use the proposed execution. (a) is p
 should usually apply, since solutions rarely batch overlapping orders. Record how often the
 mapping fails, and state the choice in the output.
 
+**Decided — neither (a) nor (b), but a third rule.** Both options in the paragraph above
+attach settlement to the *solution*, and both are biased:
+
+- (a) `--outcome-rule observed` charges the baseline for its own reverts while assuming
+  every replacement settles, because no record exists to consult. So where `X` won and
+  reverted it reports users *gaining* from `X`'s removal, on nothing but the assumption
+  that the replacement would have landed. Biased against `X`.
+- (b) `--outcome-rule assume-settled` assumes *everyone* settles, baseline included, so it
+  overstates what users actually received wherever a winner reverted.
+
+The default is `--outcome-rule inherited`, which attaches settlement to the **slot**
+instead: a winner that also won for real takes its own recorded outcome, and a replacement
+inherits the outcome of the recorded winner(s) that held its token pairs. A batch that
+really reverted stays reverted whoever is put in its place. Settlement therefore cancels out
+of `Δsurplus` and the result measures the competition's *decision*, which is the question M2
+asks. (a) and (b) are kept as the pessimistic and optimistic bounds around it, which matters
+because the gap between them is **larger than the signal** and flips the sign of the answer
+for one of the two solvers measured — see [§5.1](#51-m2-result).
+
+Slots are keyed on `winner_pairs`, the `as_erc20`-normalised directed pairs `pick_winners`
+claims, since those are exactly what makes one solution displace another. Three details:
+
+- A replacement spanning several slots needs *all* of them to have settled, since one
+  reverting leg would have taken the whole batch with it.
+- A replacement claiming a pair no recorded winner held has nothing to inherit, so its
+  settlement is assumed. That count is PLAN §5's "how often the mapping fails" and is
+  reported as `settlement assumed anyway`.
+- All three rules are applied to *both* sides identically, so a winner that survives the
+  removal cancels exactly rather than manufacturing a difference.
+
+`1,533` of the `10,301` winners in the window never settled, so this is not a corner case.
+
+Two facts settled the design, both measured over the M1 window and now in
+[docs/analytics-db.md](docs/analytics-db.md#observed-outcomes-what-actually-settled):
+
+- **A settled proposal is exact.** All 9,061 order rows have on-chain amounts equal to the
+  proposed ones, to the atom, and no proposed order of a settled winner is missing from the
+  trades. So "observed versus proposed" reduces entirely to *did it settle*, and no separate
+  observed-amount lookup is needed.
+- **Execution is `is_settled_in_time`, so a late batch counts as a failure.** The two flags
+  genuinely differ: 16 winners landed late, their orders traded, and users kept the surplus
+  while the solver earned nothing. Using the reward flag on the surplus side therefore
+  discards real user surplus — deliberately, so that M2 and M3 agree on which winners
+  delivered, since a batch the protocol did not pay for cannot be credited to the mechanism
+  on one side and written off on the other. The discarded amount is reported as
+  `orders_lost_to_lateness` rather than absorbed.
+
+**Only settlement *status* is read from chain.** Executed amounts always come from
+`proposed_trade_executions`, never from the trade events, which the first bullet is what
+licenses.
+
+### 5.1 M2 result
+
+```bash
+uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04
+```
+
+Same 7,745 mainnet auctions as M1, score mode, all three outcome rules:
+
+| | Fractal | Sector |
+| --- | --- | --- |
+| auctions bid in | 5,863 (75.7%) | 4,872 (62.9%) |
+| auctions won, recomputed / recorded | 1,007 / 1,004 | 1,025 / 1,025 |
+| baseline winner set differs from the DB | 5 | 0 |
+| **Δsurplus, `inherited`** (the default) | **+0.2632 ETH** | **+8.0082 ETH** |
+| Δsurplus, `observed` (lower bound) | −0.0347 ETH | +2.8919 ETH |
+| Δsurplus, `assume-settled` | +0.5116 ETH | +8.1318 ETH |
+| user orders compared | 8,439 | 6,961 |
+| executed only with the solver (`inherited`) | 636 | 184 |
+| executed only *without* it (`inherited` / `observed`) | 10 / 95 | 13 / 52 |
+| user orders the baseline lost to a failed settlement | 1,187 | 827 |
+| …of which merely late, so their surplus was real | 13 | 9 |
+| replacements inheriting a reverted slot | 80 | 38 |
+| replacements with nothing to inherit (mapping failures) | **0** | **0** |
+| fairness filter relaxed (and a newly-kept solution won) | 3 (3) | 11 (11) |
+| helped set another solver's reference score | 814 pairs | 1,282 pairs |
+
+**How a replacement's settlement is modelled dominates the answer, and that is the main
+finding.** Under `observed` removing Fractal appears to make users *better off*; the sign is
+an artefact. That rule charges the baseline for the removed solver's own reverts while
+assuming every replacement lands, because no record exists for a solution that never won —
+so wherever `X` won and reverted it books a free gain from `X`'s removal.
+
+Attaching settlement to the **slot** removes the artefact: 1,533 winners (14.9%) never
+settled and they carry **50.2% of all winning score**
+([numbers](docs/analytics-db.md#failures-are-concentrated-in-the-biggest-solutions)), so this
+is where most of the money is. Under `inherited` a reverted slot contributes zero to
+*both* sides and drops out, Fractal's sign flips to positive, and the remaining gap to
+`assume-settled` is small (0.26 vs 0.51, 8.01 vs 8.13) — that residual is genuine uncertainty
+about whether reverted batches would have landed, not an accounting asymmetry.
+
+Two facts make the slot rule cheap rather than a modelling gamble:
+
+- **The mapping never failed.** Across both solvers, *every* replacement claimed a token pair
+  some recorded winner held, so its settlement was always derived and never assumed —
+  the `0` row above. PLAN §5 asked for this rate expecting it to be small; it is zero.
+- **It also fixes the "executed only without the solver" anomaly.** That count falls from 95
+  to 10 for Fractal and 52 to 13 for Sector, so ~85-90% of those orders were the settlement
+  asymmetry rather than a real effect. What is left is the blocked-batch mechanism below.
+
+Treating a late settlement as a failure cost nothing here, but only by luck: none of the
+window's 16 late winners belong to either solver measured (they are BRRRolver 5, Baseline 4,
+Barter 3, Helixbox 3, Wraxyn 1). For those two, every late batch was some other solver's
+winner that won on both sides and cancelled, so Δsurplus is identical to four decimals under
+either criterion — it moved only the `unsettled` count, by exactly the 9 and 13 late orders.
+Removing one of those five solvers would move the headline, so `orders_lost_to_lateness` is
+worth reading, not just carrying.
+
+`observed` is retained because it is a *provable* lower bound: it differs from `inherited`
+only on reverted slots, where it credits the replacement with positive surplus and
+`inherited` credits it with nothing, the baseline being zero either way. `assume-settled` is
+usually but not provably the upper bound — a reverted slot whose replacement carries more
+user surplus than the winner it displaced would push it below `inherited`, which score-mode
+ranking permits since score is not surplus.
+
+Three further results worth carrying into M3 and M4:
+
+- **Un-filtering is rare and always decisive.** The filter relaxed in 3 auctions for Fractal
+  and 11 for Sector, and in *every single one* a newly-kept solution went on to win. So step
+  1's guess that this would be "rare and the most interesting case" holds on both counts:
+  full re-arbitration is required, and `compute_reference_scores`' cheap variant would have
+  missed all 14.
+- **"Executed only without the solver" is legitimate, not a bug** — contrary to step 4,
+  which called it a correctness signal. Under `inherited` it is down to 10 orders for
+  Fractal and 13 for Sector, and what remains is the blocked-batch mechanism:
+  `pick_winners` needs *every* pair of a solution free, so a single-order winner can block a
+  multi-order batch and leave orders unexecuted that nobody else bid on
+  ([traced](docs/winner-selection.md#a-blocked-batch-keeps-orders-unexecuted)).
+- **Headline sums are whale-dominated; report medians in M4.** Sector's +8.0082 ETH is
+  +8.0085 over 976 auctions against −0.0003 over 7, and a *single* auction (13498037)
+  carries +6.5587 ETH — **82% of the total**, leaving 1.4495 ETH for the other 982. The
+  median non-zero auction moves 0.000056 ETH. Fractal is less extreme but still skewed: its
+  largest auction is 20% of the total.
+- **Almost every negative contribution was a settlement artefact.** Under `observed` Sector
+  had −5.12 ETH spread over 43 auctions pulling against the headline; under `inherited` that
+  collapses to −0.0003 ETH over 7, and Fractal has none at all. So the removed solver
+  essentially never *hurt* users where it won — the earlier appearance that it did came from
+  crediting its replacements with settlements that never happened.
+
+Scope notes. A counterfactual cannot resurrect solutions the arbitrator never saw:
+`max_solutions_per_solver` is a pre-arbitration filter in the autopilot
+([why](docs/winner-selection.md#max_solutions_per_solver-is-applied-before-arbitrate)).
+`--solver` resolves a name to *every* submission address that bid in the window, because
+several solvers have rotated keys and all of a rotation must be removed together
+([traps](docs/analytics-db.md#resolving-a-solver-name)). Surplus mode runs but was not the
+basis of these numbers; on a 200-auction slice it moved Sector's Δ from 0.00161 to 0.00206
+ETH and disagreed with the recorded winner set in 2 auctions, as expected from §2.
+
+Not built, deferred: `rewards.py` (M3), `notebooks/analysis.ipynb` (M4). The per-auction
+records carry both sides' winner sets, winning totals and reference scores, plus which
+solvers supplied each reference score, so M3 needs no further extraction.
+
+One trap that cost a rewrite: retention must key on **reference scores moving**, not on the
+winner set changing. Removing `X` moves a surviving solver's reference score in far more
+auctions than it moves a win, because one of `X`'s *non-winning* solutions can be a winner of
+the without-`s` pick inside `compute_reference_scores`. For Sector that is 1,798 auctions
+retained against 1,025 with a changed winner set — and reference scores are the denominator of
+the uncapped reward, so keeping only the latter would have silently dropped 43% of the
+auctions whose rewards actually move. Δsurplus is unaffected, so nothing in M2's own output
+would have shown it.
+
 ## 6. M3 — rewards
 
 Score mode only. Apply the formulas in [docs/rewards.md](docs/rewards.md) to the baseline
@@ -239,11 +402,28 @@ Headline row per solver-window: Δsurplus (native/USD), Δrewards, net value =
 Δsurplus − Δrewards, orders saved, auctions affected, share of auctions won,
 filter-relaxation count.
 
+**Lead with `inherited` and carry `observed` as the lower bound.** M2 found that how a
+replacement's settlement is modelled moves the headline by several ETH and, under the
+solution-attached rule, flips a sign ([§5.1](#51-m2-result)). Quoting a single figure without
+naming its rule would be a choice disguised as a result.
+
+Report **medians alongside sums**: a single auction supplies 82% of Sector's net Δsurplus,
+against a median non-zero auction of 0.000056 ETH, so a sum on its own says more about one
+whale than about the solver.
+
 State these caveats with the results:
 
 1. **No behavioural response.** The remaining solvers' bids are held fixed. In reality they
    would bid differently without `X`; this is not modelled and no claim is made about which
-   direction it would move the result.
-2. **Settlement risk** — which §5 variant was used.
+   direction it would move the result. Note this cuts one specific way too:
+   `max_solutions_per_solver` is applied before arbitration, so no rival's suppressed
+   fourth solution can step in
+   ([why](docs/winner-selection.md#max_solutions_per_solver-is-applied-before-arbitrate)).
+2. **Settlement risk** — which §5 rule was used. `inherited` hands a replacement the
+   settlement of the slot it displaced, so a reverted batch stays reverted and settlement
+   cancels out of Δsurplus; quote `observed` alongside it as the provable lower bound.
+   14.9% of winners never settled and they hold 50.2% of winning score, so this is a
+   first-order caveat, not a footnote — the residual `inherited`-to-`assume-settled` gap is real
+   uncertainty about whether those batches would ever have landed.
 3. **Filter proxy** — the measured per-pair surplus proxy error from M1 step 5.
 4. **Quote rewards excluded** — no data on counterfactual quoting.

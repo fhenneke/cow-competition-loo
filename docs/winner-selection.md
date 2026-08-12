@@ -173,6 +173,41 @@ forces an answer, and no `model` case occurred at all. They also have a uniform 
 one is the recorded filter dropping a batched solution that the surplus filter keeps, and
 all 7 involve a partially fillable order, where surplus and score diverge most.
 
+### `max_solutions_per_solver` is applied before `arbitrate`
+
+The cap is enforced by the autopilot while collecting bids, not by the arbitrator
+(`crates/autopilot/src/run_loop.rs:613-633`): `bids.retain(...)` counts solutions per
+**driver name** and drops the fourth onward, then shuffles. `arbitrate` never sees them.
+
+Two consequences for anything counterfactual. The recorded solutions are already truncated
+per solver, so removing a solver **cannot** let a rival's fourth solution appear — the
+counterfactual is over the set the arbitrator actually saw, and that is the honest scope.
+And the cap keys on driver name while everything else keys on submission address, so a
+solver running two drivers gets two allowances.
+
+### A blocked batch keeps orders unexecuted
+
+`pick_winners` takes a solution only when **every** pair it touches is unclaimed, so a
+single-order winner can block a whole multi-order batch. The orders in the rest of that
+batch then go unexecuted even when nobody else bid on them at all. Removing the blocker
+lets the batch win and fills all of them.
+
+This is not hypothetical. Auction 13488369:
+
+| uid | solver | score | orders |
+| --- | --- | --- | --- |
+| 0 | Sector | 1.1543e15 | `091fcb6a` |
+| 1 | Quasi | 1.1082e15 | `091fcb6a`, `4a9b4669` |
+| 3 | Helixbox | 1.0187e15 | `091fcb6a`, `4a9b4669` |
+
+Solution 0 wins on score and claims the pair, so **both** batches are blocked and order
+`4a9b4669` goes unfilled — even though two separate solvers offered to fill it, and the
+better of them scored only 4% less. Remove Sector and Quasi's batch wins, filling both
+orders.
+
+This is why a leave-one-out run finds orders that execute *only when a solver is removed* —
+14 of them over three days for Fractal — and those are a real coverage effect, not a defect.
+
 ### Reference scores do not re-filter
 
 `compute_reference_scores` re-runs only step 5, on the already-filtered set. It does not

@@ -46,12 +46,29 @@ Both are read-only references here. Do not modify them.
    arbitrator's tie-breaks. Reference scores depend on that ordering, which is *not* plain
    score order — see
    [docs/winner-selection.md](docs/winner-selection.md#ranked-order-is-load-bearing).
+8. `is_settled_in_time` is **not** "did this execute" — 16 winners in the M1 window landed
+   late, so their orders traded and users kept the surplus while the solver earned no
+   reward. The two flags genuinely differ (`tx_hash is not null` vs `is_settled_in_time`), so
+   pick deliberately. The counterfactual picks `is_settled_in_time` for *both* the surplus
+   and the reward side, so the two agree on which winners delivered
+   ([why](loo/extract.py), `Settlement.counts_as_executed`).
+9. The lag in gotcha 5 is specific to `int_backend_data__proposed_solution_data`. Every
+   other model on that path is level with staging — check the model, don't avoid `int_` as
+   a class ([table](docs/analytics-db.md#coverage-and-lag)).
+10. Solver names need **exact** matching: `Arc` is a substring of `Arctic` and both bid in
+    the M1 window, so any `ilike '%…%'` silently removes two competitors. One name can also
+    mean several addresses (key rotations) and all of them must go together
+    ([traps](docs/analytics-db.md#resolving-a-solver-name)).
 
 ## Environment
 
 - No `psql`; `psycopg2` is not in the system Python. Use `uv run --with psycopg2-binary`.
 - The DB user is `<db-user>` — read-only, and it should stay that way.
 - `.env` is gitignored and must stay out of commits.
+- **Bound every ad-hoc query.** Aggregates over a whole multi-day window without an
+  `auction_id` range run for many minutes or hang. Always add a range or a `LIMIT`, and
+  `set statement_timeout = '120s'` so a bad query fails instead of stalling. Note there is
+  no `timeout` binary on this machine.
 
 ## Committing
 
