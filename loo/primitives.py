@@ -48,6 +48,57 @@ USD_REFERENCE_TOKENS: dict[str, dict[str, int]] = {
         "dac17f958d2ee523a2206206994597c13d831ec7": 6,  # USDT
         "6b175474e89094c44da98b954eedeac495271d0f": 18,  # DAI
     },
+    # The non-mainnet entries below were verified over July 2026 (~200-auction
+    # samples): each token is priced in every sampled auction, the tokens of one
+    # network agree with each other to 0.1-0.7% on the implied USD/native rate, and
+    # that rate matches an independent anchor (mainnet USD/ETH x the two chains'
+    # COW accounting rates) to a few percent. Polygon's bridged USDC.e is
+    # deliberately absent: it disagreed with the other three by ~6%. The ink and
+    # plasma entries labelled "dollar token" have no name to cite, only that
+    # three-way agreement; the analytics DB carries no token metadata to name them.
+    "xdai": {
+        "2a22f9c3b484c3629090feed35f17ff8f88f76f0": 6,  # USDC.e
+        "4ecaba5870353805a9f068101a40e0f32ed605c6": 6,  # USDT
+    },
+    "base": {
+        "833589fcd6edb6e08f4c7c32d4f71b54bda02913": 6,  # USDC
+        "d9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": 6,  # USDbC
+        "50c5725949a6f0c72e6c4a641f24049a917db0cb": 18,  # DAI
+    },
+    "arbitrum-one": {
+        "af88d065e77c8cc2239327c5edb3a432268e5831": 6,  # USDC
+        "ff970a61a04b1ca14834a43f5de4533ebddb5cc8": 6,  # USDC.e
+        "fd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9": 6,  # USDT
+    },
+    "avalanche": {
+        "b97ef9ef8734c71904d8002f8b6bc66dd9c48a6e": 6,  # USDC
+        "9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7": 6,  # USDT
+        "d586e7f844cea2f87f50152665bcbc2c279d8d70": 18,  # DAI.e
+    },
+    "polygon": {
+        "3c499c542cef5e3811e1192ce70d8cc03d5c3359": 6,  # USDC
+        "c2132d05d31c914a87c6611c10748aeb04b58e8f": 6,  # USDT
+        "8f3cf7ad23cd3cadbd9735aff958023239c6a063": 18,  # DAI
+    },
+    "bnb": {
+        "55d398326f99059ff775485246999027b3197955": 18,  # USDT (18 decimals on BNB)
+        "8ac76a51cc950d9822d68b83fe1ad97b32cd580d": 18,  # USDC (18 decimals on BNB)
+        "e9e7cea3dedca5984780bafc599bd69add087d56": 18,  # BUSD
+    },
+    "linea": {
+        "176211869ca2b568f2a7d4ee941e073a821ee1ff": 6,  # USDC.e
+        "a219439258ca9da29e9cc4ce5596924745e12b93": 6,  # USDT
+    },
+    "ink": {
+        "2d270e6886d130d724215a266106e6832161eaed": 6,  # dollar token
+        "70a38b0c90441e991346b7a0cd98c8528dd1c234": 6,  # dollar token
+        "99cbf1ff4527675ed3301671105c9f7748fb8a04": 6,  # dollar token
+    },
+    "plasma": {
+        "b8ce59fc3717ada4c02eadf9682a9e934f625ebb": 6,  # USDT0
+        "5d3a1ff2b6bab83b63cd9ad0787074081a52ef34": 18,  # dollar token
+        "6695c0f8706c5ace3bdf8995073179cca47926dc": 18,  # dollar token
+    },
 }
 
 # `crates/configs/src/autopilot/run_loop.rs:11`

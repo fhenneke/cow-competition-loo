@@ -186,6 +186,20 @@ without one fail loudly and the USD columns are skipped (D15).
 
 Display only: nothing on the valuation or reward path consumes a USD number.
 
+All nine non-mainnet networks were curated in August 2026 from July-2026 samples
+(~200 auctions each), since the DB carries **no token metadata table** to look a
+symbol up in. The acceptance test, per network: every candidate is priced in every
+sampled auction, the candidates agree with each other on the implied USD/native rate
+to 0.1–0.7%, and that rate matches an independent anchor — mainnet's verified USD/ETH
+carried through the two chains' COW accounting rates (`usd_per_cow / native_per_cow`,
+same snapshot on both sides) — to a few percent. Two lessons from that pass:
+
+- **Bridged stables can genuinely diverge**: polygon's USDC.e priced ~6% below native
+  USDC/USDT/DAI all month and was rejected. Mutual agreement is the test, not the name.
+- **ink and plasma have no nameable majors**: their entries are dollar tokens verified
+  purely by the three-way agreement + anchor (plasma's `b8ce59fc…` is USDT0; the
+  others are unnamed). BNB-chain stables have **18 decimals**, not 6.
+
 ## Coverage and lag
 
 - `int_backend_data__proposed_solution_data` starts at auction `12709602` and **lags the
