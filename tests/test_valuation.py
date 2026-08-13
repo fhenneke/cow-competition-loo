@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
-from loo.primitives import NATIVE_TOKEN, ceil_div, order_owner, price_in_eth
+from loo.primitives import NATIVE_TOKEN, Pair, ceil_div, order_owner, price_in_eth
 from loo.valuation import (
     Order,
     SolutionValuation,
@@ -24,7 +26,7 @@ USDC = "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 DAI = "6b175474e89094c44da98b954eedeac495271d0f"
 
 
-def sell_order(executed_sell: int, executed_buy: int, **kwargs) -> Order:
+def sell_order(executed_sell: int, executed_buy: int, **kwargs: Any) -> Order:
     return Order(
         uid=kwargs.pop("uid", "a" * 112),
         sell_token=kwargs.pop("sell_token", WETH),
@@ -38,7 +40,7 @@ def sell_order(executed_sell: int, executed_buy: int, **kwargs) -> Order:
     )
 
 
-def buy_order(executed_sell: int, executed_buy: int, **kwargs) -> Order:
+def buy_order(executed_sell: int, executed_buy: int, **kwargs: Any) -> Order:
     return Order(
         uid=kwargs.pop("uid", "b" * 112),
         sell_token=kwargs.pop("sell_token", WETH),
@@ -212,7 +214,7 @@ class TestValueSolution:
 
 
 class TestSolutionTotal:
-    def make(self, pair_surplus: dict) -> SolutionValuation:
+    def make(self, pair_surplus: dict[Pair, int]) -> SolutionValuation:
         return SolutionValuation(
             pair_surplus=pair_surplus,
             order_surplus_native={},

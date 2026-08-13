@@ -1,4 +1,4 @@
-"""M2: re-run one auction with a solver removed, and diff the two outcomes.
+"""Re-run one auction with a solver removed, and diff the two outcomes.
 
 The counterfactual is a **full re-arbitration** — steps 3-6 of
 docs/winner-selection.md, not just the winner pick. Removing a solver can lower a
@@ -15,25 +15,15 @@ winner's orders are given, which is the one judgement call this module makes —
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Iterable, Literal, Mapping
+from typing import Literal
 
 from .extract import AuctionBundle, Bid, Settlement, SolutionCap
 from .primitives import MAX_WINNERS, Pair, price_in_eth
 from .rewards import SolverReward, Win, uncapped_rewards
 from .valuation import Mode, ValuedBid, build_solutions
-
-PRICE_IMBALANCE_THRESHOLD = 2
-"""A solution is price-suspect when its orders' executed amounts, valued through the
-auction's own native prices, disagree between the sell side and the buy side by more
-than this factor. A real trade exchanges roughly equal value, so a large imbalance
-means one token's native price is wrong — and a wrong price fabricates score, surplus
-and rewards out of nothing. Measured on the M1 window: healthy winners sit within 1.04x,
-while the window's five largest "whales" are 14,000x apart, because one obscure token's
-price is persistently ~15,300x too high — see
-docs/analytics-db.md#native-prices-can-be-plain-wrong. The threshold is deliberately
-loose; it separates 1.04 from 14,000, not signal from noise."""
 from .winner_selection import (
     Ranking,
     Solution,
@@ -41,6 +31,17 @@ from .winner_selection import (
     compute_reference_outcomes,
     compute_reference_scores,
 )
+
+PRICE_IMBALANCE_THRESHOLD = 2
+"""A solution is price-suspect when its orders' executed amounts, valued through the
+auction's own native prices, disagree between the sell side and the buy side by more
+than this factor. A real trade exchanges roughly equal value, so a large imbalance
+means one token's native price is wrong — and a wrong price fabricates score, surplus
+and rewards out of nothing. Measured on the 2026-08-01..04 validation window: healthy
+winners sit within 1.04x, while the window's five largest "whales" are 14,000x apart,
+because one obscure token's price is persistently ~15,300x too high — see
+docs/analytics-db.md#native-prices-can-be-plain-wrong. The threshold is deliberately
+loose; it separates 1.04 from 14,000, not signal from noise."""
 
 OutcomeRule = Literal["inherited", "assume-settled"]
 
@@ -67,18 +68,18 @@ the same outcome in both, so it cancels exactly and only genuinely changed order
 
 They differ only in what a *replacement* — a winner that never won for real, so nothing
 was ever recorded about it — is taken to do. That is not a detail: 1,533 of the 10,301
-winners in the M1 window never settled, so the assumption is load-bearing.
+winners in the 2026-08-01..04 validation window never settled, so the assumption is load-bearing.
 
 - `inherited` reads settlement off the auction's token pairs. Whatever really happened to
   the pairs a replacement claims, happens to the replacement. Settlement therefore cancels
   out of `delta_surplus` entirely and the result measures the competition's *decision*,
-  which is the question M2 asks.
+  which is the question the surplus delta asks.
 - `assume-settled` is the everything-lands-in-time scenario: every winner on both sides
   settles, so the comparison is about proposals alone.
 
 A third rule, `observed` — a replacement assumed to settle while recorded winners keep
-their real outcomes — existed through M3 as a "lower bound" and was **removed in the M4
-review**: settlement attached to the solution is not a counterfactual anyone would defend
+their real outcomes — was carried for a while as a "lower bound" and was **removed in
+review** (D4): settlement attached to the solution is not a counterfactual anyone would defend
 (it charges the baseline for real reverts while crediting the counterfactual with never
 reverting), and a number nobody should quote is not made useful by calling it a bound.
 Measured before removal it moved the answer by 2–4× the headline, which is the measure of
@@ -311,11 +312,11 @@ class SideOutcomes:
     """Replacements taken as reverting because the batch that held their pairs reverted.
     Empty under any rule but `inherited`."""
     orphans: frozenset[int]
-    """Replacements whose settlement had to be assumed rather than derived — PLAN.md
-    section 5's "record how often the mapping fails". Under `inherited` these are the
+    """Replacements whose settlement had to be assumed rather than derived — the slot
+    rule's mapping-failure rate (D4). Under `inherited` these are the
     replacements claiming a pair no recorded winner held, so there was nothing to
     inherit. Empty under `assume-settled`, which does not consult the record at all."""
-    solution_executed: dict[int, bool] = field(default_factory=dict)
+    solution_executed: dict[int, bool] = field(default_factory=dict[int, bool])
     """The per-winner settlement decision the orders above were given, by solution uid.
     This is what the reward formula's `observed_score` consumes — keeping it here rather
     than re-deriving it guarantees the surplus and reward sides of one auction can never
@@ -344,7 +345,7 @@ def side_outcomes(
 
     `pick_winners` gives winners disjoint token pairs and an order fixes its own pair, so
     no two winners can trade the same order. Asserted rather than assumed, and confirmed
-    over the M1 window: no auction has an order in two winners' executions, and no solution
+    over the 2026-08-01..04 validation window: no auction has an order in two winners' executions, and no solution
     trades the same order twice.
     """
     outcomes: dict[str, OrderOutcome] = {}
@@ -421,7 +422,7 @@ def side_outcomes(
 
 @dataclass(frozen=True)
 class OrderDiff:
-    """One order, both sides. The field names are PLAN.md section 5's."""
+    """One order, both sides."""
 
     order_uid: str
     contributes: bool
@@ -482,7 +483,7 @@ def diff_outcomes(
     base: Mapping[str, OrderOutcome], loo: Mapping[str, OrderOutcome]
 ) -> tuple[OrderDiff, ...]:
     """Per-order diff over the union of orders traded by either side's winners."""
-    diffs = []
+    diffs: list[OrderDiff] = []
     for order_uid in sorted(set(base) | set(loo)):
         left = base.get(order_uid, UNEXECUTED)
         right = loo.get(order_uid, UNEXECUTED)
@@ -519,19 +520,20 @@ class AuctionCounterfactual:
     solver_won_db: bool = False
     """Whether the removed solver won by our own arbitration and by the DB's record.
     The first is what the counterfactual is measured against; the second is the fact
-    about reality that PLAN.md section 7 reports."""
+    about reality the comparison table reports."""
     baseline_winner_uids: frozenset[int] = frozenset()
     loo_winner_uids: frozenset[int] = frozenset()
     baseline_winning_total: int = 0
     loo_winning_total: int = 0
-    """Sum of the winners' totals — recorded score in score mode. M3 starts here."""
-    baseline_reference_scores: dict[str, int] = field(default_factory=dict)
-    loo_reference_scores: dict[str, int] = field(default_factory=dict)
+    """Sum of the winners' totals — recorded score in score mode. The reward formula
+    starts here."""
+    baseline_reference_scores: dict[str, int] = field(default_factory=dict[str, int])
+    loo_reference_scores: dict[str, int] = field(default_factory=dict[str, int])
     solver_set_reference_for: frozenset[str] = frozenset()
     """Solvers whose baseline reference score the removed solver contributed to."""
-    baseline_rewards: dict[str, SolverReward] = field(default_factory=dict)
-    loo_rewards: dict[str, SolverReward] = field(default_factory=dict)
-    """Rewards per winning solver on each side (M3): uncapped always, capped when the
+    baseline_rewards: dict[str, SolverReward] = field(default_factory=dict[str, SolverReward])
+    loo_rewards: dict[str, SolverReward] = field(default_factory=dict[str, SolverReward])
+    """Rewards per winning solver on each side: uncapped always, capped when the
     recorded caps were supplied. Score mode only — in surplus mode the totals are not
     scores, so the formula's quantities do not exist and both dicts stay empty. The
     settlement decision inside `observed_score` is the same one the order outcomes
@@ -563,13 +565,13 @@ class AuctionCounterfactual:
     held their token pairs reverted."""
     orphans_base: frozenset[int] = frozenset()
     orphans_loo: frozenset[int] = frozenset()
-    """Replacements whose settlement had to be assumed rather than derived — PLAN.md
-    section 5's mapping failures."""
+    """Replacements whose settlement had to be assumed rather than derived — the slot
+    rule's mapping failures."""
     valuation_failures: tuple[tuple[int, str], ...] = ()
     baseline_matches_db: bool = True
     """Does our baseline winner set equal `is_winner`? Where it does not, the two sides
     are still comparable to each other, but the baseline is not the recorded auction —
-    M1 measured this at 5 auctions in 7,745."""
+    Validation measured this at 5 auctions in 7,745."""
 
     @property
     def winner_set_changed(self) -> bool:
@@ -587,7 +589,7 @@ class AuctionCounterfactual:
         solver's *non-winning* solutions can be a winner of the without-`s` pick inside
         `compute_reference_scores`, so `s`'s reference score falls when the solver goes even
         though nobody's win moves. Reference scores are the denominator of the uncapped
-        reward, so M3 needs these auctions kept.
+        reward, so the reward side needs these auctions kept.
         """
         return self.baseline_reference_scores != self.loo_reference_scores
 
@@ -636,10 +638,12 @@ class AuctionCounterfactual:
 
     @staticmethod
     def _capped_total(rewards: dict[str, SolverReward]) -> Decimal | None:
-        totals = [r.capped_reward for r in rewards.values()]
-        if any(total is None for total in totals):
-            return None
-        return sum(totals, Decimal(0))
+        total = Decimal(0)
+        for reward in rewards.values():
+            if reward.capped_reward is None:
+                return None
+            total += reward.capped_reward
+        return total
 
     @property
     def rewards_base_capped(self) -> Decimal | None:
@@ -691,7 +695,7 @@ def analyse_auction(
 
     if failures or not present:
         # A valuation failure means we cannot arbitrate this auction faithfully at all.
-        # M1 measured zero over three days, so it is reported rather than tolerated.
+        # Validation measured zero over three days, so it is reported rather than tolerated.
         return AuctionCounterfactual(
             auction_id=bundle.auction_id,
             n_solutions=len(bundle.bids),
@@ -751,7 +755,7 @@ def analyse_auction(
         # The caps come from the record regardless of the outcome rule: own cap for a
         # recorded winner, the displaced slot's for a replacement. Auction-level cap
         # facts (lower cap, exclusion) ride on every recorded winner's row.
-        caps = solution_caps if solution_caps else {}
+        caps: Mapping[int, SolutionCap] = solution_caps if solution_caps else {}
         any_cap = next(iter(caps.values()), None)
         lower_cap = any_cap.lower if any_cap else None
         excluded = any_cap.excluded if any_cap else False
@@ -837,8 +841,8 @@ class Analysis:
     """Window aggregate.
 
     `auctions` counts every auction in the window, including the ones the removed solver
-    never bid in — PLAN.md section 5 keeps those in the denominator so the rates describe
-    the window rather than the solver's own subset.
+    never bid in — those stay in the denominator (D10) so the rates describe the window
+    rather than the solver's own subset.
     """
 
     solver: str = ""
@@ -883,7 +887,7 @@ class Analysis:
     """(count, native sum) of negative uncapped rewards on each side. The real payout
     clamps these at `lower_reward_cap` (-0.01 ETH on mainnet), and the uncapped penalty
     for a failed settlement is `-reference_score` — orders of magnitude larger. Reported
-    so the cost of stopping at uncapped rewards (PLAN §6 step 4) stays visible."""
+    so the cost of stopping at uncapped rewards stays visible."""
 
     capped_estimate: bool = False
     """Did the caller supply recorded caps? Set by the CLI in score mode. The capped
@@ -903,13 +907,13 @@ class Analysis:
     `PRICE_IMBALANCE_THRESHOLD` have a wrong native price fabricating every
     native-denominated number they touch, so by default they are **excluded from every
     statistic** — they stay in `auctions` and are named in `price_suspect_auctions`,
-    and contribute nothing else. Measured on the M1 window the exclusion is 44 of
+    and contribute nothing else. Measured on the 2026-08-01..04 validation window it is 44 of
     7,745 auctions (0.6%), but those 44 carried 82% of Sector's Δsurplus and 97% of
     its uncapped Δrewards, all fabricated. Switching this off (`--include-price-suspects`)
     keeps them in every number instead; the flagged ids are reported either way."""
-    price_suspect_auctions: list[int] = field(default_factory=list)
+    price_suspect_auctions: list[int] = field(default_factory=list[int])
 
-    missing_data_auctions: list[int] = field(default_factory=list)
+    missing_data_auctions: list[int] = field(default_factory=list[int])
     """Auctions excluded before arbitration because a traded order is in neither order
     table (D17) — `jit_orders` only records the JIT orders of *settled* batches, so an
     unsettled solution's JIT legs are unrecoverable and even their pair claims are
@@ -944,15 +948,17 @@ class Analysis:
     orphans_base: int = 0
     orphans_loo: int = 0
     """Replacements whose settlement had to be assumed rather than derived, because no
-    recorded winner held any of their pairs — PLAN.md section 5's mapping-failure rate. It
+    recorded winner held any of their pairs — the slot rule's mapping-failure rate. It
     is the honest measure of how far the `inherited` rule falls back on assumption."""
 
     reference_influence: int = 0
     """(auction, solver) pairs where the removed solver helped set another solver's
-    baseline reference score — i.e. where its absence moves a reward in M3."""
+    baseline reference score — i.e. where its absence moves a reward."""
 
-    valuation_failures: list[tuple[int, int, str]] = field(default_factory=list)
-    changed: list[AuctionCounterfactual] = field(default_factory=list)
+    valuation_failures: list[tuple[int, int, str]] = field(
+        default_factory=list[tuple[int, int, str]]
+    )
+    changed: list[AuctionCounterfactual] = field(default_factory=list[AuctionCounterfactual])
     """Auctions where the winner set changed or the filter relaxed. Auctions where
     nothing moved carry no information beyond their counters, so they are not kept."""
 

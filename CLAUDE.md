@@ -69,6 +69,9 @@ Both are read-only references here. Do not modify them.
 
 ## Environment
 
+- Lint and typecheck before committing: `uv run ruff check .` and `uv run pyright`.
+  Pyright runs in strict mode (configured in `pyproject.toml`, which VS Code's Pylance
+  also picks up); dev tooling installs with `uv sync --extra dev`.
 - No `psql`; `psycopg2` is not in the system Python. Use `uv run --with psycopg2-binary`.
 - The DB user is `<db-user>` — read-only, and it should stay that way.
 - `.env` is gitignored and must stay out of commits.

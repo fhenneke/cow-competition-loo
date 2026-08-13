@@ -9,8 +9,9 @@ The DB user is read-only and should stay that way; nothing here writes.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator, Sequence
 from decimal import Decimal
-from typing import Any, Sequence
+from typing import Any, TypeVar
 
 import pandas as pd
 import psycopg2
@@ -18,6 +19,13 @@ import psycopg2.extras
 from dotenv import load_dotenv
 
 SCHEMA = "dbt"
+
+Connection = psycopg2.extensions.connection
+"""The concrete psycopg2 connection type, aliased so callers can annotate against it."""
+
+Row = dict[str, Any]
+"""One result row as `fetch` returns it. Values are `Any`: column types are the query's
+business, and every amount is normalised through `as_int` at the point of use."""
 
 # One database per network, all with models in schema `dbt`.
 NETWORK_DATABASES = {
@@ -44,7 +52,7 @@ def database_name(network: str) -> str:
         raise KeyError(f"unknown network {network!r}; known networks: {known}") from None
 
 
-def connect(network: str = "mainnet", *, connect_timeout: int = 20):
+def connect(network: str = "mainnet", *, connect_timeout: int = 20) -> Connection:
     """Open a read-only connection to one network's analytics database."""
     load_dotenv()
     url = os.environ.get("ANALYTICS_DB_URL")
@@ -67,7 +75,7 @@ def connect(network: str = "mainnet", *, connect_timeout: int = 20):
     return conn
 
 
-def fetch(conn, sql: str, params: Any = None) -> list[dict]:
+def fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
     """Run a query and return rows as dicts. Preferred over `run` on the extraction
     path, where amounts must stay exact Python ints rather than become numpy dtypes."""
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -75,11 +83,13 @@ def fetch(conn, sql: str, params: Any = None) -> list[dict]:
         return [dict(row) for row in cur.fetchall()]
 
 
-def run(conn, sql: str, params: Any = None) -> pd.DataFrame:
+def run(conn: Connection, sql: str, params: Any = None) -> pd.DataFrame:
     """Run a query and return a DataFrame. For ad-hoc work and notebooks."""
     with conn.cursor() as cur:
         cur.execute(sql, params)
-        columns = [d[0] for d in cur.description]
+        if cur.description is None:
+            raise ValueError("query produced no result set")
+        columns = [d.name for d in cur.description]
         return pd.DataFrame(cur.fetchall(), columns=columns)
 
 
@@ -98,7 +108,10 @@ def as_int(value: Any) -> int:
     raise TypeError(f"cannot convert {type(value).__name__} to int: {value!r}")
 
 
-def chunked(items: Sequence, size: int):
+T = TypeVar("T")
+
+
+def chunked(items: Sequence[T], size: int) -> Iterator[Sequence[T]]:
     """Split a sequence into chunks, to keep `= any(%s)` parameter lists sane."""
     for start in range(0, len(items), size):
         yield items[start : start + size]

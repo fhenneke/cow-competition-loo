@@ -1,4 +1,4 @@
-"""M4: aggregate `analyse` reports into a per-solver comparison.
+"""Aggregate `analyse` reports into a per-solver comparison.
 
 Consumes the JSON written by `loo analyse --out` rather than re-running the pipeline:
 a full-window run takes ~5 minutes, and the report already carries every changed
@@ -13,7 +13,7 @@ Three shapes of statement come out of one report, and the table keeps them apart
 - **The outcome rule is part of the number.** The headline is `inherited` — settlement
   attaches to the slot, the one scenario grounded in the record; `assume-settled`
   (everything lands in time) is the alternative reading. A figure quoted without its
-  rule would be a choice disguised as a result (PLAN §7).
+  rule would be a choice disguised as a result.
 - **Two reward figures, never one.** Uncapped is the mechanism's exact accounting,
   three orders of magnitude away from payouts; capped is the payout answer but an
   estimate. The net-change row is always labelled with which one it nets against.
@@ -26,10 +26,10 @@ implied per auction by the median stablecoin price in the auction's own price ve
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, getcontext
 from statistics import median
-from typing import Mapping, Sequence
 
 # Capped rewards arrive as ~40-digit Decimal strings and are summed over thousands of
 # auctions; Python's default 28-digit context silently rounds those sums, which the
@@ -42,6 +42,13 @@ WEI = Decimal(10) ** 18
 
 HEADLINE_RULE = "inherited"
 ALTERNATIVE_RULES = ("assume-settled",)
+
+REPORT_FORMAT = 2
+"""Version marker of the `analyse --out` payload, required by `load_report`. Bumped
+when the shape changes, so a stale file fails with "re-run analyse" instead of a
+KeyError deep inside a comparison. Format 2 derives its keys from the `Analysis` and
+`AuctionCounterfactual` field names; format 1 (unmarked) was the hand-written
+`*_wei`-suffixed shape."""
 
 SIGN_CONVENTION_ID = "counterfactual-minus-actual"
 """Written into every `analyse --out` JSON and required by `load_report`, so a report
@@ -66,7 +73,8 @@ CAVEATS = (
     "reading. 14.9% of winners never settled and they carry 50.2% of winning score, "
     "so the rule is first-order, not a footnote.",
     "Filter proxy: the fairness filter is fed per-pair surplus, measured against the "
-    "recorded filter at 7 differences in 7,745 auctions (M1, PLAN §4.1).",
+    "recorded filter at 7 differences in 7,745 auctions "
+    "(docs/winner-selection.md#the-filter-runs-on-surplus).",
     "Quote rewards are excluded: no data on counterfactual quoting.",
     "Two reward figures: uncapped is exact accounting but not a payout; capped is the "
     "payout answer but an estimate (a replacement inherits the displaced slot's cap). "
@@ -80,8 +88,8 @@ CAVEATS = (
     "USD figures are display-only conversions at each auction's own stablecoin-implied "
     "rate; they inherit every caveat of the ETH figure they restate.",
 )
-"""PLAN §7's caveats, in the order given there, plus the USD one M4 adds. Rendered
-with every comparison — the numbers are not supposed to travel without them."""
+"""Rendered with every comparison — the numbers are not supposed to travel without
+them. The rationale behind each lives in PLAN.md's decision table and docs/."""
 
 
 @dataclass(frozen=True)
@@ -96,7 +104,7 @@ class AuctionMove:
 
 @dataclass(frozen=True)
 class Report:
-    """One `analyse --out` JSON, with the wei strings turned back into numbers.
+    """One `analyse --out` JSON, reduced to what the comparison consumes.
 
     Every delta is counterfactual minus actual (`SIGN_CONVENTION_ID`, checked at load):
     negative Δsurplus means users would have received less without the solver, positive
@@ -156,6 +164,12 @@ def load_report(path: str) -> Report:
     with open(path) as handle:
         payload = json.load(handle)
 
+    if payload.get("format") != REPORT_FORMAT:
+        raise ValueError(
+            f"{path}: report format is {payload.get('format')!r}, expected "
+            f"{REPORT_FORMAT} — the file predates the current report shape; "
+            f"re-run analyse"
+        )
     convention = payload.get("sign_convention")
     if convention != SIGN_CONVENTION_ID:
         # Tabulating an old report would present every number with its sign silently
@@ -163,25 +177,25 @@ def load_report(path: str) -> Report:
         # of it flip together.
         raise ValueError(
             f"{path}: sign convention is {convention!r}, expected "
-            f"{SIGN_CONVENTION_ID!r} — the report predates the counterfactual-minus-"
-            f"actual convention (or the observed-rule removal); re-run analyse"
+            f"{SIGN_CONVENTION_ID!r} — re-run analyse"
         )
 
-    uncapped = bool(payload["rewards_uncapped"])
+    uncapped = payload["mode"] == "score"
     capped = bool(payload["capped_estimate"])
     moves = tuple(
         AuctionMove(
             auction_id=row["auction_id"],
-            delta_surplus=int(row["delta_surplus_wei"]),
-            delta_rewards=int(row["delta_rewards_wei"]),
+            delta_surplus=row["delta_surplus"],
+            delta_rewards=row["delta_rewards"],
             delta_rewards_capped=(
-                Decimal(row["delta_rewards_capped_wei"])
-                if row["delta_rewards_capped_wei"] is not None
+                Decimal(row["delta_rewards_capped"])
+                if row["delta_rewards_capped"] is not None
                 else None
             ),
         )
         for row in payload["changed"]
     )
+    cow = payload["cow"]
 
     report = Report(
         path=path,
@@ -190,41 +204,40 @@ def load_report(path: str) -> Report:
         start=payload["start"],
         end=payload["end"],
         mode=payload["mode"],
-        outcome_rule=payload["settlement"],
-        price_suspects_excluded=bool(payload["price_suspects_excluded"]),
+        outcome_rule=payload["outcome_rule"],
+        price_suspects_excluded=bool(payload["exclude_price_suspect"]),
         price_suspects=len(payload["price_suspect_auctions"]),
-        # `.get`: reports from before D17 carry no such key and excluded nothing.
-        missing_data=len(payload.get("missing_data_auctions", [])),
+        missing_data=len(payload["missing_data_auctions"]),
         auctions=payload["auctions"],
         auctions_with_solver=payload["auctions_with_solver"],
         auctions_solver_won=payload["auctions_solver_won_baseline"],
         auctions_winner_set_changed=payload["auctions_winner_set_changed"],
         auctions_filter_relaxed=payload["auctions_filter_relaxed"],
         auctions_newly_kept_won=payload["auctions_newly_kept_won"],
-        delta_surplus=int(payload["delta_surplus_wei"]),
-        delta_rewards=int(payload["delta_rewards_wei"]) if uncapped else None,
+        delta_surplus=payload["delta_surplus"],
+        delta_rewards=payload["delta_rewards"] if uncapped else None,
         delta_rewards_capped=(
-            Decimal(payload["delta_rewards_capped_wei"]) if capped else None
+            Decimal(payload["delta_rewards_capped"]) if capped else None
         ),
         auctions_capped_skipped=payload["auctions_capped_skipped"],
         delta_rewards_cow=(
-            Decimal(payload["delta_rewards_cow_wei"])
-            if uncapped and payload["delta_rewards_cow_wei"] is not None
-            else None
+            Decimal(cow["cow_wei"]) if uncapped and cow is not None else None
         ),
         delta_rewards_capped_cow=(
-            Decimal(payload["delta_rewards_capped_cow_wei"])
-            if capped and payload["delta_rewards_capped_cow_wei"] is not None
-            else None
+            Decimal(cow["cow_wei_capped"]) if capped and cow is not None else None
         ),
-        cow_auctions_without_rate=payload["cow_auctions_without_rate"] or 0,
+        cow_auctions_without_rate=(
+            cow["auctions_without_rate"] if cow is not None else 0
+        ),
         orders_compared=payload["orders_compared"],
         orders_only_with_solver=payload["orders_only_with_solver"],
         orders_only_without_solver=payload["orders_only_without_solver"],
         moves=moves,
     )
 
-    checks = [("delta_surplus", report.delta_surplus, sum(m.delta_surplus for m in moves))]
+    checks: list[tuple[str, int | Decimal, int | Decimal]] = [
+        ("delta_surplus", report.delta_surplus, sum(m.delta_surplus for m in moves))
+    ]
     if report.delta_rewards is not None:
         checks.append(
             ("delta_rewards", report.delta_rewards, sum(m.delta_rewards for m in moves))
@@ -258,7 +271,7 @@ def load_report(path: str) -> Report:
 class Distribution:
     """How one delta is spread over a report's changed auctions.
 
-    PLAN §7 requires medians alongside sums because the sums are whale-dominated;
+    Medians ride beside every sum because the sums are whale-dominated;
     `largest_share` is the whale check itself."""
 
     total: Decimal
@@ -281,7 +294,7 @@ class Distribution:
 
 def distribution(deltas: Mapping[int, int | Decimal]) -> Distribution:
     """Distribution of `{auction_id: delta}`; zero deltas carry no information and are
-    excluded, so the median is PLAN §5.1's "median non-zero auction"."""
+    excluded, so the median is the table's "median non-zero auction"."""
     nonzero = {a: Decimal(d) for a, d in deltas.items() if d}
     total = sum(nonzero.values(), Decimal(0))
     largest_id = max(nonzero, key=lambda a: abs(nonzero[a]), default=None)
@@ -346,9 +359,9 @@ def group_reports(reports: Sequence[Report]) -> list[SolverWindow]:
     """Group reports by (solver, window); each group must contain the headline rule.
 
     Refusing to tabulate a group without `inherited` is deliberate: the alternative is
-    a headline number whose rule is whatever happened to be on disk (PLAN §7).
+    a headline number whose rule is whatever happened to be on disk.
     `assume-settled` is optional; its row reads "not run" when absent."""
-    grouped: dict[tuple, dict[str, Report]] = {}
+    grouped: dict[tuple[str, str, str, str, str], dict[str, Report]] = {}
     for report in reports:
         key = (report.solver, *report.window)
         rules = grouped.setdefault(key, {})
@@ -360,7 +373,7 @@ def group_reports(reports: Sequence[Report]) -> list[SolverWindow]:
             )
         rules[report.outcome_rule] = report
 
-    windows = []
+    windows: list[SolverWindow] = []
     for (solver, network, start, end, mode), by_rule in grouped.items():
         if HEADLINE_RULE not in by_rule:
             have = ", ".join(sorted(by_rule))
@@ -441,8 +454,8 @@ def comparison(
     windows: Sequence[SolverWindow],
     usd_by_network: Mapping[str, UsdContext] | None = None,
 ) -> Table:
-    """The PLAN §7 headline table: one column per solver-window, `inherited` leading,
-    the other rules as bounds, medians and whale shares beside every sum."""
+    """The headline table: one column per solver-window, `inherited` leading, the
+    other rules as bounds, medians and whale shares beside every sum."""
     usd_by_network = usd_by_network or {}
     windows_differ = len({w.headline.window for w in windows}) > 1
     columns = tuple(_column_title(w, windows_differ) for w in windows)
@@ -474,7 +487,7 @@ def comparison(
         report = window.headline
         usd = usd_by_network.get(report.network)
 
-        exclusions = []
+        exclusions: list[str] = []
         if report.price_suspects and report.price_suspects_excluded:
             exclusions.append(f"{report.price_suspects} price-suspect")
         if report.missing_data:
@@ -553,15 +566,18 @@ def _rewards_cell(report: Report, usd: UsdContext | None, *, capped: bool) -> st
     if delta is None:
         return "not computed" + ("" if capped else " (surplus mode)")
     cow = report.delta_rewards_capped_cow if capped else report.delta_rewards_cow
-    parts = []
+    parts: list[str] = []
     if cow is not None and not report.cow_auctions_without_rate:
         parts.append(f"{cow_amount(cow)} COW")
     if usd:
-        deltas = {
-            m.auction_id: (m.delta_rewards_capped if capped else m.delta_rewards)
-            for m in report.moves
-            if not capped or m.delta_rewards_capped is not None
-        }
+        if capped:
+            deltas: dict[int, int | Decimal] = {
+                m.auction_id: m.delta_rewards_capped
+                for m in report.moves
+                if m.delta_rewards_capped is not None
+            }
+        else:
+            deltas = {m.auction_id: m.delta_rewards for m in report.moves}
         parts.append(usd_amount(usd_total(deltas, usd)))
     detail = f" ({', '.join(parts)})" if parts else ""
     return f"{signed_eth(delta)} ETH{detail}"
@@ -588,7 +604,7 @@ def _net_cell(report: Report, usd: UsdContext | None) -> str:
 
 
 def _report_warnings(window: SolverWindow, usd: UsdContext | None) -> list[str]:
-    warnings = []
+    warnings: list[str] = []
     for report in window.by_rule.values():
         label = f"{report.solver} ({report.outcome_rule})"
         if not report.price_suspects_excluded and report.price_suspects:
@@ -626,13 +642,13 @@ def render_text(table: Table) -> str:
     lines = [
         "".rjust(label_width)
         + "  "
-        + "  ".join(c.ljust(w) for c, w in zip(table.columns, widths))
+        + "  ".join(c.ljust(w) for c, w in zip(table.columns, widths, strict=True))
     ]
     for label, cells in table.rows:
         lines.append(
             label.ljust(label_width)
             + "  "
-            + "  ".join(cell.ljust(w) for cell, w in zip(cells, widths))
+            + "  ".join(cell.ljust(w) for cell, w in zip(cells, widths, strict=True))
         )
     lines.append(f"\nsigns: {SIGN_CONVENTION}")
     for warning in table.warnings:

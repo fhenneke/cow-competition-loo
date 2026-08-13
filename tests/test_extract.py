@@ -4,14 +4,20 @@ The DB is faked by monkeypatching `extract.fetch` with canned rows keyed on the 
 own SQL constants, so the tests exercise exactly the code path the CLI uses.
 """
 
+from typing import Any, cast
+
 import pytest
 
 from loo import extract
+from loo.db import Connection, Row
 
 GOOD, BAD = 101, 102
 
+CONN = cast(Connection, None)
+"""`load_auctions` never touches the connection once `fetch` is faked."""
 
-def execution(auction_id: int, missing: bool = False) -> dict:
+
+def execution(auction_id: int, missing: bool = False) -> Row:
     """One execution row; `missing=True` mimics an order in neither order table, where
     every column served by the orders join comes back NULL."""
     return {
@@ -31,8 +37,8 @@ def execution(auction_id: int, missing: bool = False) -> dict:
 
 
 @pytest.fixture
-def canned_db(monkeypatch):
-    data = {
+def canned_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    data: dict[str, list[Row]] = {
         extract.AUCTIONS_SQL: [
             {"auction_id": a, "block_deadline": 1, "jit_owners": []} for a in (GOOD, BAD)
         ],
@@ -52,7 +58,7 @@ def canned_db(monkeypatch):
         extract.REFERENCE_SCORES_SQL: [],
     }
 
-    def fake_fetch(conn, sql, params=None):
+    def fake_fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
         ids = set(params["ids"])
         return [row for row in data[sql] if row["auction_id"] in ids]
 
@@ -60,14 +66,14 @@ def canned_db(monkeypatch):
 
 
 class TestMissingOrderPolicy:
-    def test_raises_by_default(self, canned_db):
+    def test_raises_by_default(self, canned_db: None):
         with pytest.raises(extract.MissingOrderError):
-            list(extract.load_auctions(None, [GOOD, BAD]))
+            list(extract.load_auctions(CONN, [GOOD, BAD]))
 
-    def test_collector_skips_the_auction_and_records_it(self, canned_db):
+    def test_collector_skips_the_auction_and_records_it(self, canned_db: None):
         missing: list[int] = []
 
-        bundles = list(extract.load_auctions(None, [GOOD, BAD], missing_data=missing))
+        bundles = list(extract.load_auctions(CONN, [GOOD, BAD], missing_data=missing))
 
         assert [b.auction_id for b in bundles] == [GOOD]
         assert missing == [BAD]

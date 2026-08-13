@@ -42,11 +42,13 @@ stays in the sections and docs each row links to; the milestone sections cite th
 | D10 | Auctions the solver never bid in are **skipped but stay in the denominator**, so rates describe the window rather than the solver's own subset | rates over the solver's auctions only | `analyse_auction` early return, `Analysis.add` | — |
 | D11 | Rewards are reported twice: **uncapped exactly**, and **capped as an estimate** in which a replacement inherits the displaced slot's recorded `upper_reward_cap` — realised fees follow the orders, and a reverted slot's cap is 0 exactly where its settlement is a revert ([§6.1](#61-m3-result)) | uncapped only — measured unusable as a payout answer (−410 ETH uncapped vs 0.75 ETH paid over the window); full fee-policy backfill — unnecessary while cap orphans are 0 | `rewards.uncapped_rewards` caps path, `counterfactual.winner_caps` | backfill fee policies per docs/rewards.md for orphans |
 | D12 | The reward side consumes the **same per-solution settlement decision** as the surplus side, under whatever outcome rule is in force, so the two views of one auction cannot disagree about which winners delivered (D5 extended to M3) | reading `is_settled_in_time` again independently | `SideOutcomes.solution_executed` feeding `Win.settled` | — |
-| D13 | Δrewards converts native → COW **per auction**, at the accounting-period rate of its `block_deadline`; an unsnapshotted rate leaves the auction unconverted and reported, never guessed | one window-level rate — wrong whenever a window straddles a Tuesday period boundary | `cli.convert_delta_rewards` | — |
+| D13 | Δrewards converts native → COW **per auction**, at the accounting-period rate of its `block_deadline`; an unsnapshotted rate leaves the auction unconverted and reported, never guessed | one window-level rate — wrong whenever a window straddles a Tuesday period boundary | `run.convert_delta_rewards` | — |
 | D14 | Every solution's executed amounts are valued through **both** tokens' native prices; an auction with a >2× disagreement is **excluded from every statistic** and named in the report — a wrong price fabricates every number it touches, so quoting it at all misleads ([§6.1](#61-m3-result)) | trusting `auction_prices` — one token was ~15,300× off for a whole window, fabricating the M2 "whale"; cross-auction median checks — fail exactly there, the wrong price is the persistent one; with-and-without reporting — built first, dropped as noise once the with-suspects numbers proved purely artefactual ([details](docs/analytics-db.md#native-prices-can-be-plain-wrong)) | `counterfactual.price_imbalanced`, `Analysis.exclude_price_suspect` | `--include-price-suspects`, `PRICE_IMBALANCE_THRESHOLD` |
 | D15 | USD figures are **display-only conversions**, per auction, at the rate implied by the auction's own stablecoin prices (median of USDC/USDT/DAI in `auction_prices`, window-median fallback); networks without curated reference tokens skip USD rather than guess ([source](docs/analytics-db.md#no-usd-prices--stablecoin-native-prices-imply-the-rate)) | an external price feed — a new dependency and a second trust domain for a cosmetic number; a single window rate — the per-auction rate costs nothing more (D13's logic) | `primitives.USD_REFERENCE_TOKENS`, `extract.load_usd_rates`, `aggregate.usd_total` | extend `USD_REFERENCE_TOKENS` after verifying addresses |
 | D16 | Every delta is **counterfactual − actual** (without-solver minus with-solver), so numbers read as what the removal scenario changes and turning them into a "value of the solver" is left to the reader; the convention is printed on every rendering and stamped into report JSONs, which `compare` refuses without the marker (M4 review) | with − without, M2–M3's convention (a solver's value carries a plus sign by construction) — §5.1 and §6.1 keep their historical signs; flip them to compare with §7.1 | `counterfactual` delta properties, `aggregate.SIGN_CONVENTION_ID`, `load_report` | not worth revising again — a second flip would strand two conventions in the wild |
 | D17 | Auctions with a traded order in **neither order table** are excluded transparently and named — `jit_orders` records only settled batches, so an unsettled solution's JIT legs are unrecoverable and even its `pick_winners` pair claims are unknown ([data](docs/analytics-db.md#jit-orders-are-recorded-only-when-the-batch-settles)); ~0.8% of a month window, zero in the M1 window by luck | zero-surplus tolerance — wrong for the 59% of missing orders that are surplus-capturing while CoW AMMs were live, and the missing pair claim measurably moves the pick ([8 real victims/month](docs/winner-selection.md#a-jit-leg-can-block-another-solutions-execution--and-the-filter-never-sees-it)); per-auction tolerate-and-validate — more coverage than 0.8% warrants in machinery | `extract.load_auctions` `missing_data`, `Analysis.missing_data_auctions` | for windows past the CoW-AMM deprecation (~late July 2026) zero-surplus is exact for score and filter; the missing pair claim and its blocking bias remain |
+| D18 | The pipeline is a **library call** — `run.analyse_window(conn, solvers, start, end, …)` — and the CLI a rendering around it; several solvers share **one extraction pass**, since extraction is nearly all the cost (~5 min/3-day window) and the arbitration is milliseconds per auction ([§8](#8-m6--library-api-multi-solver-runs-derived-reports--done)) | one solver per run, orchestration living inside the CLI subcommand (M2–M5's shape) — N solvers cost N extractions and programmatic use meant shelling out | `run.analyse_window` | — |
+| D19 | Report JSON (format 2) is **derived from the dataclasses** — keys are the `Analysis`/`AuctionCounterfactual` field and property names — and versioned; `load_report` refuses a file without the format marker ([§8](#8-m6--library-api-multi-solver-runs-derived-reports--done)) | a hand-written payload mirrored in four places (field, print, JSON key, loader) — every statistic cost four edits and the writer/reader key names had already drifted once | `run.report_payload`, `aggregate.REPORT_FORMAT` | bump `REPORT_FORMAT` on any shape change |
 
 ## 2. Two valuations, deliberately separate
 
@@ -89,6 +91,7 @@ loo/
   counterfactual.py    # baseline vs. LOO per auction -> per-order and per-auction diffs
   rewards.py           # uncapped (+ later capped) rewards
   aggregate.py         # M4: analyse reports -> medians, USD, per-solver comparison
+  run.py               # M6: analyse_window() — the pipeline as one library call
   cli.py               # subcommands: validate, validate-rewards, analyse, compare
 tests/
   test_winner_selection.py
@@ -694,3 +697,38 @@ jupyter lab`). The rendered `out/comparison.{txt,md}` are regenerable run artifa
 rather than implied: §1's secondary question on concentration by token pair and app
 code (the per-order diffs carry no token pair in the report JSON), and multi-window /
 multi-network sweeps — both are post-processing extensions of the same reports.
+
+## 8. M6 — library API, multi-solver runs, derived reports — **done**
+
+Not a new analysis — a restructuring, after a review of the whole repo against its
+purpose ("compute the counterfactual for a solver, chain and window, as simply as
+possible"). Three structural changes (D18, D19) and a cleanup:
+
+1. **The pipeline is a function.** `run.analyse_window(conn, solvers, start, end, …)`
+   does resolve → extract → arbitrate → COW conversion and returns a `WindowAnalysis`;
+   `loo analyse` renders it. Programmatic use no longer means shelling out or
+   re-implementing the CLI's orchestration.
+2. **Several solvers per extraction** (D18). Extraction is nearly all of a run's ~5
+   minutes; the arbitration is ~ms per auction. `--solver` is now repeatable and every
+   solver is analysed in the same pass over the bundles, so a
+   many-solvers-over-a-month sweep costs one extraction, not N. `--out` takes a
+   `{solver}` placeholder.
+3. **The report file is derived, not hand-written** (D19). `run.report_payload` dumps
+   the `Analysis`/`AuctionCounterfactual` fields plus named properties; JSON keys are
+   the dataclass names, integers stay integers, Decimals become strings. The file
+   carries `format: 2` and `load_report` refuses anything else with "re-run analyse" —
+   this retired the four-copy shape (dataclass field, print line, JSON key, loader
+   field) and with it the `settlement`/`outcome_rule` key drift the review found.
+4. **Milestone vocabulary left the runtime.** Output and docstrings now say what the
+   code does ("the validation gate", "the rewards gate", dated windows) instead of
+   citing milestones; M-numbers live only in this file. Decision IDs (D1–D19) remain
+   the cross-reference between code comments and this table.
+
+Also landed here: ruff + pyright (strict) configured in `pyproject.toml` with the
+codebase brought clean — this absorbed and superseded the stale
+`linting-typechecking-setup` worktree — plus the COW conversion now tracking the
+capped delta left unconverted, and the duplicate `REWARD_INPUTS_SQL` loader collapsed.
+
+No numbers changed: the counterfactual, validation and reward paths are untouched, and
+the validate/validate-rewards gates over 2026-08-01..04 are the regression test that
+they stayed untouched.

@@ -28,18 +28,22 @@ negative Δsurplus means users would have received less, positive Δrewards mean
 protocol would have paid more. How a change is turned into a *value of the solver* is
 deliberately left to the reader. The tables state this convention with the numbers.
 
-**1. The counterfactual**, once per solver and outcome rule. Only `inherited` is
-required; `assume-settled` is the optional everything-lands-in-time scenario (what the
-rules mean: [below](#the-outcome-rule)):
+**1. The counterfactual**, once per outcome rule. `--solver` is repeatable and every
+solver shares one extraction pass — extraction is nearly all of the run time, so
+analysing five solvers costs barely more than one. Only `inherited` is required;
+`assume-settled` is the optional everything-lands-in-time scenario (what the rules
+mean: [below](#the-outcome-rule)):
 
 ```bash
-for solver in Fractal Sector; do
-  for rule in inherited assume-settled; do
-    uv run loo analyse --solver "$solver" --start 2026-08-01 --end 2026-08-04 \
-        --outcome-rule "$rule" --out "out/$(echo $solver | tr 'A-Z' 'a-z')-$rule.json"
-  done
+for rule in inherited assume-settled; do
+  uv run loo analyse --solver Fractal --solver Sector \
+      --start 2026-08-01 --end 2026-08-04 \
+      --outcome-rule "$rule" --out "out/{solver}-$rule.json"
 done
 ```
+
+The `{solver}` placeholder in `--out` becomes each solver's slug; it is required when
+several solvers are given.
 
 **2. The comparison table** — seconds, it only reads the JSONs (plus one DB query for
 the USD columns):
@@ -71,20 +75,33 @@ as good as its reproduction of the recorded competition.
 uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04
 ```
 
-Removes one solver from every auction in the window, re-runs winner selection, and reports
-what users would have gained or lost. `--solver` takes a name or a submission address,
-matched exactly — `Arc` and `Arctic` are different solvers and both compete.
+Removes one or more solvers from every auction in the window, re-runs winner selection,
+and reports what users would have gained or lost. `--solver` takes a name or a
+submission address, matched exactly — `Arc` and `Arctic` are different solvers and both
+compete — and may be repeated; the solvers share one extraction pass and each gets its
+own report.
 
 | flag | |
 | --- | --- |
 | `--outcome-rule` | `inherited` (default) or `assume-settled` — see below |
 | `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus |
 | `--limit N` | only the first N auctions — start here |
-| `--out report.json` | per-auction records, including both sides' reference scores and rewards |
+| `--out report.json` | per-auction records, including both sides' reference scores and rewards; `{solver}` in the path becomes each solver's slug |
 
 Exit code is 0 normally, 1 if the window has no auctions, 2 if any auction could not be
-valued, 4 if `--solver` did not resolve, 5 if the settlement source does not cover the
-window.
+valued, 4 if a `--solver` did not resolve (or the flags are inconsistent), 5 if the
+settlement source does not cover the window.
+
+From Python, the same pipeline is one call — the CLI is a rendering around it:
+
+```python
+from loo import db, run
+
+conn = db.connect("mainnet")
+window = run.analyse_window(conn, ["Fractal", "Sector"], "2026-08-01", "2026-08-04")
+for solver_run in window.runs:
+    print(solver_run.solver, solver_run.analysis.delta_surplus)
+```
 
 #### The outcome rule
 
@@ -103,7 +120,7 @@ scenarios:
   proposals alone and settlement risk is excluded entirely.
 
 A third rule (`observed` — replacements assumed to settle while recorded winners keep
-their real outcomes) existed through M3 as a "lower bound" and was removed: settlement
+their real outcomes) was carried for a while as a "lower bound" and was removed: settlement
 attached to the solution is not a counterfactual anyone would defend, and a number
 nobody should quote is not made useful by calling it a bound. See
 [PLAN.md §7.1](PLAN.md#71-m4-result).
@@ -122,7 +139,7 @@ In score mode `analyse` reports solver rewards on both sides, twice:
 - **Uncapped** — the mechanism's exact accounting. The removed solver's own reward
   drops out, and rivals' rewards grow because their reference scores fall without it.
   Not a payout: a failed settlement's uncapped penalty is `-reference_score` against a
-  real floor of −0.01 ETH, and over the M1 window uncapped rewards sum to −410 ETH
+  real floor of −0.01 ETH, and over the 2026-08-01..04 window uncapped rewards sum to −410 ETH
   against 0.75 ETH actually paid.
 - **Capped (estimate)** — the payout-scale answer, clamping each reward into the
   recorded caps. A replacement winner inherits the `upper_reward_cap` of the recorded
@@ -143,8 +160,8 @@ Native prices in `auction_prices` are sometimes plain wrong — one token was pr
 ([details](docs/analytics-db.md#native-prices-can-be-plain-wrong)). Every solution is
 therefore cross-checked by valuing its executed amounts through both tokens' prices,
 and an auction where the two sides of a trade disagree by more than 2× is **excluded
-from every statistic** — the report names the excluded auction ids (0.6% of the M1
-window, which carried 82% of Sector's Δsurplus, all fabricated).
+from every statistic** — the report names the excluded auction ids (0.6% of the
+2026-08-01..04 window, which carried 82% of Sector's Δsurplus, all fabricated).
 `--include-price-suspects` keeps them in instead; the ids are printed either way.
 
 ### compare
@@ -157,7 +174,9 @@ Aggregates `analyse --out` reports into the comparison: one column per solver-wi
 the `assume-settled` scenario beside the `inherited` headline, medians, the sign split
 and the largest auction's share beside every sum, and the caveats and sign convention
 attached. Give every outcome-rule run of a solver-window together; a group without an
-`inherited` run is refused rather than silently led by another rule.
+`inherited` run is refused rather than silently led by another rule. Reports from an
+older `analyse` (the format marker is checked) are refused with "re-run analyse" —
+the files are cheap to regenerate and a silently misread one is not.
 
 USD columns are display-only conversions at each auction's own stablecoin-implied rate
 (the analytics DB has no USD table —
@@ -228,7 +247,7 @@ filter differs from DB:     7/5211 multi-pair solutions (0.1343%)
 multi-pair bracket:         must_filter=4882, must_keep=66, undetermined=263
 filter difference cause:    model=2, proxy=5
 
-every difference has a named cause — M1 gate met.
+every difference has a named cause — the validation gate is met.
 ```
 
 The two `observed` lines are the real checks. They hold the DB's own filter decisions fixed
@@ -246,15 +265,18 @@ split could possibly matter, and `cause` classifies each difference:
 
 See [PLAN.md §4.1](PLAN.md#41-m1-result) for the full argument.
 
-## Tests
+## Tests, lint, types
 
 ```bash
 uv run --extra dev pytest
+uv run ruff check .
+uv run pyright
 ```
 
-168 tests, no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
+The tests need no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
 `loo/counterfactual.py`, `loo/rewards.py` and `loo/aggregate.py` take plain dataclasses
-and files and hold no connection.
+and files and hold no connection. Pyright runs in strict mode; both tools are
+configured in `pyproject.toml` and install with `uv sync --extra dev`.
 
 ## Background
 
