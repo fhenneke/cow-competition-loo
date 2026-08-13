@@ -19,12 +19,20 @@ ONE_ETH = 10**18
 # solution trades the `0xee..ee` sentinel directly. Deliberately incomplete: the
 # autopilot takes this from per-deployment config rather than a table, so an
 # unverified address is worse than a loud failure.
+# Verified against the WETH9 per-network deployment table in the services repo
+# (contracts/src/main.rs) — the same source the autopilot's `as_erc20` wrapping uses.
 WRAPPED_NATIVE_TOKEN = {
     "mainnet": "c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
     "xdai": "e91d153e0b41518a2ce8dd3d7944fa863463a97d",  # WXDAI
     "base": "4200000000000000000000000000000000000006",  # WETH
     "arbitrum-one": "82af49447d8a07e3bd95bd0d56f35241523fbab1",  # WETH
     "sepolia": "fff9976782d46cc05630d1f6ebab18b2324d6b14",  # WETH
+    "avalanche": "b31f66aa3c1e785363f0875a1b74e27b85fd66c7",  # WAVAX
+    "polygon": "0d500b1d8e8ef31e21c99d1db9a6444d3adf1270",  # WMATIC
+    "bnb": "bb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",  # WBNB
+    "ink": "4200000000000000000000000000000000000006",  # WETH
+    "linea": "e5d7c2a44ffddf6b295a15c148167daaaf5cf34f",  # WETH
+    "plasma": "6100e367285b01f48d07953803a2d8dca5d19873",  # WXPL
 }
 
 # USD reference tokens per network, address -> decimals. The analytics DB has no USD
