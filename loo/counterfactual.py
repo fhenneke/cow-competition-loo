@@ -909,6 +909,14 @@ class Analysis:
     keeps them in every number instead; the flagged ids are reported either way."""
     price_suspect_auctions: list[int] = field(default_factory=list)
 
+    missing_data_auctions: list[int] = field(default_factory=list)
+    """Auctions excluded before arbitration because a traded order is in neither order
+    table (D17) — `jit_orders` only records the JIT orders of *settled* batches, so an
+    unsettled solution's JIT legs are unrecoverable and even their pair claims are
+    unknown. Filled by `extract.load_auctions`, never by `add`: unlike price suspects
+    these auctions are not counted in `auctions` because they were never arbitrated.
+    Measured over 2026-07-12..08-12 mainnet: ~600 of 78,271 auctions (0.8%)."""
+
     orders_compared: int = 0
     orders_only_with_solver: int = 0
     orders_only_without_solver: int = 0

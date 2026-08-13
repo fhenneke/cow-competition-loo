@@ -59,6 +59,13 @@ Both are read-only references here. Do not modify them.
     the M1 window, so any `ilike '%…%'` silently removes two competitors. One name can also
     mean several addresses (key rotations) and all of them must go together
     ([traps](docs/analytics-db.md#resolving-a-solver-name)).
+11. `stg_backend_data__jit_orders` only records JIT orders of **settled** batches, so an
+    unsettled solution's JIT orders are in neither order table and its auction cannot be
+    arbitrated faithfully. `analyse`/`validate` exclude such auctions transparently
+    (~0.8% of a month, D17); a crash on `MissingOrderError` means a caller bypassed the
+    `missing_data` collector
+    ([details](docs/analytics-db.md#jit-orders-are-recorded-only-when-the-batch-settles)).
+    The M1 window had zero of these — do not calibrate on it.
 
 ## Environment
 

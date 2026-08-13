@@ -169,8 +169,9 @@ def run_validate(args) -> int:
 
         summary = validate.Summary()
         surplus = validate.SurplusCrossCheck()
+        missing_data: list[int] = []
 
-        for bundle in extract.load_auctions(conn, auction_ids):
+        for bundle in extract.load_auctions(conn, auction_ids, missing_data=missing_data):
             summary.add(
                 validate.check_auction(bundle, weth, max_winners=args.max_winners)
             )
@@ -179,12 +180,18 @@ def run_validate(args) -> int:
     finally:
         conn.close()
 
+    if missing_data:
+        print(
+            f"{len(missing_data)} auctions excluded for missing order data "
+            f"(an order in neither orders nor jit_orders — unsettled JIT, D17)",
+            file=sys.stderr,
+        )
     report_summary(summary, args)
     if db_surplus:
         report_surplus(surplus)
 
     if args.out:
-        write_json(args.out, summary, surplus)
+        write_json(args.out, summary, surplus, missing_data)
         print(f"\nfull report written to {args.out}", file=sys.stderr)
 
     # The M1 gate is that every difference has a named cause, not that there are no
@@ -433,7 +440,9 @@ def run_analyse(args) -> int:
             exclude_price_suspect=not args.include_price_suspects,
         )
         try:
-            for bundle in extract.load_auctions(conn, auction_ids):
+            for bundle in extract.load_auctions(
+                conn, auction_ids, missing_data=analysis.missing_data_auctions
+            ):
                 analysis.add(
                     counterfactual.analyse_auction(
                         bundle,
@@ -551,7 +560,16 @@ def report_analysis(
     print(f"ranking mode    {analysis.mode}")
     print(f"outcome rule    {analysis.outcome_rule} — {counterfactual.OUTCOME_RULE[analysis.outcome_rule]}")
 
-    print(f"\nauctions in window            {total}")
+    missing = analysis.missing_data_auctions
+    print(f"\nauctions in window            {total + len(missing)}")
+    if missing:
+        print(
+            f"  missing order data, excluded {len(missing)} "
+            f"({pct(len(missing), total + len(missing))})"
+            "   <- an order in neither orders nor jit_orders: unsettled JIT, "
+            "unrecoverable (D17)"
+        )
+        print(f"  analysed                    {total}")
     print(
         f"  solver bid                  {analysis.auctions_with_solver} "
         f"({pct(analysis.auctions_with_solver, total)})"
@@ -784,6 +802,7 @@ def write_analysis_json(
         "cap_orphans": analysis.cap_orphans,
         "price_suspects_excluded": analysis.exclude_price_suspect,
         "price_suspect_auctions": analysis.price_suspect_auctions,
+        "missing_data_auctions": analysis.missing_data_auctions,
         "delta_rewards_cow_wei": str(cow.cow_wei) if cow is not None else None,
         "delta_rewards_capped_cow_wei": (
             str(cow.cow_wei_capped) if cow is not None else None
@@ -981,8 +1000,14 @@ def report_surplus(surplus: validate.SurplusCrossCheck) -> None:
         )
 
 
-def write_json(path: str, summary, surplus: validate.SurplusCrossCheck) -> None:
+def write_json(
+    path: str,
+    summary,
+    surplus: validate.SurplusCrossCheck,
+    missing_data: list[int] | None = None,
+) -> None:
     payload = {
+        "missing_data_auctions": missing_data or [],
         "auctions": summary.auctions,
         "solutions": summary.solutions,
         "auctions_winners_match": summary.auctions_winners_match,

@@ -27,7 +27,14 @@ CHUNK_SIZE = 200
 
 
 class MissingOrderError(Exception):
-    """A traded order uid is in neither `orders` nor `jit_orders`."""
+    """A traded order uid is in neither `orders` nor `jit_orders`.
+
+    Not a data glitch but a systematic gap: `jit_orders` is only populated when a batch
+    settles, so the JIT orders of solutions that never settled — losing bids, and winners
+    that reverted or landed late — are recorded nowhere and their tokens and limits are
+    unrecoverable ([docs](../docs/analytics-db.md#jit-orders-are-recorded-only-when-the-batch-settles)).
+    Callers that pass `missing_data` to `load_auctions` exclude the whole auction
+    transparently instead of dying on it (D17)."""
 
 
 class MissingAuctionContextError(Exception):
@@ -338,12 +345,21 @@ def auctions_in_window(conn, start: str, end: str) -> list[int]:
 
 
 def load_auctions(
-    conn, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
+    conn,
+    auction_ids: Sequence[int],
+    chunk_size: int = CHUNK_SIZE,
+    missing_data: list[int] | None = None,
 ) -> Iterator[AuctionBundle]:
     """Yield one `AuctionBundle` per auction, in the order given.
 
     Queries are batched over chunks of auction ids; auctions with no recorded solutions
     are skipped silently, since they carry no bids to arbitrate.
+
+    `missing_data` selects the policy for auctions where a traded order is in neither
+    order table (D17): when given, the whole auction is skipped and its id appended —
+    even one such order leaves the solution's pair claims unknowable, so nothing about
+    the auction can be arbitrated faithfully. When `None`, `MissingOrderError`
+    propagates, for callers that would rather die than lose coverage silently.
     """
     for chunk in chunked(list(auction_ids), chunk_size):
         ids = list(chunk)
@@ -388,10 +404,16 @@ def load_auctions(
                 )
             jit_owners = frozenset(context["jit_owners"])
 
-            bids = tuple(
-                _build_bid(row, executions.get((auction_id, row["uid"]), []), jit_owners)
-                for row in solutions[auction_id]
-            )
+            try:
+                bids = tuple(
+                    _build_bid(row, executions.get((auction_id, row["uid"]), []), jit_owners)
+                    for row in solutions[auction_id]
+                )
+            except MissingOrderError:
+                if missing_data is None:
+                    raise
+                missing_data.append(auction_id)
+                continue
 
             yield AuctionBundle(
                 auction_id=auction_id,

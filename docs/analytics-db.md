@@ -285,6 +285,38 @@ exempt). Consequences:
   auction in which the same `order_uid` was executed — policies derive from order class,
   app data, and the quote, so they are stable across auctions for a given order.
 
+## JIT orders are recorded only when the batch settles
+
+`stg_backend_data__jit_orders` is populated from settlements, so the JIT orders of
+solutions that never settled — losing bids, and winners that reverted or landed late —
+are recorded **nowhere**: their execution rows sit in `proposed_trade_executions`, but
+tokens, limit amounts, kind and fillability are unrecoverable. Measured over
+2026-07-12..2026-08-12 on mainnet (78,271 auctions):
+
+| | count | note |
+| --- | --- | --- |
+| orders in neither `orders` nor `jit_orders` | 653, in 685 solutions across ~600 auctions (0.8%) | |
+| of which surplus-capturing | 387 (59%) | owner in `surplus_capturing_jit_order_owners`, so they contributed to score and the filter |
+| in *winning* solutions | 235 rows across ~230 auctions | winners that reverted or landed late |
+| solutions with **all** orders missing | 143 | nothing about their pair claims is known |
+
+A losing solution's JIT order *can* still be recorded: when the same order settled via
+the winner, the row exists and every proposer's join works.
+
+The M1–M4 window (2026-08-01..04) sits in a stretch with zero missing orders and no JIT
+activity among winners at all (between auctions 13480599 and 13517908) — pure luck, so
+the M1 gate never saw one.
+
+Consequence (D17): even one missing order leaves a solution's `pick_winners` pair claims
+unknowable — and JIT-only pair claims measurably change the pick
+([winner-selection.md](winner-selection.md#a-jit-leg-can-block-another-solutions-execution--and-the-filter-never-sees-it)) —
+so `extract.load_auctions` excludes the whole auction and reports it
+(`missing_data_auctions`). The exclusions are not random: they are JIT-heavy and
+reverted-winner auctions. Revision path: CoW AMMs — the surplus-capturing case — were
+deprecated around late July 2026, so for windows past the deprecation a
+zero-surplus/zero-score reading of a missing order is exact for score and filter; the
+missing pair claim, and with it the blocking bias, remains either way.
+
 ## Observed outcomes: what actually settled
 
 Everything above describes what solvers *proposed*. Three tables carry what happened on

@@ -73,6 +73,10 @@ CAVEATS = (
     "The net-change row nets against the figure named in its label.",
     "Price-suspect auctions are excluded from every statistic and counted in the "
     "table; they carried 82% of Sector's pre-exclusion Δsurplus (D14).",
+    "Auctions with a traded order recorded in neither order table are excluded and "
+    "counted in the table (D17): jit_orders only records settled batches, so an "
+    "unsettled solution's JIT legs are unrecoverable. The exclusions are not random — "
+    "they are JIT-heavy and reverted-winner auctions.",
     "USD figures are display-only conversions at each auction's own stablecoin-implied "
     "rate; they inherit every caveat of the ETH figure they restate.",
 )
@@ -108,6 +112,9 @@ class Report:
     outcome_rule: str
     price_suspects_excluded: bool
     price_suspects: int
+    missing_data: int
+    """Auctions excluded before arbitration for missing order data (D17). Unlike price
+    suspects these are not part of `auctions`; the window total is their sum."""
     auctions: int
     auctions_with_solver: int
     auctions_solver_won: int
@@ -186,6 +193,8 @@ def load_report(path: str) -> Report:
         outcome_rule=payload["settlement"],
         price_suspects_excluded=bool(payload["price_suspects_excluded"]),
         price_suspects=len(payload["price_suspect_auctions"]),
+        # `.get`: reports from before D17 carry no such key and excluded nothing.
+        missing_data=len(payload.get("missing_data_auctions", [])),
         auctions=payload["auctions"],
         auctions_with_solver=payload["auctions_with_solver"],
         auctions_solver_won=payload["auctions_solver_won_baseline"],
@@ -465,12 +474,15 @@ def comparison(
         report = window.headline
         usd = usd_by_network.get(report.network)
 
-        excluded = (
-            f" ({report.price_suspects} price-suspect excluded)"
-            if report.price_suspects and report.price_suspects_excluded
-            else ""
+        exclusions = []
+        if report.price_suspects and report.price_suspects_excluded:
+            exclusions.append(f"{report.price_suspects} price-suspect")
+        if report.missing_data:
+            exclusions.append(f"{report.missing_data} missing-data")
+        excluded = f" ({', '.join(exclusions)} excluded)" if exclusions else ""
+        auctions.append(
+            f"{report.analysed:,} of {report.auctions + report.missing_data:,}{excluded}"
         )
-        auctions.append(f"{report.analysed:,} of {report.auctions:,}{excluded}")
         bid.append(
             f"{report.auctions_with_solver:,} "
             f"({pct(report.auctions_with_solver, report.analysed)})"
