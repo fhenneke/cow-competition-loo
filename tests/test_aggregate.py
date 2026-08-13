@@ -116,6 +116,20 @@ class TestLoadReport:
         assert [m.auction_id for m in report.moves] == [7, 8]
         assert report.moves[1].delta_rewards_capped is None
 
+    def test_missing_data_defaults_to_zero_for_pre_d17_reports(self, tmp_path):
+        report = load_report(write_report(tmp_path, "r.json", payload()))
+
+        assert report.missing_data == 0
+
+    def test_missing_data_is_counted_but_stays_out_of_analysed(self, tmp_path):
+        data = payload(missing_data_auctions=[11, 12, 13])
+
+        report = load_report(write_report(tmp_path, "r.json", data))
+
+        assert report.missing_data == 3
+        # unlike price suspects these never entered `auctions`, so `analysed` is unmoved
+        assert report.analysed == 98
+
     def test_surplus_mode_has_no_rewards(self, tmp_path):
         data = payload(
             rewards_uncapped=False,
@@ -308,6 +322,22 @@ class TestComparison:
             "40 (8.0% of 500"
         )
 
+    def test_missing_data_exclusions_widen_the_window_total(self, tmp_path):
+        reports = [
+            load_report(
+                write_report(
+                    tmp_path, "a.json", payload(missing_data_auctions=[11, 12, 13])
+                )
+            )
+        ]
+
+        table = comparison(group_reports(reports))
+
+        rows = dict(table.rows)
+        assert rows["auctions analysed"][0] == (
+            "98 of 103 (2 price-suspect, 3 missing-data excluded)"
+        )
+
     def test_sign_split_keeps_direction_visible(self, tmp_path):
         table = self.build(tmp_path)
 
@@ -420,9 +450,12 @@ class TestFormatters:
 
 
 def test_caveats_cover_the_plan_list():
-    """PLAN §7 names six caveats and M4 adds the USD one; a comparison must carry
-    them all, so their disappearance should fail loudly here."""
-    assert len(CAVEATS) == 7
-    themes = ("behavioural", "Settlement", "proxy", "Quote", "reward", "Price", "USD")
+    """PLAN §7 names six caveats, M4 adds the USD one and D17 the missing-data one; a
+    comparison must carry them all, so their disappearance should fail loudly here."""
+    assert len(CAVEATS) == 8
+    themes = (
+        "behavioural", "Settlement", "proxy", "Quote", "reward", "Price",
+        "neither order table", "USD",
+    )
     for theme, caveat in zip(themes, CAVEATS):
         assert theme.lower() in caveat.lower()

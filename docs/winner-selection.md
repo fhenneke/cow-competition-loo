@@ -219,6 +219,31 @@ orders.
 This is why a leave-one-out run finds orders that execute *only when a solver is removed* —
 14 of them over three days for Fractal — and those are a real coverage effect, not a defect.
 
+### A JIT leg can block another solution's execution — and the filter never sees it
+
+The two asymmetries above combine into a mechanism-level quirk. A non-contributing JIT
+order is invisible to the fairness filter (step 1 skips it) yet claims its directed pair
+in `pick_winners` (step 5 iterates every order). A batch of [user order + the solver's
+own JIT counterparty on the reverse direction] therefore passes the filter as a
+single-pair solution while claiming **both** directions — and blocks any solution on the
+reverse direction outright, without that leg ever having been compared to a baseline.
+
+Measured over 2026-07-12..2026-08-12 on mainnet: 1,010 auctions have a winner claiming a
+pair only via a JIT order; in 67 that claim causally changed the pick (verified by
+re-running `arbitrate` with JIT-only claims stripped — a kept solution newly wins). 59 of
+the 67 are benign: both solutions fill the *same* CoW-AMM order, so the block is
+one-fill-per-pair working as intended. In **8**, the blocked solution filled a different
+user order, and in all 8 that order was executed by no winner at all — a real coverage
+loss to a JIT leg. Six of the eight blockers are one uncatalogued solver (`26a6fdc0…`)
+running a JIT-counterparty strategy on USDC↔WETH.
+
+Auction `13472415` is the sharpest case, a full chain: BRRRolver's batch matching user
+orders in both WETH/USDC directions was filtered out — its baseline on USDC→WETH was set
+by Baseline's single-pair solution (uid 22). Uncatalogued (uid 1) then won WETH→USDC
+with a user order plus its own JIT counterparty on USDC→WETH, whose claim blocked uid 22
+from winning. User order `8d5b1fc0…` went unfilled with two willing solutions in the
+auction — one filtered, one blocked. Flagged to the backend team on 2026-08-13.
+
 ### Reference scores do not re-filter
 
 `compute_reference_scores` re-runs only step 5, on the already-filtered set. It does not
