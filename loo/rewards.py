@@ -1,4 +1,4 @@
-"""M3: per-auction solver rewards, uncapped.
+"""Per-auction solver rewards: uncapped exactly, capped as an estimate.
 
 Transcribed from `fct_solver_rewards_per_auction.sql` (see docs/rewards.md for the
 formula reference and the dbt source paths). Everything is per auction, per solver,
@@ -39,9 +39,10 @@ Pure module: no DB handle. Integer arithmetic for the uncapped path; the caps ar
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, getcontext
-from typing import Iterable, Mapping, NamedTuple
+from typing import NamedTuple
 
 # The caps arrive from Postgres `numeric` with ~40 significant digits and are summed
 # per solver; Python's default 28-digit context silently rounds those sums, which the
@@ -127,10 +128,11 @@ def uncapped_rewards(
         )
         if win.solver not in upper:
             upper[win.solver] = Decimal(0)
+        current = upper[win.solver]
         if win.upper_cap is None:
             upper[win.solver] = None
-        elif upper[win.solver] is not None:
-            upper[win.solver] += win.upper_cap
+        elif current is not None:
+            upper[win.solver] = current + win.upper_cap
 
     rewards: dict[str, SolverReward] = {}
     for solver, competition_score in competition.items():
@@ -150,10 +152,8 @@ def uncapped_rewards(
         upper_cap = upper[solver] if lower_cap is not None else None
         capped: Decimal | None = None
         if lower_cap is not None and upper_cap is not None:
-            if excluded:
-                capped = Decimal(0)
-            else:
-                capped = min(max(Decimal(uncapped), Decimal(lower_cap)), upper_cap)
+            clamped = min(max(Decimal(uncapped), Decimal(lower_cap)), upper_cap)
+            capped = Decimal(0) if excluded else clamped
 
         rewards[solver] = SolverReward(
             solver=solver,
@@ -201,9 +201,9 @@ class RewardMismatch:
 
 @dataclass
 class RewardValidation:
-    """Window aggregate of the M3 gate: recorded inputs -> formula -> fct comparison.
+    """Window aggregate of the rewards gate: recorded inputs -> formula -> fct comparison.
 
-    Unlike M1 there is no approximation anywhere in this path — the inputs are the
+    Unlike the competition validation there is no approximation anywhere in this path — the inputs are the
     DB's own winning solutions, settlement flags and reference scores — so the gate is
     absolute: every row must match exactly, and any mismatch is a bug in the formula
     transcription or a data problem to be understood, not a rate to be reported.
@@ -213,8 +213,8 @@ class RewardValidation:
     auctions_with_winners: int = 0
     rows: int = 0
     rows_matched: int = 0
-    auctions_missing_from_fct: list[int] = field(default_factory=list)
-    mismatches: list[RewardMismatch] = field(default_factory=list)
+    auctions_missing_from_fct: list[int] = field(default_factory=list[int])
+    mismatches: list[RewardMismatch] = field(default_factory=list[RewardMismatch])
 
     def check_auction(
         self,

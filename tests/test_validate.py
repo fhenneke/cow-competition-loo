@@ -6,7 +6,10 @@ decides whether *any* valid per-pair score split could have produced the DB's de
 
 from __future__ import annotations
 
+from typing import Any
+
 from loo.extract import AuctionBundle, Bid
+from loo.primitives import Pair
 from loo.validate import (
     AuctionReport,
     SolutionCheck,
@@ -20,7 +23,7 @@ A = ("weth", "usdc")
 B = ("dai", "usdc")
 
 
-def valuation(pair_surplus: dict) -> SolutionValuation:
+def valuation(pair_surplus: dict[Pair, int]) -> SolutionValuation:
     return SolutionValuation(
         pair_surplus=pair_surplus,
         order_surplus_native={},
@@ -64,8 +67,8 @@ class TestFilterBracket:
         assert filter_bracket(valuation({A: 60, B: 40}), 100, {A: 61, B: 0}) == "must_filter"
 
 
-def check(**kwargs) -> SolutionCheck:
-    defaults = dict(
+def check(**kwargs: Any) -> SolutionCheck:
+    defaults: dict[str, Any] = dict(
         uid=0,
         solver="a",
         db_score=100,
@@ -139,7 +142,7 @@ def bid(uid: int, solver: str, score: int, is_winner: bool, filtered_out: bool) 
     )
 
 
-def sol(uid: int, solver: str, total: int, pairs: frozenset) -> Solution:
+def sol(uid: int, solver: str, total: int, pairs: frozenset[Pair]) -> Solution:
     return Solution(
         solver=solver,
         solution_uid=uid,
@@ -154,7 +157,7 @@ class TestObservedPick:
     """`observed_pick` re-runs step 5 on the DB's own kept set, so a pick bug cannot be
     written off as a proxy filter difference in the same auction."""
 
-    def bundle(self, bids) -> AuctionBundle:
+    def bundle(self, bids: list[Bid]) -> AuctionBundle:
         return AuctionBundle(
             auction_id=1,
             jit_owners=frozenset(),

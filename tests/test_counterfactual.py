@@ -10,6 +10,8 @@ Two things carry most of the weight and are pinned down hardest:
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from loo.counterfactual import (
@@ -25,6 +27,7 @@ from loo.counterfactual import (
     un_filtered,
 )
 from loo.extract import AuctionBundle, Bid, Settlement
+from loo.primitives import Pair
 from loo.valuation import Order, SolutionValuation, ValuedBid
 from loo.winner_selection import Solution, arbitrate
 
@@ -45,10 +48,10 @@ def solution(
     solver: str,
     uid: int,
     total: int,
-    pair_values: dict | None = None,
-    winner_pairs: frozenset | None = None,
+    pair_values: dict[Pair, int] | None = None,
+    winner_pairs: frozenset[Pair] | None = None,
 ) -> Solution:
-    values = pair_values if pair_values is not None else {A: total}
+    values: dict[Pair, int] = pair_values if pair_values is not None else {A: total}
     return Solution(
         solver=solver,
         solution_uid=uid,
@@ -577,10 +580,10 @@ class TestRetention:
     auctions whose rewards actually change.
     """
 
-    def result(self, **kwargs):
+    def result(self, **kwargs: Any):
         from loo.counterfactual import AuctionCounterfactual
 
-        defaults = dict(auction_id=1, n_solutions=2, solver_present=True)
+        defaults: dict[str, Any] = dict(auction_id=1, n_solutions=2, solver_present=True)
         defaults.update(kwargs)
         return AuctionCounterfactual(**defaults)
 
@@ -605,8 +608,8 @@ class TestRetention:
 
 
 class TestAnalysis:
-    def diff(self, **kwargs) -> OrderDiff:
-        defaults = dict(
+    def diff(self, **kwargs: Any) -> OrderDiff:
+        defaults: dict[str, Any] = dict(
             order_uid="o1",
             contributes=True,
             executed_base=True,

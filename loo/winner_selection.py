@@ -1,16 +1,18 @@
 """Winner selection, reimplemented from `services/crates/winner-selection`.
 
 Pure: plain dataclasses in, plain dataclasses out, no DB handle and no floats. The
-caller supplies each solution's `total` and `pair_values` — see PLAN.md §2 for why the
-valuation is an input rather than something this module derives.
+caller supplies each solution's `total` and `pair_values` — see PLAN.md ("Two
+valuations, deliberately separate") for why the valuation is an input rather than
+something this module derives.
 
 Everything here mirrors `arbitrator.rs`; deviations are called out in comments.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Iterable, NamedTuple, Sequence
+from typing import NamedTuple
 
 from .primitives import MAX_WINNERS, Pair
 
@@ -33,7 +35,7 @@ class Solution:
     """Solution value. In the Rust this is always `sum(pair_values.values())`; in score
     mode we take it from `proposed_solutions.score` instead, so the two can differ."""
 
-    pair_values: dict[Pair, int] = field(default_factory=dict)
+    pair_values: dict[Pair, int] = field(default_factory=dict[Pair, int])
     """Value per **raw** directed token pair, over score-contributing orders only."""
 
     order_uids: frozenset[str] = frozenset()
@@ -58,7 +60,7 @@ class Ranking:
     winner_uids: frozenset[int]
     """`solution_uid` of every winner."""
 
-    baselines: dict[Pair, int] = field(default_factory=dict)
+    baselines: dict[Pair, int] = field(default_factory=dict[Pair, int])
     """Per-pair baseline used by the filter. Kept for diagnostics."""
 
     dropped_uids: frozenset[int] = frozenset()

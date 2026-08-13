@@ -1,4 +1,4 @@
-"""M1 step 5: reproduce the recorded competition and account for every difference.
+"""Reproduce the recorded competition and account for every difference.
 
 Three comparisons, all in score mode:
 
@@ -17,8 +17,8 @@ disagreement can be attributed rather than merely observed.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable
 
 from .extract import AuctionBundle
 from .primitives import MAX_WINNERS, Pair
@@ -86,8 +86,8 @@ class SolutionCheck:
     db_filtered: bool
     our_filtered: bool
     partially_fillable: bool
-    pair_values: dict[Pair, int] = field(default_factory=dict)
-    pair_surplus: dict[Pair, int] = field(default_factory=dict)
+    pair_values: dict[Pair, int] = field(default_factory=dict[Pair, int])
+    pair_surplus: dict[Pair, int] = field(default_factory=dict[Pair, int])
     bracket: str = "must_keep"
     """`filter_bracket` verdict — what any valid per-pair score split would force."""
 
@@ -104,8 +104,8 @@ class SolutionCheck:
         """Why our filter decision differs from the DB's.
 
         Where the bracket is `undetermined` the true per-pair split decides the filter and
-        we cannot know it, so a difference is the approximation PLAN.md §2 accepts:
-        `proxy`.
+        we cannot know it, so a difference is the deliberate surplus-proxy approximation
+        (D2): `proxy`.
 
         Where the bracket is decisive it binds the DB, which filtered on the true split.
         It does not bind us: we filter on surplus, and surplus baselines sit at or below
@@ -131,12 +131,12 @@ class SolutionCheck:
 class AuctionReport:
     auction_id: int
     n_solutions: int
-    checks: list[SolutionCheck] = field(default_factory=list)
-    valuation_failures: list[tuple[int, str]] = field(default_factory=list)
-    reference_recomputed: dict[str, int] = field(default_factory=dict)
-    reference_observed: dict[str, int] = field(default_factory=dict)
-    reference_db: dict[str, int] = field(default_factory=dict)
-    baselines: dict[Pair, int] = field(default_factory=dict)
+    checks: list[SolutionCheck] = field(default_factory=list[SolutionCheck])
+    valuation_failures: list[tuple[int, str]] = field(default_factory=list[tuple[int, str]])
+    reference_recomputed: dict[str, int] = field(default_factory=dict[str, int])
+    reference_observed: dict[str, int] = field(default_factory=dict[str, int])
+    reference_db: dict[str, int] = field(default_factory=dict[str, int])
+    baselines: dict[Pair, int] = field(default_factory=dict[Pair, int])
     """Exact score baselines from `score_baselines`, used by the bracket. Not necessarily
     what the configured filter compared against."""
     observed_pick_uids: frozenset[int] = frozenset()
@@ -173,7 +173,7 @@ class AuctionReport:
         """Where the reproduction diverged, for triage."""
         if self.valuation_failures:
             return "valuation"
-        parts = []
+        parts: list[str] = []
         if not self.filter_matches:
             parts.append("filter")
         if not self.winners_match:
@@ -193,11 +193,11 @@ class AuctionReport:
 
     @property
     def unexplained(self) -> str | None:
-        """The M1 exit criterion, per auction.
+        """The validation exit criterion, per auction.
 
         Returns `None` when every difference has a named, verified cause, and otherwise
         names what is still unaccounted for. Accepted causes are `proxy` (the unknowable
-        per-pair split of PLAN.md §2) and `model` (a surplus-based filter deliberately
+        per-pair split behind the surplus proxy, D2) and `model` (a surplus-based filter deliberately
         answering a different question); a `bug` is not.
 
         The two "observed" checks are what make this a real gate rather than a
@@ -384,12 +384,12 @@ class Summary:
     the right denominator. Split by `filter_causes` into unknowable (`proxy`), deliberate
     (`model`) and defective (`bug`)."""
     valuation_failures: int = 0
-    bracket_counts: dict[str, int] = field(default_factory=dict)
-    filter_causes: dict[str, int] = field(default_factory=dict)
-    mismatched: list[AuctionReport] = field(default_factory=list)
-    unexplained: list[tuple[int, str]] = field(default_factory=list)
-    """Auctions where a difference is still unaccounted for — the M1 exit criterion is
-    that this list is empty."""
+    bracket_counts: dict[str, int] = field(default_factory=dict[str, int])
+    filter_causes: dict[str, int] = field(default_factory=dict[str, int])
+    mismatched: list[AuctionReport] = field(default_factory=list[AuctionReport])
+    unexplained: list[tuple[int, str]] = field(default_factory=list[tuple[int, str]])
+    """Auctions where a difference is still unaccounted for — the validation exit
+    criterion is that this list is empty."""
 
     @property
     def proxy_error_rate(self) -> float:
@@ -434,14 +434,16 @@ class SurplusCrossCheck:
     skipped: int = 0
     """Orders present in the model that we could not value at all. Counted separately so
     "N/N agree" cannot be read as coverage it does not have."""
-    mismatches: list[tuple[int, int, str, int, int]] = field(default_factory=list)
+    mismatches: list[tuple[int, int, str, int, int]] = field(
+        default_factory=list[tuple[int, int, str, int, int]]
+    )
     """(auction, solution uid, order uid, ours, theirs)."""
 
     @property
     def agreed(self) -> int:
         return self.compared - len(self.mismatches)
 
-    def merge(self, other: "SurplusCrossCheck") -> None:
+    def merge(self, other: SurplusCrossCheck) -> None:
         self.compared += other.compared
         self.skipped += other.skipped
         self.mismatches.extend(other.mismatches)

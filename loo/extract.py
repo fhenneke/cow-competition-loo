@@ -2,7 +2,7 @@
 
 Reads the raw staging tables rather than `int_backend_data__proposed_solution_data`:
 the intermediate model lags the staging tables by 2-3 days and carries no
-`filtered_out` column, which M1's comparison needs. The intermediate model is still
+`filtered_out` column, which the validation comparison needs. The intermediate model is still
 used, optionally, as an independent check on the surplus computation
 (`load_db_order_surplus`).
 
@@ -12,13 +12,12 @@ joins `proposed_solutions.uid`, never `.id`.
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from statistics import median
-from typing import Iterator, Sequence
-
 from decimal import Decimal
+from statistics import median
 
-from .db import as_int, chunked, fetch
+from .db import Connection, Row, as_int, chunked, fetch
 from .primitives import order_owner, usd_per_native, usd_reference_tokens
 from .rewards import SolverReward, Win
 from .valuation import Order
@@ -63,7 +62,8 @@ class Settlement:
 
     `landed` and `in_time` come apart: a batch that arrives after its deadline still fills
     its orders, so the user does receive surplus, but the solver earns no reward for it.
-    Measured over the M1 window: 8,768 of 10,301 winners landed, of which 16 were late.
+    Measured over the 2026-08-01..04 validation window: 8,768 of 10,301 winners landed,
+    of which 16 were late.
     """
 
     landed: bool
@@ -79,7 +79,7 @@ class Settlement:
         **A late settlement counts as a failure with zero surplus**, even though its orders
         really did fill. Deliberate, and the one place this analysis knowingly departs from
         what happened: a batch the protocol did not reward is not a batch the mechanism can
-        be credited with, and the surplus and reward sides of M2/M3 have to agree on which
+        be credited with, and the surplus and reward sides have to agree on which
         winners delivered. The cost is the real surplus of 16 late winners in the window —
         `landed and not in_time` is kept so that cost stays visible rather than becoming
         invisible rounding.
@@ -221,7 +221,8 @@ where auction_id = any(%(ids)s)
 # One row per *winning* solution, always — the model left-joins settlements onto the
 # winners, so a winner that never settled is a row with a null `tx_hash` rather than a
 # missing row. That distinction is what lets a missing row mean "no data" and fail loudly.
-# Verified over the M1 window: 10,301 winners, 10,301 rows, no duplicates, no rows for
+# Verified over the 2026-08-01..04 validation window: 10,301 winners, 10,301 rows, no
+# duplicates, no rows for
 # non-winners.
 SETTLEMENTS_SQL = """
 select
@@ -236,7 +237,8 @@ where auction_id = any(%(ids)s)
 
 # The reward formula's own inputs, straight from the model `fct_solver_rewards_per_auction`
 # builds on: one row per winning solution with its score, settlement flag and caps. Used
-# by the M3 gate, which recomputes both rewards from these and compares against the mart —
+# by `loo validate-rewards`, which recomputes both rewards from these and compares
+# against the mart —
 # so the only thing in the comparison's path is the formula transcription itself.
 REWARD_INPUTS_SQL = """
 select auction_id, solution_uid, encode(solver, 'hex') as solver, score,
@@ -264,7 +266,7 @@ from dbt.int_accounting_period_data__conversion_rates
 where block_number = any(%(blocks)s)
 """
 
-# USD reference prices for display conversion (M4). The analytics DB has no USD price
+# USD reference prices for display conversion. The analytics DB has no USD price
 # table; a major stablecoin's native price in the auction's own price vector implies
 # the rate — see `primitives.USD_REFERENCE_TOKENS`.
 USD_PRICES_SQL = """
@@ -275,7 +277,7 @@ where auction_id = any(%(ids)s)
 """
 
 # `--solver` takes a name or an address. Names are matched **exactly** (case-insensitively):
-# among solvers active in the M1 window `Arc` is a substring of `Arctic` and both bid, so
+# among active solvers `Arc` is a substring of `Arctic` and both bid, so
 # any `like '%…%'` match would silently remove two competitors. `Uncatalogued` is excluded
 # because it is `coalesce(name, 'Uncatalogued')` — a bucket for addresses missing from the
 # Dune seed, not a solver; those must be named by address.
@@ -334,7 +336,7 @@ order by coalesce(a.solutions, 0) desc, c.name
 """
 
 
-def auctions_in_window(conn, start: str, end: str) -> list[int]:
+def auctions_in_window(conn: Connection, start: str, end: str) -> list[int]:
     """Auction ids with at least one bid in `[start, end)`.
 
     This is the same auction universe the dbt reward models use. Auction ids are sparse
@@ -345,7 +347,7 @@ def auctions_in_window(conn, start: str, end: str) -> list[int]:
 
 
 def load_auctions(
-    conn,
+    conn: Connection,
     auction_ids: Sequence[int],
     chunk_size: int = CHUNK_SIZE,
     missing_data: list[int] | None = None,
@@ -383,13 +385,13 @@ def load_auctions(
                 row["reference_score"]
             )
 
-        executions: dict[tuple[int, int], list[dict]] = {}
+        executions: dict[tuple[int, int], list[Row]] = {}
         for row in execution_rows:
             executions.setdefault(
                 (row["auction_id"], row["solution_uid"]), []
             ).append(row)
 
-        solutions: dict[int, list[dict]] = {}
+        solutions: dict[int, list[Row]] = {}
         for row in solution_rows:
             solutions.setdefault(row["auction_id"], []).append(row)
 
@@ -425,9 +427,9 @@ def load_auctions(
             )
 
 
-def _build_bid(row: dict, execution_rows: list[dict], jit_owners: frozenset[str]) -> Bid:
-    orders = []
-    contributes = {}
+def _build_bid(row: Row, execution_rows: list[Row], jit_owners: frozenset[str]) -> Bid:
+    orders: list[Order] = []
+    contributes: dict[str, bool] = {}
 
     for execution in execution_rows:
         uid = execution["order_uid"]
@@ -467,7 +469,7 @@ def _build_bid(row: dict, execution_rows: list[dict], jit_owners: frozenset[str]
 
 
 def load_settlement_outcomes(
-    conn, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
+    conn: Connection, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
 ) -> dict[int, dict[int, Settlement]]:
     """On-chain outcome per winning solution, keyed by auction then `solution_uid`.
 
@@ -510,15 +512,22 @@ class RewardInputs:
     excluded: bool
 
 
+def _reward_input_rows(
+    conn: Connection, auction_ids: Sequence[int], chunk_size: int
+) -> Iterator[Row]:
+    """`REWARD_INPUTS_SQL` rows, chunked — shared by the two shapes built from them."""
+    for chunk in chunked(list(auction_ids), chunk_size):
+        yield from fetch(conn, REWARD_INPUTS_SQL, {"ids": list(chunk)})
+
+
 def load_reward_inputs(
-    conn, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
+    conn: Connection, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
 ) -> dict[int, RewardInputs]:
     """The reward formula's inputs per auction — each winning solution's solver, score,
     settled-in-time flag and cap — from the same model the dbt rewards mart reads."""
-    rows_by_auction: dict[int, list[dict]] = {}
-    for chunk in chunked(list(auction_ids), chunk_size):
-        for row in fetch(conn, REWARD_INPUTS_SQL, {"ids": list(chunk)}):
-            rows_by_auction.setdefault(row["auction_id"], []).append(row)
+    rows_by_auction: dict[int, list[Row]] = {}
+    for row in _reward_input_rows(conn, auction_ids, chunk_size):
+        rows_by_auction.setdefault(row["auction_id"], []).append(row)
 
     inputs: dict[int, RewardInputs] = {}
     for auction_id, rows in rows_by_auction.items():
@@ -548,7 +557,7 @@ def load_reward_inputs(
 
 
 def load_solution_caps(
-    conn, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
+    conn: Connection, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
 ) -> dict[int, dict[int, SolutionCap]]:
     """Cap inputs per recorded winning solution, keyed by auction then `solution_uid`.
 
@@ -556,18 +565,17 @@ def load_solution_caps(
     counterfactual replacement has no row here, which is exactly why its cap has to be
     inherited from the slot it displaced."""
     caps: dict[int, dict[int, SolutionCap]] = {}
-    for chunk in chunked(list(auction_ids), chunk_size):
-        for row in fetch(conn, REWARD_INPUTS_SQL, {"ids": list(chunk)}):
-            caps.setdefault(row["auction_id"], {})[row["solution_uid"]] = SolutionCap(
-                upper=Decimal(row["upper_reward_cap"]),
-                lower=as_int(row["lower_reward_cap"]),
-                excluded=bool(row["is_excluded"]),
-            )
+    for row in _reward_input_rows(conn, auction_ids, chunk_size):
+        caps.setdefault(row["auction_id"], {})[row["solution_uid"]] = SolutionCap(
+            upper=Decimal(row["upper_reward_cap"]),
+            lower=as_int(row["lower_reward_cap"]),
+            excluded=bool(row["is_excluded"]),
+        )
     return caps
 
 
 def load_reference_scores(
-    conn, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
+    conn: Connection, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
 ) -> dict[int, dict[str, int]]:
     """Recorded reference scores keyed by auction then solver — winners only, by
     construction of the table."""
@@ -581,7 +589,7 @@ def load_reference_scores(
 
 
 def load_fct_rewards(
-    conn, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
+    conn: Connection, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
 ) -> dict[int, dict[str, SolverReward]]:
     """Ground truth from `fct_solver_rewards_per_auction`, keyed by auction then solver."""
     rewards: dict[int, dict[str, SolverReward]] = {}
@@ -600,7 +608,7 @@ def load_fct_rewards(
 
 
 def load_conversion_rates(
-    conn, blocks: Sequence[int], chunk_size: int = CHUNK_SIZE
+    conn: Connection, blocks: Sequence[int], chunk_size: int = CHUNK_SIZE
 ) -> dict[int, Decimal | None]:
     """COW->native conversion rate per block, `None` where the accounting period has
     not been snapshotted yet. A block missing entirely also maps to `None`."""
@@ -615,7 +623,10 @@ def load_conversion_rates(
 
 
 def load_usd_rates(
-    conn, auction_ids: Sequence[int], network: str = "mainnet", chunk_size: int = CHUNK_SIZE
+    conn: Connection,
+    auction_ids: Sequence[int],
+    network: str = "mainnet",
+    chunk_size: int = CHUNK_SIZE,
 ) -> dict[int, Decimal]:
     """USD per native token, per auction, implied by stablecoin native prices.
 
@@ -639,13 +650,15 @@ def load_usd_rates(
     }
 
 
-def solver_matches(conn, solver: str, start: str, end: str) -> list[SolverMatch]:
+def solver_matches(conn: Connection, solver: str, start: str, end: str) -> list[SolverMatch]:
     """Catalogue entries matching `solver`, with how much each one bid in the window."""
     rows = fetch(conn, SOLVER_SQL, {"solver": solver, "start": start, "end": end})
     return [SolverMatch(**row) for row in rows]
 
 
-def resolve_solver(conn, solver: str, start: str, end: str) -> tuple[frozenset[str], list[SolverMatch]]:
+def resolve_solver(
+    conn: Connection, solver: str, start: str, end: str
+) -> tuple[frozenset[str], list[SolverMatch]]:
     """Submission addresses to remove for `--solver`, and the matches behind them.
 
     Returns every matching address that bid in the window — see `SOLVER_SQL` on why a
@@ -674,7 +687,7 @@ def resolve_solver(conn, solver: str, start: str, end: str) -> tuple[frozenset[s
 
 
 def load_db_order_surplus(
-    conn, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
+    conn: Connection, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
 ) -> dict[tuple[int, int, str], int]:
     """`order_surplus_atoms_in_surplus_token` keyed by (auction, solution uid, order).
 

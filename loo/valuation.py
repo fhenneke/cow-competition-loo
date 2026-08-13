@@ -11,8 +11,9 @@ Integer arithmetic throughout.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable, Literal, Sequence
+from typing import TYPE_CHECKING, Literal
 
 from .primitives import Pair, as_erc20, ceil_div, price_in_eth
 from .winner_selection import Solution
@@ -234,13 +235,13 @@ def solution_total(valuation: SolutionValuation, mode: Mode, db_score: int | Non
 class ValuedBid:
     """A bid, its valuation, and the `Solution` the arbitrator sees."""
 
-    bid: "Bid"
+    bid: Bid
     solution: Solution
     valuation: SolutionValuation
 
 
 def build_solutions(
-    bids: Sequence["Bid"],
+    bids: Sequence[Bid],
     native_prices: dict[str, int],
     weth: str,
     *,

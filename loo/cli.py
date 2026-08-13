@@ -2,27 +2,26 @@
 
 Four subcommands:
 
-- `validate` (M1) reproduces the recorded competition over a date window and accounts for
+- `analyse` removes one or more solvers from a window's auctions, re-runs the
+  competition and reports what users and the protocol would have lost or saved.
+- `compare` aggregates several `analyse --out` reports into the per-solver
+  comparison table, with medians beside the sums and USD conversion.
+- `validate` reproduces the recorded competition over a date window and accounts for
   every difference. It is the gate the counterfactual rests on.
-- `validate-rewards` (M3) recomputes every solver's uncapped reward from the DB's own
+- `validate-rewards` recomputes every solver's uncapped reward from the DB's own
   inputs and compares against `fct_solver_rewards_per_auction`. No approximation is in
   its path, so it must match exactly.
-- `analyse` (M2+M3) removes one solver from those auctions, re-runs the competition and
-  reports what users and the protocol would have lost or saved.
-- `compare` (M4) aggregates several `analyse --out` reports into the per-solver
-  comparison table, with medians beside the sums and USD conversion.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import asdict
-from decimal import Decimal
-from typing import NamedTuple
 
-from . import aggregate, counterfactual, db, extract, rewards, validate
+from . import aggregate, counterfactual, db, extract, rewards, run, validate
 from .aggregate import cow_amount, eth, pct
 from .primitives import MAX_WINNERS, wrapped_native_token
 
@@ -67,13 +66,19 @@ def main(argv: list[str] | None = None) -> int:
     check_rewards.set_defaults(func=run_validate_rewards)
 
     analyse = sub.add_parser(
-        "analyse", help="remove one solver, re-run the competition, and diff the outcomes"
+        "analyse",
+        help="remove one or more solvers, re-run the competition, and diff the outcomes",
     )
     analyse.add_argument("--network", default="mainnet")
     analyse.add_argument(
         "--solver",
+        action="append",
         required=True,
-        help="solver name (as in dune_data__cow_protocol__solvers) or submission address",
+        help=(
+            "solver name (as in dune_data__cow_protocol__solvers) or submission "
+            "address; repeatable — every solver shares one extraction pass, so "
+            "analysing several costs barely more than one"
+        ),
     )
     analyse.add_argument("--start", required=True, help="inclusive, e.g. 2026-08-01")
     analyse.add_argument("--end", required=True, help="exclusive, e.g. 2026-08-02")
@@ -90,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "the settlement scenario: a replacement winner inherits the outcome of the "
             "slot it displaced (default), or every winner on both sides is assumed to "
-            "settle in time. See PLAN.md section 5"
+            "settle in time. See README.md, \"The outcome rule\""
         ),
     )
     analyse.add_argument(
@@ -104,7 +109,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     analyse.add_argument("--max-winners", type=int, default=MAX_WINNERS)
     analyse.add_argument("--limit", type=int, help="only the first N auctions in the window")
-    analyse.add_argument("--out", help="write the full report as JSON")
+    analyse.add_argument(
+        "--out",
+        help=(
+            "write the full report as JSON; a {solver} placeholder is substituted "
+            "with the solver's slug, and is required when several --solver are given"
+        ),
+    )
     analyse.add_argument(
         "--show", type=int, default=10, help="how many changed auctions to print"
     )
@@ -112,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
 
     compare = sub.add_parser(
         "compare",
-        help="aggregate analyse reports into the per-solver comparison table (M4)",
+        help="aggregate analyse reports into the per-solver comparison table",
     )
     compare.add_argument(
         "reports",
@@ -135,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
     return args.func(args)
 
 
-def run_validate(args) -> int:
+def run_validate(args: argparse.Namespace) -> int:
     weth = wrapped_native_token(args.network)
     conn = db.connect(args.network)
 
@@ -151,7 +162,7 @@ def run_validate(args) -> int:
         if not auction_ids:
             return 1
 
-        db_surplus = {}
+        db_surplus: dict[tuple[int, int, str], int] = {}
         if args.cross_check_surplus:
             db_surplus = extract.load_db_order_surplus(conn, auction_ids)
             print(f"{len(db_surplus)} DB surplus rows for cross-check", file=sys.stderr)
@@ -194,13 +205,13 @@ def run_validate(args) -> int:
         write_json(args.out, summary, surplus, missing_data)
         print(f"\nfull report written to {args.out}", file=sys.stderr)
 
-    # The M1 gate is that every difference has a named cause, not that there are no
-    # differences: the per-pair proxy of PLAN.md §2 is a known and accepted one.
+    # The gate is that every difference has a named cause, not that there are no
+    # differences: the per-pair surplus proxy is a known and accepted one.
     return 0 if not summary.unexplained else 2
 
 
-def run_validate_rewards(args) -> int:
-    """The M3 gate: recorded winning solutions + recorded settlement flags + recorded
+def run_validate_rewards(args: argparse.Namespace) -> int:
+    """The rewards gate: recorded winning solutions + settlement flags + recorded
     reference scores -> the reward formula -> compare with the dbt mart, row by row.
 
     Nothing in this path is approximated — the inputs are the mart's own — so unlike
@@ -231,9 +242,9 @@ def run_validate_rewards(args) -> int:
         conn.close()
 
     validation = rewards.RewardValidation()
-    try:
-        for auction_id in auction_ids:
-            auction_inputs = inputs.get(auction_id)
+    for auction_id in auction_ids:
+        auction_inputs = inputs.get(auction_id)
+        try:
             ours = (
                 rewards.uncapped_rewards(
                     auction_inputs.wins,
@@ -244,12 +255,12 @@ def run_validate_rewards(args) -> int:
                 if auction_inputs
                 else {}
             )
-            validation.check_auction(auction_id, ours, fct.get(auction_id, {}))
-    except rewards.MissingReferenceScoreError as error:
-        # A winner without a reference score means the inputs themselves are broken —
-        # comparing anything after that would attribute a data gap to the formula.
-        print(f"ERROR: auction {auction_id}: {error}", file=sys.stderr)
-        return 3
+        except rewards.MissingReferenceScoreError as error:
+            # A winner without a reference score means the inputs themselves are broken —
+            # comparing anything after that would attribute a data gap to the formula.
+            print(f"ERROR: auction {auction_id}: {error}", file=sys.stderr)
+            return 3
+        validation.check_auction(auction_id, ours, fct.get(auction_id, {}))
 
     report_reward_validation(validation, args)
 
@@ -264,7 +275,9 @@ def run_validate_rewards(args) -> int:
     return 0
 
 
-def report_reward_validation(validation: rewards.RewardValidation, args) -> None:
+def report_reward_validation(
+    validation: rewards.RewardValidation, args: argparse.Namespace
+) -> None:
     print(
         f"\n=== uncapped rewards vs fct_solver_rewards_per_auction: "
         f"{validation.auctions} auctions, {validation.auctions_with_winners} with winners ==="
@@ -282,7 +295,7 @@ def report_reward_validation(validation: rewards.RewardValidation, args) -> None
 
     if not validation.mismatches:
         if validation.gate_met:
-            print("\nevery row matches — M3 gate met.")
+            print("\nevery row matches — the rewards gate is met.")
         return
 
     fields: dict[str, int] = {}
@@ -290,7 +303,7 @@ def report_reward_validation(validation: rewards.RewardValidation, args) -> None
         for name in mismatch.differing_fields:
             fields[name] = fields.get(name, 0) + 1
     print(
-        f"\n{len(validation.mismatches)} rows disagree — M3 gate NOT met: "
+        f"\n{len(validation.mismatches)} rows disagree — the rewards gate is NOT met: "
         + ", ".join(f"{k}={v}" for k, v in sorted(fields.items()))
     )
     for mismatch in validation.mismatches[: args.show]:
@@ -325,7 +338,7 @@ def write_reward_validation_json(path: str, validation: rewards.RewardValidation
         json.dump(payload, handle, indent=2, default=str)
 
 
-def reward_as_json(reward) -> dict | None:
+def reward_as_json(reward: rewards.SolverReward | None) -> dict[str, str | None] | None:
     """A `SolverReward` as JSON-safe strings, keeping `None` a null rather than 'None'."""
     if reward is None:
         return None
@@ -334,167 +347,85 @@ def reward_as_json(reward) -> dict | None:
     }
 
 
-class CowConversion(NamedTuple):
-    """Δrewards converted native -> COW at each auction's accounting-period rate."""
-
-    cow_wei: Decimal
-    cow_wei_capped: Decimal
-    converted_native: int
-    """The part of the native uncapped delta the conversion covers."""
-    auctions_without_rate: int
-    native_without_rate: int
-    """Auctions whose accounting period has no snapshotted rate yet, and their native
-    delta — left unconverted rather than guessed at."""
+def report_path(template: str, solver: str) -> str:
+    """`--out` with the `{solver}` placeholder substituted by the solver's slug."""
+    slug = re.sub(r"[^a-z0-9]+", "-", solver.lower()).strip("-")
+    return template.replace("{solver}", slug)
 
 
-def convert_delta_rewards(conn, analysis: counterfactual.Analysis) -> CowConversion:
-    """Only auctions retained in `changed` can carry a non-zero reward delta: rewards
-    move only when the winner set or a reference score does, and both retain (D8)."""
-    moved = [
-        r
-        for r in analysis.changed
-        if r.delta_rewards or (r.delta_rewards_capped or 0) != 0
-    ]
-    rates = extract.load_conversion_rates(
-        conn, sorted({r.block_deadline for r in moved})
-    )
-    cow_wei, cow_wei_capped = Decimal(0), Decimal(0)
-    converted, missing, missing_native = 0, 0, 0
-    for result in moved:
-        rate = rates.get(result.block_deadline)
-        if rate:
-            cow_wei += Decimal(result.delta_rewards) / rate
-            if result.delta_rewards_capped is not None:
-                cow_wei_capped += result.delta_rewards_capped / rate
-            converted += result.delta_rewards
-        else:
-            missing += 1
-            missing_native += result.delta_rewards
-    return CowConversion(cow_wei, cow_wei_capped, converted, missing, missing_native)
+def run_analyse(args: argparse.Namespace) -> int:
+    if len(args.solver) > 1 and args.out and "{solver}" not in args.out:
+        print(
+            "ERROR: --out needs a {solver} placeholder when several solvers are "
+            "analysed, or each report would overwrite the last",
+            file=sys.stderr,
+        )
+        return 4
 
-
-def run_analyse(args) -> int:
-    weth = wrapped_native_token(args.network)
     conn = db.connect(args.network)
-
     try:
         try:
-            addresses, matches = extract.resolve_solver(
-                conn, args.solver, args.start, args.end
+            window = run.analyse_window(
+                conn,
+                args.solver,
+                args.start,
+                args.end,
+                network=args.network,
+                mode=args.mode,
+                outcome_rule=args.outcome_rule,
+                max_winners=args.max_winners,
+                include_price_suspects=args.include_price_suspects,
+                limit=args.limit,
+                log=lambda message: print(message, file=sys.stderr),
             )
         except extract.SolverResolutionError as error:
             print(f"ERROR: {error}", file=sys.stderr)
             return 4
-        for match in matches:
-            print(
-                f"solver {args.solver!r} -> {match.address}  {match.name} "
-                f"({match.environment}, active={match.active})  "
-                f"{match.solutions} solutions in {match.auctions_bid} auctions, "
-                f"{match.winning_solutions} winning",
-                file=sys.stderr,
-            )
-        if len(matches) > 1:
-            # A key rotation: the same competitor under two submission addresses. All of
-            # them have to go together, or reference scores would treat one half of the
-            # rotation as a rival of the other.
-            print(
-                f"note: {len(matches)} addresses resolved; removing all of them as one "
-                f"solver",
-                file=sys.stderr,
-            )
-
-        auction_ids = extract.auctions_in_window(conn, args.start, args.end)
-        if args.limit:
-            auction_ids = auction_ids[: args.limit]
-        print(
-            f"{len(auction_ids)} auctions in [{args.start}, {args.end}) on {args.network}",
-            file=sys.stderr,
-        )
-        if not auction_ids:
-            return 1
-
-        settled: dict[int, dict[int, extract.Settlement]] = {}
-        if args.outcome_rule != "assume-settled":
-            settled = extract.load_settlement_outcomes(conn, auction_ids)
-            print(
-                f"settlement outcomes for {sum(len(v) for v in settled.values())} "
-                f"winning solutions across {len(settled)} auctions",
-                file=sys.stderr,
-            )
-
-        caps: dict[int, dict[int, extract.SolutionCap]] = {}
-        if args.mode == "score":
-            caps = extract.load_solution_caps(conn, auction_ids)
-            print(
-                f"reward caps for {sum(len(v) for v in caps.values())} "
-                f"recorded winning solutions",
-                file=sys.stderr,
-            )
-
-        analysis = counterfactual.Analysis(
-            solver=args.solver,
-            addresses=addresses,
-            mode=args.mode,
-            outcome_rule=args.outcome_rule,
-            capped_estimate=args.mode == "score",
-            exclude_price_suspect=not args.include_price_suspects,
-        )
-        try:
-            for bundle in extract.load_auctions(
-                conn, auction_ids, missing_data=analysis.missing_data_auctions
-            ):
-                analysis.add(
-                    counterfactual.analyse_auction(
-                        bundle,
-                        weth,
-                        addresses,
-                        mode=args.mode,
-                        max_winners=args.max_winners,
-                        outcome_rule=args.outcome_rule,
-                        settled=settled.get(bundle.auction_id, {}),
-                        solution_caps=caps.get(bundle.auction_id, {}),
-                    )
-                )
         except counterfactual.MissingSettlementError as error:
             # The settlement source does not reach this window. Reporting a partial run
             # would understate baseline surplus in exactly the auctions it dropped.
             print(f"ERROR: {error}", file=sys.stderr)
             return 5
-
-        cow = None
-        if args.mode == "score":
-            cow = convert_delta_rewards(conn, analysis)
     finally:
         conn.close()
 
-    report_analysis(analysis, args, cow)
+    if not window.auction_ids:
+        return 1
 
-    if args.out:
-        write_analysis_json(args.out, analysis, args, cow)
-        print(f"\nfull report written to {args.out}", file=sys.stderr)
+    never_bid: list[str] = []
+    skipped = False
+    for solver_run in window.runs:
+        report_analysis(solver_run.analysis, args, solver_run.cow)
+        if args.out:
+            path = report_path(args.out, solver_run.solver)
+            run.write_report(path, window, solver_run)
+            print(f"\nfull report written to {path}", file=sys.stderr)
+        if not solver_run.analysis.auctions_with_solver:
+            never_bid.append(solver_run.solver)
+        skipped = skipped or bool(solver_run.analysis.auctions_skipped)
 
-    if not analysis.auctions_with_solver:
+    if never_bid:
         # `resolve_solver` checks the whole window, so `--limit` can still slice down to
         # auctions the solver never bid in. Every delta is then trivially zero, which reads
         # as "removing this solver costs users nothing" — the one misreading worth an exit
         # code. Checked here rather than at resolution time so it holds for any reason the
         # solver ends up absent.
         print(
-            f"\nERROR: {args.solver} did not bid in any of the "
-            f"{analysis.auctions} auctions analysed, so every delta above is trivially "
-            f"zero rather than a finding. Widen the window or drop --limit.",
+            f"\nERROR: {', '.join(never_bid)} did not bid in any of the "
+            f"{len(window.auction_ids)} auctions analysed, so every delta above is "
+            f"trivially zero rather than a finding. Widen the window or drop --limit.",
             file=sys.stderr,
         )
         return 4
 
     # A valuation failure means an auction could not be arbitrated at all, so its
-    # contribution to every number above is silently missing. M1 measured zero of them,
-    # so any at all is worth a non-zero exit rather than a line in the report.
-    return 2 if analysis.auctions_skipped else 0
+    # contribution to every number above is silently missing. Validation measured zero
+    # of them, so any at all is worth a non-zero exit rather than a line in the report.
+    return 2 if skipped else 0
 
 
-def run_compare(args) -> int:
-    """M4: the per-solver comparison table, from `analyse --out` files.
+def run_compare(args: argparse.Namespace) -> int:
+    """The per-solver comparison table, from `analyse --out` files.
 
     Pure post-processing of the reports; the only DB work is fetching the stablecoin
     prices behind the USD columns, and `--skip-usd` removes even that.
@@ -542,7 +473,7 @@ def run_compare(args) -> int:
     caveats = "\n".join(
         f"{i}. {caveat}" for i, caveat in enumerate(aggregate.CAVEATS, 1)
     )
-    output = f"{rendered}\n\ncaveats (PLAN.md section 7):\n{caveats}\n"
+    output = f"{rendered}\n\ncaveats:\n{caveats}\n"
     print(output)
     if args.out:
         with open(args.out, "w") as handle:
@@ -552,7 +483,9 @@ def run_compare(args) -> int:
 
 
 def report_analysis(
-    analysis: counterfactual.Analysis, args, cow: CowConversion | None = None
+    analysis: counterfactual.Analysis,
+    args: argparse.Namespace,
+    cow: run.CowConversion | None = None,
 ) -> None:
     total = analysis.auctions
     print(f"\n=== leave one out: {analysis.solver} ===")
@@ -658,7 +591,8 @@ def report_analysis(
         if cow is not None and cow.auctions_without_rate:
             print(
                 f"  COW conversion unavailable: {cow.auctions_without_rate} auctions "
-                f"({eth(cow.native_without_rate)} ETH of the delta) fall in an accounting "
+                f"({eth(cow.native_without_rate)} ETH uncapped, "
+                f"{eth(cow.capped_without_rate)} ETH capped) fall in an accounting "
                 f"period with no snapshotted rate yet"
                 + (
                     f"; the other {eth(cow.converted_native)} ETH converts to "
@@ -669,8 +603,8 @@ def report_analysis(
             )
     else:
         print(
-            "\nrewards not computed: M3 is score mode only, and this run ranked on "
-            "user surplus"
+            "\nrewards not computed: the reward formula's quantities are scores, and "
+            "this run ranked on user surplus"
         )
 
     print(f"\nuser orders compared          {analysis.orders_compared}")
@@ -714,7 +648,7 @@ def report_analysis(
     print(
         f"\nsolver helped set another solver's reference score in "
         f"{analysis.reference_influence} auction-solver pairs"
-        "  <- what moves in M3"
+        "  <- where its removal moves a reward"
     )
 
     if analysis.valuation_failures:
@@ -754,142 +688,7 @@ def print_counterfactual(result: counterfactual.AuctionCounterfactual) -> None:
         )
 
 
-def write_analysis_json(
-    path: str,
-    analysis: counterfactual.Analysis,
-    args,
-    cow: CowConversion | None = None,
-) -> None:
-    payload = {
-        "solver": analysis.solver,
-        "addresses": sorted(analysis.addresses),
-        "network": args.network,
-        "start": args.start,
-        "end": args.end,
-        "mode": analysis.mode,
-        "sign_convention": aggregate.SIGN_CONVENTION_ID,
-        "settlement": analysis.outcome_rule,
-        "outcome_rule": counterfactual.OUTCOME_RULE[analysis.outcome_rule],
-        "auctions": analysis.auctions,
-        "auctions_with_solver": analysis.auctions_with_solver,
-        "auctions_skipped": analysis.auctions_skipped,
-        "auctions_solver_won_baseline": analysis.auctions_solver_won_baseline,
-        "auctions_solver_won_db": analysis.auctions_solver_won_db,
-        "auctions_winner_set_changed": analysis.auctions_winner_set_changed,
-        "auctions_filter_relaxed": analysis.auctions_filter_relaxed,
-        "auctions_newly_kept_won": analysis.auctions_newly_kept_won,
-        "auctions_baseline_differs_from_db": analysis.auctions_baseline_differs_from_db,
-        "surplus_base_wei": str(analysis.surplus_base),
-        "surplus_loo_wei": str(analysis.surplus_loo),
-        "delta_surplus_wei": str(analysis.delta_surplus),
-        "rewards_uncapped": analysis.mode == "score",
-        "rewards_base_wei": str(analysis.rewards_base),
-        "rewards_loo_wei": str(analysis.rewards_loo),
-        "delta_rewards_wei": str(analysis.delta_rewards),
-        "removed_reward_base_wei": str(analysis.removed_reward_base),
-        "auctions_rewards_moved": analysis.auctions_rewards_moved,
-        "negative_rewards_base": analysis.negative_rewards_base,
-        "negative_rewards_loo": analysis.negative_rewards_loo,
-        "negative_reward_sum_base_wei": str(analysis.negative_reward_sum_base),
-        "negative_reward_sum_loo_wei": str(analysis.negative_reward_sum_loo),
-        "capped_estimate": analysis.capped_estimate,
-        "rewards_base_capped_wei": str(analysis.rewards_base_capped),
-        "rewards_loo_capped_wei": str(analysis.rewards_loo_capped),
-        "delta_rewards_capped_wei": str(analysis.delta_rewards_capped),
-        "auctions_capped": analysis.auctions_capped,
-        "auctions_capped_skipped": analysis.auctions_capped_skipped,
-        "cap_double_inherited": analysis.cap_double_inherited,
-        "cap_orphans": analysis.cap_orphans,
-        "price_suspects_excluded": analysis.exclude_price_suspect,
-        "price_suspect_auctions": analysis.price_suspect_auctions,
-        "missing_data_auctions": analysis.missing_data_auctions,
-        "delta_rewards_cow_wei": str(cow.cow_wei) if cow is not None else None,
-        "delta_rewards_capped_cow_wei": (
-            str(cow.cow_wei_capped) if cow is not None else None
-        ),
-        "cow_converted_native_wei": str(cow.converted_native) if cow is not None else None,
-        "cow_auctions_without_rate": (
-            cow.auctions_without_rate if cow is not None else None
-        ),
-        "cow_native_without_rate_wei": (
-            str(cow.native_without_rate) if cow is not None else None
-        ),
-        "orders_compared": analysis.orders_compared,
-        "orders_only_with_solver": analysis.orders_only_with_solver,
-        "orders_only_without_solver": analysis.orders_only_without_solver,
-        "orders_unsettled_base": analysis.orders_unsettled_base,
-        "orders_lost_to_lateness": analysis.orders_lost_to_lateness,
-        "jit_orders_only_with_solver": analysis.jit_orders_only_with_solver,
-        "jit_orders_only_without_solver": analysis.jit_orders_only_without_solver,
-        "replacements_base": analysis.replacements_base,
-        "replacements_loo": analysis.replacements_loo,
-        "inherited_reverts_loo": analysis.inherited_reverts_loo,
-        "orphans_base": analysis.orphans_base,
-        "orphans_loo": analysis.orphans_loo,
-        "reference_influence": analysis.reference_influence,
-        "valuation_failures": analysis.valuation_failures,
-        "changed": [
-            {
-                "auction_id": r.auction_id,
-                "n_solutions": r.n_solutions,
-                "delta_surplus_wei": str(r.delta_surplus),
-                "solver_won_baseline": r.solver_won_baseline,
-                "solver_won_db": r.solver_won_db,
-                "baseline_winner_uids": sorted(r.baseline_winner_uids),
-                "loo_winner_uids": sorted(r.loo_winner_uids),
-                "baseline_winning_total": str(r.baseline_winning_total),
-                "loo_winning_total": str(r.loo_winning_total),
-                "baseline_reference_scores": {
-                    k: str(v) for k, v in r.baseline_reference_scores.items()
-                },
-                "loo_reference_scores": {
-                    k: str(v) for k, v in r.loo_reference_scores.items()
-                },
-                "delta_rewards_wei": str(r.delta_rewards),
-                "delta_rewards_capped_wei": (
-                    str(r.delta_rewards_capped)
-                    if r.delta_rewards_capped is not None
-                    else None
-                ),
-                "baseline_rewards": {
-                    solver: reward_as_json(reward)
-                    for solver, reward in r.baseline_rewards.items()
-                },
-                "loo_rewards": {
-                    solver: reward_as_json(reward)
-                    for solver, reward in r.loo_rewards.items()
-                },
-                "cap_double_inherited": r.cap_double_inherited,
-                "cap_orphans_loo": sorted(r.cap_orphans_loo),
-                "price_suspect_uids": sorted(r.price_suspect_uids),
-                "solver_set_reference_for": sorted(r.solver_set_reference_for),
-                "un_filtered_uids": sorted(r.un_filtered_uids),
-                "un_filtered_winner_uids": sorted(r.un_filtered_winner_uids),
-                "replacements_base": sorted(r.replacements_base),
-                "replacements_loo": sorted(r.replacements_loo),
-                "inherited_reverts_loo": sorted(r.inherited_reverts_loo),
-                "orphans_base": sorted(r.orphans_base),
-                "orphans_loo": sorted(r.orphans_loo),
-                "baseline_matches_db": r.baseline_matches_db,
-                "order_diffs": [
-                    {
-                        **{
-                            k: (str(v) if isinstance(v, int) and k.startswith("surplus") else v)
-                            for k, v in asdict(d).items()
-                        },
-                        "delta_surplus_wei": str(d.delta_surplus),
-                    }
-                    for d in r.order_diffs
-                ],
-            }
-            for r in analysis.changed
-        ],
-    }
-    with open(path, "w") as handle:
-        json.dump(payload, handle, indent=2, default=str)
-
-
-def report_summary(summary: validate.Summary, args) -> None:
+def report_summary(summary: validate.Summary, args: argparse.Namespace) -> None:
     total = summary.auctions
     print(f"\n=== {total} auctions, {summary.solutions} solutions ===")
     print(f"winner set matches:         {summary.auctions_winners_match}/{total}")
@@ -931,7 +730,7 @@ def report_summary(summary: validate.Summary, args) -> None:
         )
 
     if summary.unexplained:
-        print(f"\nUNEXPLAINED in {len(summary.unexplained)} auctions — M1 gate not met:")
+        print(f"\nUNEXPLAINED in {len(summary.unexplained)} auctions — the validation gate is NOT met:")
         reasons: dict[str, int] = {}
         for _, reason in summary.unexplained:
             reasons[reason] = reasons.get(reason, 0) + 1
@@ -939,7 +738,7 @@ def report_summary(summary: validate.Summary, args) -> None:
             examples = [a for a, r in summary.unexplained if r == reason][:5]
             print(f"    {reason}: {count}  e.g. {examples}")
     else:
-        print("\nevery difference has a named cause — M1 gate met.")
+        print("\nevery difference has a named cause — the validation gate is met.")
 
     if summary.mismatched:
         print(f"\n--- first {min(args.show, len(summary.mismatched))} ---")
@@ -947,8 +746,7 @@ def report_summary(summary: validate.Summary, args) -> None:
             print_report(report)
 
 
-def print_report(report) -> None:
-    db_only, ours_only = report.swapped
+def print_report(report: validate.AuctionReport) -> None:
     print(
         f"\nauction {report.auction_id}  {report.disagreement}  "
         f"{report.n_solutions} solutions  "
@@ -1002,7 +800,7 @@ def report_surplus(surplus: validate.SurplusCrossCheck) -> None:
 
 def write_json(
     path: str,
-    summary,
+    summary: validate.Summary,
     surplus: validate.SurplusCrossCheck,
     missing_data: list[int] | None = None,
 ) -> None:

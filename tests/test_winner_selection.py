@@ -5,6 +5,7 @@ Each test names the behaviour in `arbitrator.rs` it pins down.
 
 from __future__ import annotations
 
+from loo.primitives import Pair
 from loo.winner_selection import (
     Solution,
     arbitrate,
@@ -24,10 +25,12 @@ def solution(
     solver: str,
     uid: int,
     total: int,
-    pair_values: dict | None = None,
-    winner_pairs: frozenset | None = None,
+    pair_values: dict[Pair, int] | None = None,
+    winner_pairs: frozenset[Pair] | None = None,
 ) -> Solution:
-    values = pair_values if pair_values is not None else {WETH_USDC: total}
+    values: dict[Pair, int] = (
+        pair_values if pair_values is not None else {WETH_USDC: total}
+    )
     return Solution(
         solver=solver,
         solution_uid=uid,
@@ -104,7 +107,7 @@ class TestFairness:
         assert is_fair(weak, {WETH_USDC: 1000})
 
     def test_multi_pair_must_beat_every_baseline(self):
-        baselines = {WETH_USDC: 50, DAI_USDC: 50}
+        baselines: dict[Pair, int] = {WETH_USDC: 50, DAI_USDC: 50}
         assert is_fair(solution("a", 0, 120, {WETH_USDC: 60, DAI_USDC: 60}), baselines)
         assert not is_fair(solution("b", 1, 100, {WETH_USDC: 60, DAI_USDC: 40}), baselines)
 
