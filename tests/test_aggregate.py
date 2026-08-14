@@ -39,14 +39,39 @@ from loo.primitives import usd_per_native
 ONE = 10**18
 
 
-def move(
-    auction_id: int, surplus: int, rewards: int = 0, capped: str | None = "0"
+def diff(
+    surplus_base: int | None,
+    surplus_loo: int | None,
+    *,
+    contributes: bool = True,
 ) -> dict[str, Any]:
+    """One serialized order diff; a `None` surplus is an unexecuted side."""
+    return {
+        "contributes": contributes,
+        "executed_base": surplus_base is not None,
+        "executed_loo": surplus_loo is not None,
+        "surplus_base": surplus_base,
+        "surplus_loo": surplus_loo,
+    }
+
+
+def move(
+    auction_id: int,
+    surplus: int,
+    rewards: int = 0,
+    capped: str | None = "0",
+    order_diffs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if order_diffs is None:
+        # Executed on both sides by default: the delta is price movement, so the
+        # coverage slice stays zero unless a test asks for an only-with diff.
+        order_diffs = [diff(max(-surplus, 0), max(surplus, 0))] if surplus else []
     return {
         "auction_id": auction_id,
         "delta_surplus": surplus,
         "delta_rewards": rewards,
         "delta_rewards_capped": capped,
+        "order_diffs": order_diffs,
     }
 
 
@@ -100,7 +125,12 @@ def payload(
             "capped_without_rate": "0",
         },
         "orders_compared": 500,
-        "orders_only_with_solver": 40,
+        "orders_only_with_solver": sum(
+            1
+            for m in changed
+            for d in m["order_diffs"]
+            if d["contributes"] and d["executed_base"] and not d["executed_loo"]
+        ),
         "orders_only_without_solver": 3,
         "changed": changed,
     }
@@ -188,6 +218,40 @@ class TestLoadReport:
         path = write_report(tmp_path, "r.json", data)
 
         with pytest.raises(ValueError, match="delta_surplus"):
+            load_report(path)
+
+    def test_derives_only_with_surplus_from_the_order_diffs(self, tmp_path: Path):
+        changed = [
+            # One order lost outright, one re-executed at a worse price, and a JIT
+            # (non-contributing) order lost alongside — only the first is coverage.
+            move(
+                7,
+                -3 * ONE,
+                order_diffs=[
+                    diff(2 * ONE, None),
+                    diff(2 * ONE, ONE),
+                    diff(5 * ONE, None, contributes=False),
+                ],
+            ),
+            move(8, ONE),
+        ]
+        path = write_report(tmp_path, "r.json", payload(changed=changed))
+
+        report = load_report(path)
+
+        assert report.orders_only_with_solver == 1
+        assert report.delta_surplus_only_with == -2 * ONE
+        assert report.moves[0].delta_surplus_only_with == -2 * ONE
+        assert report.moves[1].delta_surplus_only_with == 0
+
+    def test_rejects_an_only_with_count_the_diffs_do_not_hold(self, tmp_path: Path):
+        """`delta_surplus_only_with` is complete only if every only-with order lives in
+        a changed auction; a count disagreement means order diffs are missing."""
+        data = payload()
+        data["orders_only_with_solver"] += 1
+        path = write_report(tmp_path, "r.json", data)
+
+        with pytest.raises(ValueError, match="orders_only_with_solver"):
             load_report(path)
 
     def test_rejects_a_report_from_the_old_sign_convention(self, tmp_path: Path):
@@ -308,7 +372,14 @@ class TestComparison:
                 write_report(
                     tmp_path,
                     "fi.json",
-                    payload(changed=[move(1, ONE, 2 * ONE, str(ONE)), move(2, -ONE // 2)]),
+                    payload(
+                        changed=[
+                            move(1, ONE, 2 * ONE, str(ONE)),
+                            # Auction 2's loss is an order that only trades with the
+                            # solver, so it is coverage rather than a worse price.
+                            move(2, -ONE // 2, order_diffs=[diff(ONE // 2, None)]),
+                        ]
+                    ),
                 )
             ),
             load_report(
@@ -337,8 +408,10 @@ class TestComparison:
         assert "over 2 auctions" in rows["  median non-zero auction"][fractal]
         assert "auction 1" in rows["  largest single auction"][fractal]
         assert rows["orders executed only with the solver"][fractal].startswith(
-            "40 (8.0% of 500"
+            "1 (0.2% of 500"
         )
+        assert rows["  Δsurplus from those orders"][fractal] == "-0.5000 ETH"
+        assert rows["  Δsurplus from those orders"][sector] == "0.0000 ETH"
 
     def test_missing_data_exclusions_widen_the_window_total(self, tmp_path: Path):
         reports = [
@@ -374,6 +447,8 @@ class TestComparison:
         fractal = list(table.columns).index("Fractal")
         # +1 ETH at 2000 and −0.5 ETH at 1000 → $1,500.
         assert rows["Δsurplus (inherited)"][fractal] == "+0.5000 ETH ($1,500.00)"
+        # The coverage slice converts at its own auction's rate too.
+        assert rows["  Δsurplus from those orders"][fractal] == "-0.5000 ETH (-$500.00)"
         # Sector's single move is auction 1 at its own rate.
         sector = list(table.columns).index("Sector")
         assert rows["Δsurplus (inherited)"][sector] == "+1.0000 ETH ($2,000.00)"
@@ -490,6 +565,14 @@ class TestReportRoundTrip:
                     surplus_base=100,
                     surplus_loo=40,
                 ),
+                OrderDiff(
+                    order_uid="cd",
+                    contributes=True,
+                    executed_base=True,
+                    executed_loo=False,
+                    surplus_base=40,
+                    surplus_loo=None,
+                ),
             ),
             baseline_rewards={
                 "s1": SolverReward(
@@ -532,13 +615,16 @@ class TestReportRoundTrip:
 
         assert report.solver == "TestSolver"
         assert report.outcome_rule == "inherited"
-        assert report.delta_surplus == -60
+        assert report.delta_surplus == -100
         assert report.delta_rewards == -5
         assert report.delta_rewards_capped == Decimal(-3)
         assert report.delta_rewards_cow == Decimal(1)
         assert report.delta_rewards_capped_cow == Decimal(2)
         assert [m.auction_id for m in report.moves] == [7]
         assert report.moves[0].delta_rewards_capped == Decimal(-3)
+        assert report.orders_only_with_solver == 1
+        assert report.delta_surplus_only_with == -40
+        assert report.moves[0].delta_surplus_only_with == -40
 
 
 def test_caveats_cover_the_plan_list():

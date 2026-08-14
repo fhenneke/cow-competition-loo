@@ -30,6 +30,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, getcontext
 from statistics import median
+from typing import Any
 
 # Capped rewards arrive as ~40-digit Decimal strings and are summed over thousands of
 # auctions; Python's default 28-digit context silently rounds those sums, which the
@@ -106,6 +107,10 @@ class AuctionMove:
 
     auction_id: int
     delta_surplus: int
+    delta_surplus_only_with: int
+    """The part of `delta_surplus` from orders executed only with the solver — orders
+    that do not trade at all on the LOO side, so the whole of their surplus is lost
+    rather than moved to a worse price."""
     delta_rewards: int
     delta_rewards_capped: Decimal | None
 
@@ -147,6 +152,12 @@ class Report:
     orders_compared: int
     orders_only_with_solver: int
     orders_only_without_solver: int
+    delta_surplus_only_with: int
+    """The part of `delta_surplus` from the `orders_only_with_solver` orders — the
+    coverage slice. Without the solver these orders do not trade at all, so users lose
+    their surplus but are not handed a worse price; the rest of `delta_surplus` is
+    price movement on orders that still trade. Derived from the changed auctions'
+    order diffs at load time, so stored reports carry it without a re-run."""
     moves: tuple[AuctionMove, ...]
 
     @property
@@ -159,6 +170,20 @@ class Report:
     @property
     def window(self) -> tuple[str, str, str, str]:
         return (self.network, self.start, self.end, self.mode)
+
+
+def _only_with_surplus(order_diffs: Sequence[Mapping[str, Any]]) -> int:
+    """One changed auction's Δsurplus over its orders executed only with the solver.
+
+    The same per-order delta the pipeline sums into `delta_surplus`, restricted to
+    contributing orders with `executed_base and not executed_loo` — the predicate
+    behind the `orders_only_with_solver` count. An unexecuted side has no surplus, so
+    each term is minus the order's baseline surplus."""
+    return sum(
+        (diff["surplus_loo"] or 0) - (diff["surplus_base"] or 0)
+        for diff in order_diffs
+        if diff["contributes"] and diff["executed_base"] and not diff["executed_loo"]
+    )
 
 
 def load_report(path: str) -> Report:
@@ -194,6 +219,7 @@ def load_report(path: str) -> Report:
         AuctionMove(
             auction_id=row["auction_id"],
             delta_surplus=row["delta_surplus"],
+            delta_surplus_only_with=_only_with_surplus(row["order_diffs"]),
             delta_rewards=row["delta_rewards"],
             delta_rewards_capped=(
                 Decimal(row["delta_rewards_capped"])
@@ -240,8 +266,26 @@ def load_report(path: str) -> Report:
         orders_compared=payload["orders_compared"],
         orders_only_with_solver=payload["orders_only_with_solver"],
         orders_only_without_solver=payload["orders_only_without_solver"],
+        delta_surplus_only_with=sum(m.delta_surplus_only_with for m in moves),
         moves=moves,
     )
+
+    # An order executed only with the solver implies its winning solution changed, so
+    # every such order lives in a `changed` auction and the count re-derived there must
+    # equal the report's own total — the completeness assumption `delta_surplus_only_with`
+    # rests on.
+    only_with = sum(
+        1
+        for row in payload["changed"]
+        for diff in row["order_diffs"]
+        if diff["contributes"] and diff["executed_base"] and not diff["executed_loo"]
+    )
+    if only_with != report.orders_only_with_solver:
+        raise ValueError(
+            f"{path}: orders_only_with_solver is {report.orders_only_with_solver} but "
+            f"the changed auctions' order diffs hold {only_with}; the file is "
+            f"truncated, edited, or from an incompatible analyse version"
+        )
 
     checks: list[tuple[str, int | Decimal, int | Decimal]] = [
         ("delta_surplus", report.delta_surplus, sum(m.delta_surplus for m in moves))
@@ -487,6 +531,7 @@ def comparison(
     rewards_capped = row("Δrewards capped (estimate)")
     net = row("net change (Δsurplus − capped Δrewards)")
     saved = row("orders executed only with the solver")
+    saved_surplus = row("  Δsurplus from those orders")
     only_without = row("orders executed only without")
     affected = row("auctions where anything moved")
     relaxed = row("fairness filter relaxed")
@@ -553,6 +598,13 @@ def comparison(
             f"({pct(report.orders_only_with_solver, report.orders_compared)} "
             f"of {report.orders_compared:,} compared)"
         )
+        saved_cell = f"{signed_eth(report.delta_surplus_only_with)} ETH"
+        if usd:
+            only_with_deltas = {
+                m.auction_id: m.delta_surplus_only_with for m in report.moves
+            }
+            saved_cell += f" ({usd_amount(usd_total(only_with_deltas, usd))})"
+        saved_surplus.append(saved_cell)
         only_without.append(f"{report.orders_only_without_solver:,}")
         affected.append(f"{len(report.moves):,}")
         relaxed.append(
