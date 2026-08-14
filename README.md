@@ -25,8 +25,7 @@ minutes.
 **Signs:** every delta is **counterfactual − actual** (without-solver minus
 with-solver), so the numbers read directly as what the removal scenario changes:
 negative Δsurplus means users would have received less, positive Δrewards means the
-protocol would have paid more. How a change is turned into a *value of the solver* is
-deliberately left to the reader. The tables state this convention with the numbers.
+protocol would have paid more. The tables state this convention with the numbers.
 
 **1. The counterfactual**, once per outcome rule. `--solver` is repeatable and every
 solver shares one extraction pass — extraction is nearly all of the run time, so

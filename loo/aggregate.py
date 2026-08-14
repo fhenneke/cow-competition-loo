@@ -58,35 +58,43 @@ sign silently inverted."""
 SIGN_CONVENTION = (
     "every delta is counterfactual minus actual — negative Δsurplus means users would "
     "have received less without the solver, positive Δrewards means the protocol would "
-    "have paid more. Deltas describe the removal scenario; turning them into a value "
-    "of the solver is the reader's step"
+    "have paid more"
 )
 """Stated on every rendering rather than assumed: the same numbers under the equally
 sensible with-minus-without convention would flip every sign."""
 
 CAVEATS = (
-    "No behavioural response: rivals' bids are held fixed, and "
-    "max_solutions_per_solver is applied before arbitration, so no suppressed rival "
-    "solution can step in.",
-    "Settlement risk: the headline attaches settlement to the slot (`inherited`), the "
-    "one scenario grounded in the record; `assume-settled` is the everything-lands "
-    "reading. 14.9% of winners never settled and they carry 50.2% of winning score, "
-    "so the rule is first-order, not a footnote.",
-    "Filter proxy: the fairness filter is fed per-pair surplus, measured against the "
-    "recorded filter at 7 differences in 7,745 auctions "
+    "No behavioural response: the remaining solvers' bids are held fixed, so nothing "
+    "is claimed about how they would bid if the removed solver actually left. The "
+    "competition's cap on solutions per solver is also applied before winners are "
+    "picked, so a rival solution suppressed by that cap cannot step in either.",
+    "Settlement risk: winning an auction does not guarantee the batch lands on-chain, "
+    "so the counterfactual must assume something about settlement. The headline rule "
+    "(`inherited`) keeps each auction slot's recorded outcome — a batch that actually "
+    "reverted stays reverted whoever wins it; the alternative (`assume-settled`) "
+    "assumes every winner lands in time. The choice is first-order: on the mainnet "
+    "calibration window, 14.9% of winners never settled in time and they carried "
+    "50.2% of winning score.",
+    "Filter proxy: the competition's fairness filter is re-run on per-token-pair user "
+    "surplus, because per-pair scores are not recorded. Measured against the recorded "
+    "filter this changes 7 decisions in 7,745 auctions "
     "(docs/winner-selection.md#the-filter-runs-on-surplus).",
     "Quote rewards are excluded: no data on counterfactual quoting.",
-    "Two reward figures: uncapped is exact accounting but not a payout; capped is the "
-    "payout answer but an estimate (a replacement inherits the displaced slot's cap). "
-    "The net-change row nets against the figure named in its label.",
+    "Two reward figures: uncapped is the mechanism's exact accounting but not what is "
+    "paid out; capped is at payout scale but an estimate (a replacement winner "
+    "inherits the reward cap of the slot it takes). The net-change row nets against "
+    "the figure named in its label.",
     "Price-suspect auctions are excluded from every statistic and counted in the "
-    "table; they carried 82% of Sector's pre-exclusion Δsurplus (D14).",
+    "table: native token prices in the auction data are occasionally wrong by orders "
+    "of magnitude, and one such fabricated price once supplied 82% of a solver's "
+    "headline (docs/analytics-db.md#native-prices-can-be-plain-wrong).",
     "Auctions with a traded order recorded in neither order table are excluded and "
-    "counted in the table (D17): jit_orders only records settled batches, so an "
-    "unsettled solution's JIT legs are unrecoverable. The exclusions are not random — "
-    "they are JIT-heavy and reverted-winner auctions.",
+    "counted in the table: solver-provided (JIT) orders are only recorded for settled "
+    "batches, so an unsettled solution's JIT orders are unrecoverable and its auction "
+    "cannot be replayed faithfully. The exclusions are not random — they are "
+    "JIT-heavy and reverted-winner auctions.",
     "USD figures are display-only conversions at each auction's own stablecoin-implied "
-    "rate; they inherit every caveat of the ETH figure they restate.",
+    "rate; they inherit every caveat of the native-token figure they restate.",
 )
 """Rendered with every comparison — the numbers are not supposed to travel without
 them. The rationale behind each lives in PLAN.md's decision table and docs/."""
@@ -606,7 +614,7 @@ def _net_cell(report: Report, usd: UsdContext | None) -> str:
 def _report_warnings(window: SolverWindow, usd: UsdContext | None) -> list[str]:
     warnings: list[str] = []
     for report in window.by_rule.values():
-        label = f"{report.solver} ({report.outcome_rule})"
+        label = f"{report.solver} ({report.network}, {report.outcome_rule})"
         if not report.price_suspects_excluded and report.price_suspects:
             warnings.append(
                 f"{label}: ran with --include-price-suspects, so "
