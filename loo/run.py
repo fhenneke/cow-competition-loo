@@ -12,14 +12,20 @@ auctions: analysing five solvers costs one extraction, not five.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from decimal import Decimal
 from typing import Any, NamedTuple, cast
 
 from . import extract
 from .aggregate import REPORT_FORMAT, SIGN_CONVENTION_ID
-from .counterfactual import OUTCOME_RULE, Analysis, OutcomeRule, analyse_auction
+from .counterfactual import (
+    OUTCOME_RULE,
+    Analysis,
+    AuctionCounterfactual,
+    OutcomeRule,
+    analyse_auction,
+)
 from .db import Connection
 from .primitives import MAX_WINNERS, wrapped_native_token
 from .valuation import Mode
@@ -39,17 +45,25 @@ class CowConversion(NamedTuple):
     uncapped and capped delta they carry — left unconverted rather than guessed at."""
 
 
-def convert_delta_rewards(conn: Connection, analysis: Analysis) -> CowConversion:
+def moved_auctions(analysis: Analysis) -> list[AuctionCounterfactual]:
     """Only auctions retained in `changed` can carry a non-zero reward delta: rewards
     move only when the winner set or a reference score does, and both retain (D8)."""
-    moved = [
+    return [
         r
         for r in analysis.changed
         if r.delta_rewards or (r.delta_rewards_capped or 0) != 0
     ]
-    rates = extract.load_conversion_rates(
-        conn, sorted({r.block_deadline for r in moved})
-    )
+
+
+def convert_delta_rewards(
+    analysis: Analysis, rates: Mapping[int, Decimal | None]
+) -> CowConversion:
+    """Convert one run's reward deltas at each auction's accounting-period rate.
+
+    `rates` maps block deadlines to rates and is loaded once per window for all runs
+    (`load_conversion_rates`), not per run: the rates table is expensive to touch and
+    identical across solvers and outcome rules."""
+    moved = moved_auctions(analysis)
     cow_wei, cow_wei_capped = Decimal(0), Decimal(0)
     converted, missing, missing_native = 0, 0, 0
     missing_capped = Decimal(0)
@@ -106,7 +120,7 @@ def analyse_window(
     *,
     network: str = "mainnet",
     mode: Mode = "score",
-    outcome_rule: OutcomeRule = "inherited",
+    outcome_rules: Sequence[OutcomeRule] = ("inherited",),
     max_winners: int = MAX_WINNERS,
     include_price_suspects: bool = False,
     limit: int | None = None,
@@ -114,18 +128,25 @@ def analyse_window(
 ) -> WindowAnalysis:
     """Remove each solver from every auction in `[start, end)` and diff the outcomes.
 
-    One extraction serves every solver: the auction bundles are solver-independent, so
-    each is arbitrated once per solver as it streams past. Solvers are resolved before
-    anything is extracted — a bad `--solver` fails in seconds, not after five minutes.
+    One extraction serves every solver **and every outcome rule**: the auction bundles
+    are solver- and rule-independent, so each is arbitrated once per (solver, rule) as
+    it streams past. Extraction is nearly all of a run's cost, so asking for the second
+    rule costs minutes of arbitration, not a second pass over the DB. Solvers are
+    resolved before anything is extracted — a bad `--solver` fails in seconds, not
+    after five minutes.
 
     Raises `extract.SolverResolutionError` when a solver does not resolve to exactly
     one competitor that bid in the window, and `counterfactual.MissingSettlementError`
     when the settlement source does not cover the window under the `inherited` rule.
     """
+    if not outcome_rules:
+        raise ValueError("outcome_rules must name at least one rule")
+    if len(set(outcome_rules)) != len(outcome_rules):
+        raise ValueError(f"duplicate outcome rules: {list(outcome_rules)}")
     emit: Callable[[str], None] = log or (lambda message: None)
     weth = wrapped_native_token(network)
 
-    runs: list[SolverRun] = []
+    resolved: list[tuple[str, frozenset[str], list[extract.SolverMatch]]] = []
     for solver in solvers:
         addresses, matches = extract.resolve_solver(conn, solver, start, end)
         for match in matches:
@@ -143,27 +164,31 @@ def analyse_window(
                 f"note: {len(matches)} addresses resolved; removing all of them as one "
                 f"solver"
             )
-        for earlier in runs:
-            if earlier.addresses & addresses:
+        for earlier_solver, earlier_addresses, _ in resolved:
+            if earlier_addresses & addresses:
                 raise extract.SolverResolutionError(
-                    f"{solver!r} and {earlier.solver!r} resolve to the same competitor "
+                    f"{solver!r} and {earlier_solver!r} resolve to the same competitor "
                     f"(shared address); give each solver once"
                 )
-        runs.append(
-            SolverRun(
+        resolved.append((solver, addresses, matches))
+
+    runs = [
+        SolverRun(
+            solver=solver,
+            addresses=addresses,
+            matches=matches,
+            analysis=Analysis(
                 solver=solver,
                 addresses=addresses,
-                matches=matches,
-                analysis=Analysis(
-                    solver=solver,
-                    addresses=addresses,
-                    mode=mode,
-                    outcome_rule=outcome_rule,
-                    capped_estimate=mode == "score",
-                    exclude_price_suspect=not include_price_suspects,
-                ),
-            )
+                mode=mode,
+                outcome_rule=rule,
+                capped_estimate=mode == "score",
+                exclude_price_suspect=not include_price_suspects,
+            ),
         )
+        for solver, addresses, matches in resolved
+        for rule in outcome_rules
+    ]
 
     auction_ids = extract.auctions_in_window(conn, start, end)
     if limit:
@@ -181,7 +206,7 @@ def analyse_window(
         return window
 
     settled: dict[int, dict[int, extract.Settlement]] = {}
-    if outcome_rule != "assume-settled":
+    if any(rule != "assume-settled" for rule in outcome_rules):
         settled = extract.load_settlement_outcomes(conn, auction_ids)
         emit(
             f"settlement outcomes for {sum(len(v) for v in settled.values())} "
@@ -207,7 +232,7 @@ def analyse_window(
                     run.addresses,
                     mode=mode,
                     max_winners=max_winners,
-                    outcome_rule=outcome_rule,
+                    outcome_rule=run.analysis.outcome_rule,
                     settled=settled.get(bundle.auction_id, {}),
                     solution_caps=caps.get(bundle.auction_id, {}),
                 )
@@ -216,8 +241,23 @@ def analyse_window(
     for run in runs:
         # The exclusion is a property of the window, not of the solver being removed.
         run.analysis.missing_data_auctions = list(window.missing_data)
-        if mode == "score":
-            run.cow = convert_delta_rewards(conn, run.analysis)
+
+    if mode == "score":
+        # One rate query for every run together: the rates are identical across
+        # solvers and rules, and the table behind them must be touched sparingly
+        # (see CONVERSION_RATES_SQL).
+        rates = extract.load_conversion_rates(
+            conn,
+            sorted(
+                {
+                    r.block_deadline
+                    for run in runs
+                    for r in moved_auctions(run.analysis)
+                }
+            ),
+        )
+        for run in runs:
+            run.cow = convert_delta_rewards(run.analysis, rates)
 
     return window
 

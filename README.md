@@ -27,22 +27,21 @@ with-solver), so the numbers read directly as what the removal scenario changes:
 negative Δsurplus means users would have received less, positive Δrewards means the
 protocol would have paid more. The tables state this convention with the numbers.
 
-**1. The counterfactual**, once per outcome rule. `--solver` is repeatable and every
-solver shares one extraction pass — extraction is nearly all of the run time, so
-analysing five solvers costs barely more than one. Only `inherited` is required;
-`assume-settled` is the optional everything-lands-in-time scenario (what the rules
-mean: [below](#the-outcome-rule)):
+**1. The counterfactual**, one invocation. `--solver` and `--outcome-rule` are both
+repeatable and everything shares one extraction pass — extraction is nearly all of the
+run time, so analysing five solvers under both rules costs barely more than one solver
+under one. Only `inherited` is required; `assume-settled` is the optional
+everything-lands-in-time scenario (what the rules mean: [below](#the-outcome-rule)):
 
 ```bash
-for rule in inherited assume-settled; do
-  uv run loo analyse --solver Fractal --solver Sector \
-      --start 2026-08-01 --end 2026-08-04 \
-      --outcome-rule "$rule" --out "out/{solver}-$rule.json"
-done
+uv run loo analyse --solver Fractal --solver Sector \
+    --start 2026-08-01 --end 2026-08-04 \
+    --outcome-rule inherited --outcome-rule assume-settled \
+    --out "out/{solver}-{rule}.json"
 ```
 
-The `{solver}` placeholder in `--out` becomes each solver's slug; it is required when
-several solvers are given.
+The `{solver}` placeholder in `--out` becomes each solver's slug and `{rule}` the
+outcome rule; each is required when several of its values are given.
 
 **2. The comparison table** — seconds, it only reads the JSONs (plus one DB query for
 the USD columns):
@@ -82,10 +81,10 @@ own report.
 
 | flag | |
 | --- | --- |
-| `--outcome-rule` | `inherited` (default) or `assume-settled` — see below |
+| `--outcome-rule` | `inherited` (default) or `assume-settled`, repeatable — all rules share the extraction pass; see below |
 | `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus |
 | `--limit N` | only the first N auctions — start here |
-| `--out report.json` | per-auction records, including both sides' reference scores and rewards; `{solver}` in the path becomes each solver's slug |
+| `--out report.json` | per-auction records, including both sides' reference scores and rewards; `{solver}` in the path becomes each solver's slug, `{rule}` the outcome rule |
 
 Exit code is 0 normally, 1 if the window has no auctions, 2 if any auction could not be
 valued, 4 if a `--solver` did not resolve (or the flags are inconsistent), 5 if the

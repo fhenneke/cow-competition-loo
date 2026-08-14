@@ -20,6 +20,7 @@ import json
 import re
 import sys
 from dataclasses import asdict
+from typing import cast
 
 from . import aggregate, counterfactual, db, extract, rewards, run, validate
 from .aggregate import cow_amount, eth, pct
@@ -91,11 +92,14 @@ def main(argv: list[str] | None = None) -> int:
     analyse.add_argument(
         "--outcome-rule",
         choices=("inherited", "assume-settled"),
-        default="inherited",
+        action="append",
+        dest="outcome_rules",
         help=(
             "the settlement scenario: a replacement winner inherits the outcome of the "
             "slot it displaced (default), or every winner on both sides is assumed to "
-            "settle in time. See README.md, \"The outcome rule\""
+            "settle in time. Repeatable — all rules share the one extraction pass, so "
+            "asking for both costs barely more than one. See README.md, \"The outcome "
+            "rule\""
         ),
     )
     analyse.add_argument(
@@ -113,7 +117,8 @@ def main(argv: list[str] | None = None) -> int:
         "--out",
         help=(
             "write the full report as JSON; a {solver} placeholder is substituted "
-            "with the solver's slug, and is required when several --solver are given"
+            "with the solver's slug and a {rule} placeholder with the outcome rule — "
+            "each is required when several of its values are given"
         ),
     )
     analyse.add_argument(
@@ -347,16 +352,29 @@ def reward_as_json(reward: rewards.SolverReward | None) -> dict[str, str | None]
     }
 
 
-def report_path(template: str, solver: str) -> str:
-    """`--out` with the `{solver}` placeholder substituted by the solver's slug."""
+def report_path(template: str, solver: str, rule: str) -> str:
+    """`--out` with `{solver}` substituted by the solver's slug and `{rule}` by the
+    outcome rule."""
     slug = re.sub(r"[^a-z0-9]+", "-", solver.lower()).strip("-")
-    return template.replace("{solver}", slug)
+    return template.replace("{solver}", slug).replace("{rule}", rule)
 
 
 def run_analyse(args: argparse.Namespace) -> int:
+    # argparse's `choices` already constrains the values; the cast restores the
+    # literal type it erased.
+    rules = cast(
+        "list[counterfactual.OutcomeRule]", args.outcome_rules or ["inherited"]
+    )
     if len(args.solver) > 1 and args.out and "{solver}" not in args.out:
         print(
             "ERROR: --out needs a {solver} placeholder when several solvers are "
+            "analysed, or each report would overwrite the last",
+            file=sys.stderr,
+        )
+        return 4
+    if len(rules) > 1 and args.out and "{rule}" not in args.out:
+        print(
+            "ERROR: --out needs a {rule} placeholder when several outcome rules are "
             "analysed, or each report would overwrite the last",
             file=sys.stderr,
         )
@@ -372,13 +390,13 @@ def run_analyse(args: argparse.Namespace) -> int:
                 args.end,
                 network=args.network,
                 mode=args.mode,
-                outcome_rule=args.outcome_rule,
+                outcome_rules=tuple(rules),
                 max_winners=args.max_winners,
                 include_price_suspects=args.include_price_suspects,
                 limit=args.limit,
                 log=lambda message: print(message, file=sys.stderr),
             )
-        except extract.SolverResolutionError as error:
+        except (extract.SolverResolutionError, ValueError) as error:
             print(f"ERROR: {error}", file=sys.stderr)
             return 4
         except counterfactual.MissingSettlementError as error:
@@ -397,10 +415,15 @@ def run_analyse(args: argparse.Namespace) -> int:
     for solver_run in window.runs:
         report_analysis(solver_run.analysis, args, solver_run.cow)
         if args.out:
-            path = report_path(args.out, solver_run.solver)
+            path = report_path(
+                args.out, solver_run.solver, solver_run.analysis.outcome_rule
+            )
             run.write_report(path, window, solver_run)
             print(f"\nfull report written to {path}", file=sys.stderr)
-        if not solver_run.analysis.auctions_with_solver:
+        if (
+            not solver_run.analysis.auctions_with_solver
+            and solver_run.solver not in never_bid
+        ):
             never_bid.append(solver_run.solver)
         skipped = skipped or bool(solver_run.analysis.auctions_skipped)
 

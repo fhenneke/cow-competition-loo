@@ -50,6 +50,8 @@ stays in the sections and docs each row links to; the milestone sections cite th
 | D18 | The pipeline is a **library call** — `run.analyse_window(conn, solvers, start, end, …)` — and the CLI a rendering around it; several solvers share **one extraction pass**, since extraction is nearly all the cost (~5 min/3-day window) and the arbitration is milliseconds per auction ([§8](#8-m6--library-api-multi-solver-runs-derived-reports--done)) | one solver per run, orchestration living inside the CLI subcommand (M2–M5's shape) — N solvers cost N extractions and programmatic use meant shelling out | `run.analyse_window` | — |
 | D19 | Report JSON is **derived from the dataclasses** — keys are the `Analysis`/`AuctionCounterfactual` field and property names — and versioned (format 3 since [§9](#9-m7--relative-price-impact--done)); `load_report` refuses a file without the current format marker ([§8](#8-m6--library-api-multi-solver-runs-derived-reports--done)) | a hand-written payload mirrored in four places (field, print, JSON key, loader) — every statistic cost four edits and the writer/reader key names had already drifted once | `run.report_payload`, `aggregate.REPORT_FORMAT` | bump `REPORT_FORMAT` on any shape change |
 | D20 | The **relative price impact** is Δsurplus / baseline received-leg volume, in bps, over contributing **fill-or-kill** orders executed on both sides whose surplus moved; surplus and volume are valued through the same buy-token native price, so the per-order ratio survives even a wrong price ([§9](#9-m7--relative-price-impact--done)) | including partially fillable orders — the two sides can execute different amounts, mixing quantity into a price figure; counting unmoved still-traded orders — dilutes the figure toward zero as a function of batch composition; a whole-window normalisation — answers a different (average-user) question and needs a window-volume field the report does not carry | `valuation.order_volume_native`, `counterfactual.OrderDiff`, `aggregate.PriceImpact` | conditioning lives in `aggregate._price_impact`, applied at load time — format-3 reports need no re-run to revise it |
+| D21 | Conversion rates are fetched **per accounting period, never per block**: one `between` range scan with a group-by returns `(first_block, last_block, rate)` per weekly period and blocks map client-side ([§10](#10-m8--sweep-efficiency--done), [table](docs/analytics-db.md#int_accounting_period_data__conversion_rates-is-per-block-and-unindexed)) | `block_number = any(<thousands of blocks>)` — the model is one row per block with no index, so the array is probed against every row of a full scan; a sweep of those drove the shared DB's CPU alert on 2026-08-14 | `extract.CONVERSION_RATES_SQL`, `extract.load_conversion_rates`; rates loaded **once per window** for all runs in `run.analyse_window` | an index on `block_number` (offered by the DB on-call) would make the range scan an index scan — worth accepting, not worth depending on |
+| D22 | **Outcome rules share the one extraction pass**, like solvers (D18): `analyse_window` takes `outcome_rules` and arbitrates each bundle once per (solver, rule) as it streams past; `--outcome-rule` is repeatable with a `{rule}` placeholder in `--out` ([§10](#10-m8--sweep-efficiency--done)) | one rule per invocation (M6's shape) — extraction is rule-independent and nearly all the cost, so a two-rule sweep did exactly twice the DB work for milliseconds of avoided arbitration | `run.analyse_window`, `cli.run_analyse` | — |
 
 ## 2. Two valuations, deliberately separate
 
@@ -770,3 +772,39 @@ with "re-run analyse" — every stored report predates the volumes and must be
 regenerated (one ~5-minute `analyse` per window, all solvers in one pass).
 `aggregate.PriceImpact` applies the conditioning at load time, so format-3 reports
 never need re-running to revise it.
+
+## 10. M8 — sweep efficiency — **done**
+
+Two changes with one purpose: a multi-chain month sweep should cost the shared DB as
+little as possible. Prompted by a real incident — the 2026-08-14 sweep drove the
+analytics DB's CPU alert, and the on-call traced it to our conversion-rate query.
+
+1. **Conversion rates per period, not per block** (D21). The rate table materializes
+   one row per block with no index, so `block_number = any(<thousands of blocks>)`
+   probed the array against every row of a full sequential scan, chunk after chunk,
+   invocation after invocation. The rate only changes once per weekly accounting
+   period, so `load_conversion_rates` now issues a single `between` range query
+   grouped by period — a handful of `(first_block, last_block, rate)` rows — and maps
+   blocks to periods client-side. The rates are also loaded **once per window** for
+   all runs together instead of once per run (`convert_delta_rewards` now takes the
+   rates rather than a connection). Full write-up of the table's shape and the general
+   `= any(array)` lesson:
+   [docs/analytics-db.md](docs/analytics-db.md#int_accounting_period_data__conversion_rates-is-per-block-and-unindexed).
+2. **Outcome rules share the extraction pass** (D22), exactly as solvers do since M6:
+   extraction is rule-independent — the rules differ only in per-auction
+   post-processing — yet each rule was a separate invocation re-pulling the same
+   month of bundles. `analyse_window` now takes `outcome_rules` and produces one run
+   per (solver, rule) from one pass; the CLI's `--outcome-rule` is repeatable and
+   `--out` gains a `{rule}` placeholder, required exactly when several rules are
+   given (the `{solver}` rule, applied to rules). The settlement source is loaded
+   only when some requested rule needs it.
+
+Together: a both-rules sweep of one network is one extraction instead of two, and its
+rate lookup is one cheap range query instead of dozens of array probes — the July
+2026 ten-network sweep drops from 20 invocations to 10 with roughly half the DB load.
+
+No numbers change: neither the counterfactual nor the reward path is touched, only
+how often their inputs are fetched. `tests/test_run.py` pins the orchestration (one
+extraction and one rate query for a two-rule window; `assume-settled` alone skips the
+settlement source) and `tests/test_extract.py` pins the period-range query shape and
+the block → rate mapping.
