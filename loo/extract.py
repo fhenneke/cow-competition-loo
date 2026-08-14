@@ -255,15 +255,27 @@ from dbt.fct_solver_rewards_per_auction
 where auction_id = any(%(ids)s)
 """
 
-# `int_accounting_period_data__conversion_rates` carries one row per block with the
+# `int_accounting_period_data__conversion_rates` carries one row per **block** with the
 # COW->native conversion rate of the accounting period (Tuesday to Tuesday) the block's
 # time falls in. The rate is snapshotted from Dune only after the period is paid out, so
 # recent blocks have a row with a NULL rate — callers must treat missing-rate as "not
 # convertible yet", not as an error.
+#
+# Queried per **period**, never per block: the table has one row per block of the whole
+# synced history and, being a plain dbt incremental table, no index — a
+# `block_number = any(<thousands of blocks>)` probe forced full scans that evaluate the
+# array against every row, and a multi-invocation sweep of those drove the shared DB's
+# CPU alert (2026-08-14). The rate is constant within a period, so one range scan with
+# a group-by returns the handful of (first_block, last_block, rate) rows the same
+# information lives in, and the block -> rate mapping happens client-side.
 CONVERSION_RATES_SQL = """
-select block_number, conversion_rate_cow_to_native
+select
+    min(block_number) as first_block,
+    max(block_number) as last_block,
+    conversion_rate_cow_to_native
 from dbt.int_accounting_period_data__conversion_rates
-where block_number = any(%(blocks)s)
+where block_number between %(first)s and %(last)s
+group by accounting_period_start_time, conversion_rate_cow_to_native
 """
 
 # USD reference prices for display conversion. The analytics DB has no USD price
@@ -608,17 +620,33 @@ def load_fct_rewards(
 
 
 def load_conversion_rates(
-    conn: Connection, blocks: Sequence[int], chunk_size: int = CHUNK_SIZE
+    conn: Connection, blocks: Sequence[int]
 ) -> dict[int, Decimal | None]:
     """COW->native conversion rate per block, `None` where the accounting period has
-    not been snapshotted yet. A block missing entirely also maps to `None`."""
+    not been snapshotted yet. A block outside every synced period also maps to `None`.
+
+    One query for the whole block range, returning one row per accounting period —
+    see the SQL comment for why this must never be a per-block lookup. Each period's
+    observed [first_block, last_block] within the range assigns its rate to the
+    requested blocks client-side."""
     rates: dict[int, Decimal | None] = {block: None for block in blocks}
-    for chunk in chunked(list(blocks), chunk_size):
-        for row in fetch(conn, CONVERSION_RATES_SQL, {"blocks": list(chunk)}):
-            rate = row["conversion_rate_cow_to_native"]
-            # The column is double precision; going through `str` keeps the value the
-            # DB displays rather than the binary expansion of the float.
-            rates[row["block_number"]] = Decimal(str(rate)) if rate is not None else None
+    if not rates:
+        return rates
+    periods = [
+        (row["first_block"], row["last_block"], row["conversion_rate_cow_to_native"])
+        for row in fetch(
+            conn, CONVERSION_RATES_SQL, {"first": min(rates), "last": max(rates)}
+        )
+    ]
+    for block in rates:
+        for first, last, rate in periods:
+            if first <= block <= last:
+                if rate is not None:
+                    # The column is double precision; going through `str` keeps the
+                    # value the DB displays rather than the binary expansion of the
+                    # float.
+                    rates[block] = Decimal(str(rate))
+                break
     return rates
 
 

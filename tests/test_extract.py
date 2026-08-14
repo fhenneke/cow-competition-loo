@@ -1,9 +1,10 @@
-"""`load_auctions` and the D17 missing-order policy.
+"""`load_auctions`, the D17 missing-order policy, and the conversion-rate loader.
 
 The DB is faked by monkeypatching `extract.fetch` with canned rows keyed on the module's
 own SQL constants, so the tests exercise exactly the code path the CLI uses.
 """
 
+from decimal import Decimal
 from typing import Any, cast
 
 import pytest
@@ -80,3 +81,48 @@ class TestMissingOrderPolicy:
         # the surviving auction is complete, not partially built
         assert len(bundles[0].bids) == 1
         assert len(bundles[0].bids[0].orders) == 1
+
+
+class TestConversionRates:
+    """`load_conversion_rates` must query per accounting period, never per block: the
+    table behind it is one row per block with no index, and a large-array block probe
+    was what drove the shared DB's CPU alert (see `CONVERSION_RATES_SQL`)."""
+
+    def test_maps_blocks_through_period_ranges(self, monkeypatch: pytest.MonkeyPatch):
+        queries: list[Any] = []
+
+        def fake_fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
+            assert sql is extract.CONVERSION_RATES_SQL
+            queries.append(params)
+            return [
+                {
+                    "first_block": 100,
+                    "last_block": 199,
+                    "conversion_rate_cow_to_native": 0.5,
+                },
+                {
+                    "first_block": 200,
+                    "last_block": 299,
+                    "conversion_rate_cow_to_native": None,
+                },
+            ]
+
+        monkeypatch.setattr(extract, "fetch", fake_fetch)
+
+        rates = extract.load_conversion_rates(CONN, [150, 250, 350, 100])
+
+        assert rates == {
+            100: Decimal("0.5"),
+            150: Decimal("0.5"),
+            250: None,  # period synced, rate not snapshotted yet
+            350: None,  # outside every synced period
+        }
+        # One query, bounded by the requested range — never a per-block array.
+        assert queries == [{"first": 100, "last": 350}]
+
+    def test_no_blocks_means_no_query(self, monkeypatch: pytest.MonkeyPatch):
+        def fake_fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
+            raise AssertionError("no query expected for an empty block list")
+
+        monkeypatch.setattr(extract, "fetch", fake_fetch)
+        assert extract.load_conversion_rates(CONN, []) == {}

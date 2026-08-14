@@ -455,6 +455,28 @@ The table is a current-state snapshot with **no time dimension**: `active` means
 latest allow-list event for this address was an add". It cannot answer "was X active on
 2026-08-02".
 
+## `int_accounting_period_data__conversion_rates` is per-block and unindexed
+
+The COW→native conversion-rate model materializes **one row per block** of the whole
+synced history (incremental, `unique_key='block_number'`), even though the rate itself
+only changes once per weekly accounting period (Tuesday to Tuesday) and is NULL until
+the period is snapshotted after payout. dbt creates **no index** on the table — true of
+dbt-materialized tables generally unless an `indexes` config says otherwise — so every
+predicate is a sequential scan over millions of rows per chain.
+
+The failure mode that made this a section: `where block_number = any(<array>)` with
+thousands of block numbers evaluates the array against **every row of the scan**, and a
+multi-invocation sweep of such queries drove a DB CPU alert on 2026-08-14 (the on-call
+offer that followed: an index on `block_number`, which would also help). The fix on our
+side is to ask for the information at its real grain — one range scan with a group-by
+returns one `(first_block, last_block, rate)` row per period, and blocks map to periods
+client-side (`extract.CONVERSION_RATES_SQL`, D21).
+
+The general lesson applies to any dbt-backed table here: check the model's
+materialization before shipping a large `= any(array)` probe against it, and prefer a
+`between` range plus client-side filtering when the table is unindexed — a range
+predicate costs two integer comparisons per row, an N-element array costs N.
+
 ## Reading the dbt model source
 
 The models are defined in a separate repo, cloned locally at `~/Work/Code/cow-dagster`:
