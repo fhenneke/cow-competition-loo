@@ -150,6 +150,8 @@ def payload(
             if d["contributes"] and d["executed_base"] and not d["executed_loo"]
         ),
         "orders_only_without_solver": 3,
+        "window_volume_base": 10_000 * ONE,
+        "window_orders_base": 50_000,
         "changed": changed,
     }
     base.update(overrides)
@@ -372,6 +374,26 @@ class TestPriceImpact:
             tmp_path, [move(7, 0, order_diffs=[diff(2 * ONE, ONE, contributes=False)])]
         )
         assert impact.orders_still_traded == 0
+
+    def test_overall_spreads_the_moved_delta_over_the_window_volume(
+        self, tmp_path: Path
+    ):
+        """The unconditioned reading: unmoved and no-longer-trading orders count as
+        zero price change, so the same Δsurplus lands on the whole window's volume."""
+        changed = [move(7, -ONE, order_diffs=[diff(2 * ONE, ONE)])]
+        report = load_report(
+            write_report(tmp_path, "r.json", payload(changed=changed))
+        )
+        # -1 ETH over the fixture's 10,000 ETH window -> -1 bps exactly.
+        assert report.overall_bps == Decimal(-1)
+
+    def test_no_window_volume_means_no_overall_figure(self, tmp_path: Path):
+        report = load_report(
+            write_report(
+                tmp_path, "r.json", payload(changed=[], window_volume_base=0)
+            )
+        )
+        assert report.overall_bps is None
 
 
 class TestDistribution:
@@ -612,6 +634,10 @@ class TestComparison:
             "+100.00 bps volume-weighted over 100.00 ETH (1 of 1 orders moved)"
         )
         assert rows["  median moved order"][fractal] == "+100.00 bps over 1 orders"
+        # The same +1 ETH spread over the fixture's 10,000 ETH window.
+        assert rows["  averaged over all traded volume"][fractal] == (
+            "+1.000 bps of 10000.00 ETH traded (50,000 orders)"
+        )
 
     def test_no_moved_order_reads_as_such(self, tmp_path: Path):
         changed = [

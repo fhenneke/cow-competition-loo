@@ -10,6 +10,7 @@ Two things carry most of the weight and are pinned down hardest:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -453,6 +454,88 @@ class TestDiffOutcomes:
         assert (diff.volume_base, diff.volume_loo) == (1000, None)
 
 
+class TestRecordedExecutedVolume:
+    """The denominator of "averaged over all traded volume": what the recorded winners
+    executed, computed through `analyse_auction` whether or not the solver bid."""
+
+    def test_a_reverted_winner_trades_nothing_under_inherited(self):
+        auction = bundle([bid(0, "a", 100, [sell_order("o1")], is_winner=True)])
+        inherited = analyse_auction(
+            auction, WETH, frozenset({"x"}), settled={0: NOT_SETTLED}
+        )
+        assert inherited.executed_volume_base == 0
+        assert inherited.executed_orders_base == 0
+
+        assumed = analyse_auction(
+            auction, WETH, frozenset({"x"}), outcome_rule="assume-settled"
+        )
+        assert assumed.executed_volume_base == 2100
+        assert assumed.executed_orders_base == 1
+
+    def test_partially_fillable_orders_are_not_in_the_denominator(self):
+        """The numerator excludes them (their Δsurplus mixes quantity into price), so
+        counting their volume would dilute the average by construction."""
+        partial = replace(sell_order("o1"), partially_fillable=True)
+        result = analyse_auction(
+            bundle([bid(0, "a", 100, [partial], is_winner=True)]),
+            WETH,
+            frozenset({"x"}),
+            settled={0: SETTLED},
+        )
+        assert result.executed_volume_base == 0
+        assert result.executed_orders_base == 0
+
+    def test_jit_orders_are_not_user_volume(self):
+        result = analyse_auction(
+            bundle(
+                [bid(0, "a", 100, [sell_order("o1")], is_winner=True, contributes=False)]
+            ),
+            WETH,
+            frozenset({"x"}),
+            settled={0: SETTLED},
+        )
+        assert result.executed_volume_base == 0
+
+    def test_a_non_winning_bid_contributes_nothing(self):
+        result = analyse_auction(
+            bundle(
+                [
+                    bid(0, "a", 100, [sell_order("o1")], is_winner=True),
+                    bid(1, "b", 90, [sell_order("o1", executed_buy=2050)]),
+                ]
+            ),
+            WETH,
+            frozenset({"x"}),
+            settled={0: SETTLED},
+        )
+        assert result.executed_volume_base == 2100
+
+    def test_a_recorded_winner_without_settlement_is_loud_even_when_absent(self):
+        """The denominator needs the same settlement coverage the sides do; defaulting
+        would silently skew every overall figure."""
+        with pytest.raises(MissingSettlementError, match="no settlement outcome"):
+            analyse_auction(
+                bundle([bid(0, "a", 100, [sell_order("o1")], is_winner=True)]),
+                WETH,
+                frozenset({"x"}),
+                settled={},
+            )
+
+    def test_price_suspect_auctions_stay_out_of_the_window_volume(self):
+        """A fabricated price fabricates volume too; the suspect exclusion must cover
+        the denominator exactly as it covers every other statistic."""
+        result = analyse_auction(
+            bundle([bid(0, "a", 100, [sell_order("o1")], is_winner=True)]),
+            WETH,
+            frozenset({"x"}),
+            settled={0: SETTLED},
+        )
+        suspect = replace(result, price_suspect_uids=frozenset({0}))
+        analysis = Analysis()
+        analysis.add(suspect)
+        assert analysis.window_volume_base == 0
+
+
 class TestAnalyseAuction:
     def test_an_auction_the_solver_skipped_is_still_counted(self):
         result = analyse_auction(
@@ -464,10 +547,15 @@ class TestAnalyseAuction:
         assert result.solver_present is False
         assert result.order_diffs == ()
         assert result.delta_surplus == 0
+        # The window denominator still sees what this auction traded (D10's logic).
+        assert result.executed_volume_base == 2100
+        assert result.executed_orders_base == 1
 
         analysis = Analysis()
         analysis.add(result)
         assert (analysis.auctions, analysis.auctions_with_solver) == (1, 0)
+        assert analysis.window_volume_base == 2100
+        assert analysis.window_orders_base == 1
 
     def test_a_replaced_winner_gives_users_less(self):
         """`x` wins the pair with a better fill; without it the runner-up wins the same

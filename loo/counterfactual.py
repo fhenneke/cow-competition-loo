@@ -196,6 +196,52 @@ def price_imbalanced(
     return sell_value > threshold * buy_value or buy_value > threshold * sell_value
 
 
+def recorded_executed_volume(
+    valued: Iterable[ValuedBid],
+    db_winner_uids: frozenset[int],
+    *,
+    outcome_rule: OutcomeRule,
+    settled: Mapping[int, Settlement],
+) -> tuple[int, int]:
+    """(volume, orders) the auction actually traded: the received-leg value of every
+    fill-or-kill user order the **recorded** winners executed, under the outcome
+    rule's settlement reading.
+
+    The denominator for "averaged over all traded volume". It reads the recorded
+    winners rather than our re-arbitrated baseline, deliberately: the denominator
+    must exist for every auction, including the ones the removed solver never bid in,
+    and those are exactly the auctions the counterfactual never arbitrates. The
+    record differs from our baseline in 5 of 7,745 validation auctions — noise in a
+    window denominator, and arguably the more literal reading of "volume users
+    actually traded"."""
+    volume = orders = 0
+    for entry in valued:
+        uid = entry.bid.uid
+        if uid not in db_winner_uids:
+            continue
+        if outcome_rule == "inherited":
+            outcome = settled.get(uid)
+            if outcome is None:
+                raise MissingSettlementError(
+                    f"auction {entry.bid.auction_id} solution {uid} won the recorded "
+                    f"competition but has no settlement outcome; the settlement source "
+                    f"does not cover this auction. Narrow the window or use "
+                    f"--outcome-rule assume-settled."
+                )
+            if not outcome.counts_as_executed:
+                continue
+        for order in entry.bid.orders:
+            if order.partially_fillable:
+                continue
+            order_volume = entry.valuation.order_volume_native.get(order.uid)
+            if order_volume is None:
+                # Non-contributing (JIT) order: not a user's volume.
+                continue
+            volume += order_volume
+            orders += 1
+    return volume, orders
+
+
 def recorded_settlement_by_pair(
     by_uid: Mapping[int, ValuedBid],
     recorded_winner_uids: frozenset[int],
@@ -580,6 +626,12 @@ class AuctionCounterfactual:
     block_deadline: int = 0
     """Deadline block, carried so Δrewards can be converted native -> COW at the
     auction's own accounting-period rate."""
+    executed_volume_base: int = 0
+    executed_orders_base: int = 0
+    """What the auction really traded under the outcome rule: received-leg value and
+    count of the recorded winners' executed fill-or-kill user orders
+    (`recorded_executed_volume`). Computed whether or not the removed solver bid —
+    the window sum is the denominator of "averaged over all traded volume"."""
     un_filtered_uids: frozenset[int] = frozenset()
     un_filtered_winner_uids: frozenset[int] = frozenset()
     order_diffs: tuple[OrderDiff, ...] = ()
@@ -721,6 +773,12 @@ def analyse_auction(
         bundle.bids, bundle.native_prices, weth, mode=mode
     )
 
+    executed_volume = executed_orders = 0
+    if not failures:
+        executed_volume, executed_orders = recorded_executed_volume(
+            valued, db_winner_uids, outcome_rule=outcome_rule, settled=settled
+        )
+
     if failures or not present:
         # A valuation failure means we cannot arbitrate this auction faithfully at all.
         # Validation measured zero over three days, so it is reported rather than tolerated.
@@ -732,6 +790,8 @@ def analyse_auction(
             valuation_failures=tuple(sorted(failures.items())),
             block_deadline=bundle.block_deadline,
             price_suspect_uids=suspects,
+            executed_volume_base=executed_volume,
+            executed_orders_base=executed_orders,
         )
 
     solutions = [v.solution for v in valued]
@@ -852,6 +912,8 @@ def analyse_auction(
         cap_orphans_loo=cap_orphans,
         price_suspect_uids=suspects,
         block_deadline=bundle.block_deadline,
+        executed_volume_base=executed_volume,
+        executed_orders_base=executed_orders,
         un_filtered_uids=relaxed,
         un_filtered_winner_uids=relaxed & loo.winner_uids,
         order_diffs=diff_outcomes(base.orders, loo_side.orders),
@@ -894,6 +956,14 @@ class Analysis:
 
     surplus_base: int = 0
     surplus_loo: int = 0
+
+    window_volume_base: int = 0
+    window_orders_base: int = 0
+    """Received-leg value and count of every executed fill-or-kill user order of the
+    window's recorded winners, under the outcome rule — the denominator of "averaged
+    over all traded volume". Unlike `surplus_base`, summed over **every** clean
+    analysed auction, present solver or not (D10's denominator logic): an auction the
+    solver never bid in has zero price change but its volume still happened."""
 
     rewards_base: int = 0
     rewards_loo: int = 0
@@ -1022,7 +1092,13 @@ class Analysis:
                 (result.auction_id, uid, error) for uid, error in result.valuation_failures
             )
         self.auctions_solver_won_db += result.solver_won_db
-        if not result.solver_present or result.valuation_failures:
+        if result.valuation_failures:
+            return
+        # Before the solver-present return: the window denominator covers every clean
+        # analysed auction, not just the ones the solver bid in.
+        self.window_volume_base += result.executed_volume_base
+        self.window_orders_base += result.executed_orders_base
+        if not result.solver_present:
             return
 
         self.auctions_with_solver += 1
