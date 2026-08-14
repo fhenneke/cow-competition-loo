@@ -44,12 +44,13 @@ WEI = Decimal(10) ** 18
 HEADLINE_RULE = "inherited"
 ALTERNATIVE_RULES = ("assume-settled",)
 
-REPORT_FORMAT = 2
+REPORT_FORMAT = 3
 """Version marker of the `analyse --out` payload, required by `load_report`. Bumped
 when the shape changes, so a stale file fails with "re-run analyse" instead of a
-KeyError deep inside a comparison. Format 2 derives its keys from the `Analysis` and
-`AuctionCounterfactual` field names; format 1 (unmarked) was the hand-written
-`*_wei`-suffixed shape."""
+KeyError deep inside a comparison. Format 3 added per-order volumes and
+`partially_fillable` to the order diffs — the inputs of the relative price impact.
+Format 2 derived its keys from the `Analysis` and `AuctionCounterfactual` field names;
+format 1 (unmarked) was the hand-written `*_wei`-suffixed shape."""
 
 SIGN_CONVENTION_ID = "counterfactual-minus-actual"
 """Written into every `analyse --out` JSON and required by `load_report`, so a report
@@ -94,6 +95,13 @@ CAVEATS = (
     "batches, so an unsettled solution's JIT orders are unrecoverable and its auction "
     "cannot be replayed faithfully. The exclusions are not random — they are "
     "JIT-heavy and reverted-winner auctions.",
+    "The relative price change is over fill-or-kill user orders executed on both sides "
+    "whose surplus moved: partially fillable orders are excluded because the two sides "
+    "can execute different amounts, which makes Δsurplus a mixture of price and "
+    "quantity, and orders re-executed identically carry no price information. Within "
+    "an order the bps ratio is immune to a wrong native price — surplus and volume are "
+    "valued through the same buy-token price, which cancels — but the volume weighting "
+    "across orders is not.",
     "USD figures are display-only conversions at each auction's own stablecoin-implied "
     "rate; they inherit every caveat of the native-token figure they restate.",
 )
@@ -158,6 +166,10 @@ class Report:
     their surplus but are not handed a worse price; the rest of `delta_surplus` is
     price movement on orders that still trade. Derived from the changed auctions'
     order diffs at load time, so stored reports carry it without a re-run."""
+    price_impact: PriceImpact
+    """The price-movement slice in relative terms: bps of traded volume on the
+    fill-or-kill orders that trade on both sides. Derived at load time, like
+    `delta_surplus_only_with`."""
     moves: tuple[AuctionMove, ...]
 
     @property
@@ -170,6 +182,81 @@ class Report:
     @property
     def window(self) -> tuple[str, str, str, str]:
         return (self.network, self.start, self.end, self.mode)
+
+
+@dataclass(frozen=True)
+class PriceImpact:
+    """Relative price change on the orders that trade on both sides.
+
+    The relative counterpart of the absolute Δsurplus: how much worse (or better) the
+    execution price gets on the orders the scenario still fills. Restricted to
+    fill-or-kill orders — a partially fillable order can execute different amounts on
+    the two sides, and Δsurplus over one side's volume is then a mixture of price and
+    quantity rather than a price change.
+    """
+
+    orders_still_traded: int
+    """Contributing fill-or-kill orders executed on both sides."""
+    orders_partially_fillable: int
+    """Contributing both-sides orders excluded for being partially fillable."""
+    orders_moved: int
+    """Still-traded orders whose surplus changed — the set both bps figures are over.
+    The conditioning is deliberate: an order re-executed identically carries no price
+    information and would only dilute the average toward zero."""
+    delta_surplus: int
+    volume_base: int
+    """Δsurplus and baseline received-leg volume, summed over the moved orders."""
+    median_bps: Decimal | None
+    """Signed median of the per-order relative changes — the typical moved order,
+    beside a volume-weighted figure that whales can dominate."""
+
+    @property
+    def weighted_bps(self) -> Decimal | None:
+        """Σ Δsurplus / Σ baseline volume over the moved orders, in basis points."""
+        if not self.volume_base:
+            return None
+        return Decimal(self.delta_surplus) * 10_000 / Decimal(self.volume_base)
+
+
+def _price_impact(changed: Sequence[Mapping[str, Any]]) -> PriceImpact:
+    """One report's `PriceImpact`, from the changed auctions' order diffs.
+
+    Derived at load time like `_only_with_surplus`, and complete for the same reason:
+    an order still trading in an unchanged auction is executed by the same solution on
+    both sides, so its price cannot have moved. The per-order ratio uses the baseline
+    volume — the denominator is what actually happened, matching the sign convention.
+    A moved order whose baseline volume rounds to 0 wei (dust) has no denominator and
+    stays out of `orders_moved`.
+    """
+    still_traded = partial = moved = 0
+    delta_total = volume_total = 0
+    per_order: list[Decimal] = []
+    for row in changed:
+        for diff in row["order_diffs"]:
+            if not (
+                diff["contributes"] and diff["executed_base"] and diff["executed_loo"]
+            ):
+                continue
+            if diff["partially_fillable"]:
+                partial += 1
+                continue
+            still_traded += 1
+            delta = (diff["surplus_loo"] or 0) - (diff["surplus_base"] or 0)
+            volume = diff["volume_base"] or 0
+            if not delta or not volume:
+                continue
+            moved += 1
+            delta_total += delta
+            volume_total += volume
+            per_order.append(Decimal(delta) * 10_000 / Decimal(volume))
+    return PriceImpact(
+        orders_still_traded=still_traded,
+        orders_partially_fillable=partial,
+        orders_moved=moved,
+        delta_surplus=delta_total,
+        volume_base=volume_total,
+        median_bps=median(per_order) if per_order else None,
+    )
 
 
 def _only_with_surplus(order_diffs: Sequence[Mapping[str, Any]]) -> int:
@@ -267,6 +354,7 @@ def load_report(path: str) -> Report:
         orders_only_with_solver=payload["orders_only_with_solver"],
         orders_only_without_solver=payload["orders_only_without_solver"],
         delta_surplus_only_with=sum(m.delta_surplus_only_with for m in moves),
+        price_impact=_price_impact(payload["changed"]),
         moves=moves,
     )
 
@@ -460,6 +548,11 @@ def pct(part: int, whole: int) -> str:
     return f"{part / whole:.1%}" if whole else "n/a"
 
 
+def bps(value: Decimal, places: int = 2) -> str:
+    """Signed basis points; "+" only when positive, matching `signed_eth`."""
+    return ("+" if value > 0 else "") + f"{value:.{places}f} bps"
+
+
 def cow_amount(wei: Decimal, places: int = 2) -> str:
     """Format COW wei (a Decimal) as whole COW."""
     quantum = Decimal(1).scaleb(-places)
@@ -533,6 +626,8 @@ def comparison(
     saved = row("orders executed only with the solver")
     saved_surplus = row("  Δsurplus from those orders")
     only_without = row("orders executed only without")
+    price_change = row("relative price change, still-traded orders")
+    price_median = row("  median moved order")
     affected = row("auctions where anything moved")
     relaxed = row("fairness filter relaxed")
 
@@ -606,6 +701,25 @@ def comparison(
             saved_cell += f" ({usd_amount(usd_total(only_with_deltas, usd))})"
         saved_surplus.append(saved_cell)
         only_without.append(f"{report.orders_only_without_solver:,}")
+
+        impact = report.price_impact
+        weighted = impact.weighted_bps
+        partial = (
+            f"; {impact.orders_partially_fillable:,} partially fillable excluded"
+            if impact.orders_partially_fillable
+            else ""
+        )
+        if weighted is not None and impact.median_bps is not None:
+            price_change.append(
+                f"{bps(weighted)} volume-weighted over {eth(impact.volume_base, 2)} ETH "
+                f"({impact.orders_moved:,} of {impact.orders_still_traded:,} orders "
+                f"moved{partial})"
+            )
+            price_median.append(f"{bps(impact.median_bps)} over {impact.orders_moved:,} orders")
+        else:
+            price_change.append(f"no still-traded order moved{partial}")
+            price_median.append("n/a")
+
         affected.append(f"{len(report.moves):,}")
         relaxed.append(
             f"{report.auctions_filter_relaxed} "

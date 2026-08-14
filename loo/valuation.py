@@ -12,7 +12,7 @@ Integer arithmetic throughout.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from .primitives import Pair, as_erc20, ceil_div, price_in_eth
@@ -145,6 +145,21 @@ def order_surplus_native(order: Order, native_prices: dict[str, int]) -> int:
     return to_native(order, order_surplus(order), native_prices)
 
 
+def order_volume_native(order: Order, native_prices: dict[str, int]) -> int:
+    """Native value of the order's received leg: `executed_buy` at the buy-token price.
+
+    The denominator for relative price statements (Δsurplus / volume). Deliberately
+    valued through the same buy-token price `to_native` puts into the numerator, so the
+    per-order ratio is exact even when that native price is wrong — a wrong price scales
+    surplus and volume equally and cancels. Only the weighting *across* orders still
+    trusts the price level, and price-suspect auctions are excluded upstream anyway.
+    """
+    price = native_prices.get(order.buy_token)
+    if price is None:
+        raise ValuationError(f"order {order.uid}: missing native price for buy token")
+    return price_in_eth(price, order.executed_buy)
+
+
 @dataclass(frozen=True)
 class SolutionValuation:
     """Surplus decomposition of one solution."""
@@ -158,6 +173,9 @@ class SolutionValuation:
     winner_pairs: frozenset[Pair]
     """`as_erc20`-normalised pairs over **all** orders — what `pick_winners` claims."""
     order_uids: frozenset[str]
+    order_volume_native: dict[str, int] = field(default_factory=dict[str, int])
+    """Native value of each contributing order's received leg — the denominator for
+    relative price statements. Same keys as `order_surplus_native`."""
 
     @property
     def total(self) -> int:
@@ -182,6 +200,7 @@ def value_solution(
     pair_surplus: dict[Pair, int] = {}
     native: dict[str, int] = {}
     atoms: dict[str, int] = {}
+    volumes: dict[str, int] = {}
     winner_pairs: set[Pair] = set()
     uids: set[str] = set()
 
@@ -199,6 +218,7 @@ def value_solution(
 
         atoms[order.uid] = surplus_atoms
         native[order.uid] = surplus_native
+        volumes[order.uid] = order_volume_native(order, native_prices)
         pair = (order.sell_token, order.buy_token)
         pair_surplus[pair] = pair_surplus.get(pair, 0) + surplus_native
 
@@ -208,6 +228,7 @@ def value_solution(
         order_surplus_atoms=atoms,
         winner_pairs=frozenset(winner_pairs),
         order_uids=frozenset(uids),
+        order_volume_native=volumes,
     )
 
 

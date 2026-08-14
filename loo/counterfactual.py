@@ -163,6 +163,14 @@ class OrderOutcome:
     """This order's batch really did fill, but after its deadline, so
     `Settlement.counts_as_executed` treats it as a failure. Tracked only where the record is
     this solution's own, which is where the discarded surplus is real."""
+    volume_native: int | None = None
+    """Native value of the received leg when executed, `None` otherwise — the
+    denominator for relative price statements. Carried at 0 for a non-contributing
+    order, mirroring `surplus_native`; neither enters any user statistic."""
+    partially_fillable: bool = False
+    """Carried so the aggregation can exclude partially fillable orders from the
+    relative-price statistic: the two sides may execute different amounts, and Δsurplus
+    over one side's volume is then a mixture of price and quantity."""
 
 
 UNEXECUTED = OrderOutcome(executed=False, surplus_native=None, contributes=False)
@@ -409,6 +417,12 @@ def side_outcomes(
                 solver=entry.bid.solver,
                 observed=observed,
                 landed_late=late,
+                volume_native=(
+                    entry.valuation.order_volume_native.get(order.uid, 0)
+                    if executed
+                    else None
+                ),
+                partially_fillable=order.partially_fillable,
             )
 
     return SideOutcomes(
@@ -446,6 +460,16 @@ class OrderDiff:
     late_loo: bool = False
     """The batch really filled this order, but after its deadline, so it is carried as a
     failure. The one place this analysis knowingly discards surplus a user did receive."""
+
+    volume_base: int | None = None
+    volume_loo: int | None = None
+    """Native value of the received leg on each executed side. On an order that trades
+    on both sides, `delta_surplus / volume_base` is the relative price change the
+    counterfactual hands the user — the buy-token price cancels out of the ratio, so a
+    wrong native price cannot fabricate it."""
+    partially_fillable: bool = False
+    """Excluded from the relative-price statistic: the two sides may execute different
+    amounts, and Δsurplus over one side's volume is then not a price change."""
 
     @property
     def unsettled_base(self) -> bool:
@@ -501,6 +525,10 @@ def diff_outcomes(
                 observed_loo=right.observed,
                 late_base=left.landed_late,
                 late_loo=right.landed_late,
+                volume_base=left.volume_native,
+                volume_loo=right.volume_native,
+                # A property of the order itself, so any side that saw it agrees.
+                partially_fillable=left.partially_fillable or right.partially_fillable,
             )
         )
     return tuple(diffs)

@@ -48,7 +48,8 @@ stays in the sections and docs each row links to; the milestone sections cite th
 | D16 | Every delta is **counterfactual − actual** (without-solver minus with-solver), so numbers read as what the removal scenario changes and turning them into a "value of the solver" is left to the reader; the convention is printed on every rendering and stamped into report JSONs, which `compare` refuses without the marker (M4 review) | with − without, M2–M3's convention (a solver's value carries a plus sign by construction) — §5.1 and §6.1 keep their historical signs; flip them to compare with §7.1 | `counterfactual` delta properties, `aggregate.SIGN_CONVENTION_ID`, `load_report` | not worth revising again — a second flip would strand two conventions in the wild |
 | D17 | Auctions with a traded order in **neither order table** are excluded transparently and named — `jit_orders` records only settled batches, so an unsettled solution's JIT legs are unrecoverable and even its `pick_winners` pair claims are unknown ([data](docs/analytics-db.md#jit-orders-are-recorded-only-when-the-batch-settles)); ~0.8% of a month window, zero in the M1 window by luck | zero-surplus tolerance — wrong for the 59% of missing orders that are surplus-capturing while CoW AMMs were live, and the missing pair claim measurably moves the pick ([8 real victims/month](docs/winner-selection.md#a-jit-leg-can-block-another-solutions-execution--and-the-filter-never-sees-it)); per-auction tolerate-and-validate — more coverage than 0.8% warrants in machinery | `extract.load_auctions` `missing_data`, `Analysis.missing_data_auctions` | for windows past the CoW-AMM deprecation (~late July 2026) zero-surplus is exact for score and filter; the missing pair claim and its blocking bias remain |
 | D18 | The pipeline is a **library call** — `run.analyse_window(conn, solvers, start, end, …)` — and the CLI a rendering around it; several solvers share **one extraction pass**, since extraction is nearly all the cost (~5 min/3-day window) and the arbitration is milliseconds per auction ([§8](#8-m6--library-api-multi-solver-runs-derived-reports--done)) | one solver per run, orchestration living inside the CLI subcommand (M2–M5's shape) — N solvers cost N extractions and programmatic use meant shelling out | `run.analyse_window` | — |
-| D19 | Report JSON (format 2) is **derived from the dataclasses** — keys are the `Analysis`/`AuctionCounterfactual` field and property names — and versioned; `load_report` refuses a file without the format marker ([§8](#8-m6--library-api-multi-solver-runs-derived-reports--done)) | a hand-written payload mirrored in four places (field, print, JSON key, loader) — every statistic cost four edits and the writer/reader key names had already drifted once | `run.report_payload`, `aggregate.REPORT_FORMAT` | bump `REPORT_FORMAT` on any shape change |
+| D19 | Report JSON is **derived from the dataclasses** — keys are the `Analysis`/`AuctionCounterfactual` field and property names — and versioned (format 3 since [§9](#9-m7--relative-price-impact--done)); `load_report` refuses a file without the current format marker ([§8](#8-m6--library-api-multi-solver-runs-derived-reports--done)) | a hand-written payload mirrored in four places (field, print, JSON key, loader) — every statistic cost four edits and the writer/reader key names had already drifted once | `run.report_payload`, `aggregate.REPORT_FORMAT` | bump `REPORT_FORMAT` on any shape change |
+| D20 | The **relative price impact** is Δsurplus / baseline received-leg volume, in bps, over contributing **fill-or-kill** orders executed on both sides whose surplus moved; surplus and volume are valued through the same buy-token native price, so the per-order ratio survives even a wrong price ([§9](#9-m7--relative-price-impact--done)) | including partially fillable orders — the two sides can execute different amounts, mixing quantity into a price figure; counting unmoved still-traded orders — dilutes the figure toward zero as a function of batch composition; a whole-window normalisation — answers a different (average-user) question and needs a window-volume field the report does not carry | `valuation.order_volume_native`, `counterfactual.OrderDiff`, `aggregate.PriceImpact` | conditioning lives in `aggregate._price_impact`, applied at load time — format-3 reports need no re-run to revise it |
 
 ## 2. Two valuations, deliberately separate
 
@@ -732,3 +733,40 @@ capped delta left unconverted, and the duplicate `REWARD_INPUTS_SQL` loader coll
 No numbers changed: the counterfactual, validation and reward paths are untouched, and
 the validate/validate-rewards gates over 2026-08-01..04 are the regression test that
 they stayed untouched.
+
+## 9. M7 — relative price impact — **done**
+
+The absolute Δsurplus says how much value moves; this milestone adds how much *prices*
+move in relative terms (D20): basis points of traded volume, on the orders the
+scenario still fills. Two figures per solver in the comparison — the volume-weighted
+bps change and the signed median moved order — derived at load time from the report's
+order diffs, exactly like the coverage slice.
+
+The definitions, each a deliberate choice:
+
+- **Denominator = the baseline received leg.** Per order the volume is `executed_buy`
+  valued at the buy-token native price — the same price `to_native` puts into the
+  surplus numerator, so the per-order ratio is exact even under a wrong native price
+  (D14's failure mode): the price cancels. Only the weighting *across* orders trusts
+  price levels, and price-suspect auctions are excluded anyway. Baseline-side because
+  the denominator should be what actually happened (D16's logic).
+- **Fill-or-kill orders only** (review guidance): a partially fillable order can
+  execute different amounts on the two sides, and Δsurplus over one side's volume is
+  then a price/quantity mixture rather than a price change. Excluded and counted in
+  the table cell.
+- **Only orders whose surplus moved.** An order re-executed identically carries no
+  price information; including it would dilute the figure toward zero as a function
+  of batch composition. The conditioning is stated in the row label and the caveat.
+  A moved order whose baseline volume floors to 0 wei (dust) has no denominator and
+  stays out the same way.
+- **The coverage slice stays absolute.** An order that stops trading altogether is
+  not "a worse price"; it remains the separate `orders executed only with the solver`
+  rows.
+
+Mechanically: `valuation.order_volume_native` is filled per contributing order
+alongside the surplus; `OrderDiff` carries `volume_base`/`volume_loo`/
+`partially_fillable`; the report is **format 3** and `compare` refuses older files
+with "re-run analyse" — every stored report predates the volumes and must be
+regenerated (one ~5-minute `analyse` per window, all solvers in one pass).
+`aggregate.PriceImpact` applies the conditioning at load time, so format-3 reports
+never need re-running to revise it.
