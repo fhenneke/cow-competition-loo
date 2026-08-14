@@ -44,13 +44,14 @@ WEI = Decimal(10) ** 18
 HEADLINE_RULE = "inherited"
 ALTERNATIVE_RULES = ("assume-settled",)
 
-REPORT_FORMAT = 3
+REPORT_FORMAT = 4
 """Version marker of the `analyse --out` payload, required by `load_report`. Bumped
 when the shape changes, so a stale file fails with "re-run analyse" instead of a
-KeyError deep inside a comparison. Format 3 added per-order volumes and
-`partially_fillable` to the order diffs — the inputs of the relative price impact.
-Format 2 derived its keys from the `Analysis` and `AuctionCounterfactual` field names;
-format 1 (unmarked) was the hand-written `*_wei`-suffixed shape."""
+KeyError deep inside a comparison. Format 4 added the window's recorded executed
+volume — the denominator of "averaged over all traded volume". Format 3 added
+per-order volumes and `partially_fillable` to the order diffs; format 2 derived its
+keys from the `Analysis` and `AuctionCounterfactual` field names; format 1 (unmarked)
+was the hand-written `*_wei`-suffixed shape."""
 
 SIGN_CONVENTION_ID = "counterfactual-minus-actual"
 """Written into every `analyse --out` JSON and required by `load_report`, so a report
@@ -101,7 +102,11 @@ CAVEATS = (
     "quantity, and orders re-executed identically carry no price information. Within "
     "an order the bps ratio is immune to a wrong native price — surplus and volume are "
     "valued through the same buy-token price, which cancels — but the volume weighting "
-    "across orders is not.",
+    "across orders is not. The companion figure averaged over all traded volume "
+    "spreads the same moved-order Δsurplus across the window's whole executed "
+    "fill-or-kill volume (the recorded winners' executions under the outcome rule, "
+    "every analysed auction), so unmoved orders — and orders that stop trading, whose "
+    "loss is the coverage figure — count as zero price change.",
     "USD figures are display-only conversions at each auction's own stablecoin-implied "
     "rate; they inherit every caveat of the native-token figure they restate.",
 )
@@ -170,7 +175,24 @@ class Report:
     """The price-movement slice in relative terms: bps of traded volume on the
     fill-or-kill orders that trade on both sides. Derived at load time, like
     `delta_surplus_only_with`."""
+    window_volume: int
+    window_orders: int
+    """The window's recorded executed fill-or-kill user volume (received leg) and
+    order count, over every clean analysed auction — solver present or not. The
+    denominator of `overall_bps`."""
     moves: tuple[AuctionMove, ...]
+
+    @property
+    def overall_bps(self) -> Decimal | None:
+        """The moved-order Δsurplus averaged over all traded volume: what the window's
+        average traded unit of value loses, with unmoved and no-longer-trading orders
+        counting as zero price change. `None` when the window traded nothing."""
+        if not self.window_volume:
+            return None
+        return (
+            Decimal(self.price_impact.delta_surplus) * 10_000
+            / Decimal(self.window_volume)
+        )
 
     @property
     def analysed(self) -> int:
@@ -355,6 +377,8 @@ def load_report(path: str) -> Report:
         orders_only_without_solver=payload["orders_only_without_solver"],
         delta_surplus_only_with=sum(m.delta_surplus_only_with for m in moves),
         price_impact=_price_impact(payload["changed"]),
+        window_volume=payload["window_volume_base"],
+        window_orders=payload["window_orders_base"],
         moves=moves,
     )
 
@@ -628,6 +652,7 @@ def comparison(
     only_without = row("orders executed only without")
     price_change = row("relative price change, still-traded orders")
     price_median = row("  median moved order")
+    price_overall = row("  averaged over all traded volume")
     affected = row("auctions where anything moved")
     relaxed = row("fairness filter relaxed")
 
@@ -719,6 +744,14 @@ def comparison(
         else:
             price_change.append(f"no still-traded order moved{partial}")
             price_median.append("n/a")
+        overall = report.overall_bps
+        if overall is not None:
+            price_overall.append(
+                f"{bps(overall, 3)} of {eth(report.window_volume, 2)} ETH traded "
+                f"({report.window_orders:,} orders)"
+            )
+        else:
+            price_overall.append("n/a — the window traded nothing")
 
         affected.append(f"{len(report.moves):,}")
         relaxed.append(

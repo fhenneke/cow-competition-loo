@@ -182,7 +182,11 @@ the volume-weighted price change in basis points of the baseline received value,
 the median moved order beside it. Partially fillable orders are excluded — their two
 sides can execute different amounts, which would mix quantity into a price figure —
 and within an order the ratio is immune to a wrong native price, since surplus and
-volume are valued through the same buy-token price, which cancels.
+volume are valued through the same buy-token price, which cancels. A companion row
+averages the same Δsurplus over the window's whole executed fill-or-kill volume (the
+recorded winners' executions, every analysed auction), so unmoved orders count as
+zero price change: "when a price moves" and "the average traded unit" are different
+questions, and the table answers both under their own labels.
 
 USD columns are display-only conversions at each auction's own stablecoin-implied rate
 (the analytics DB has no USD table —
