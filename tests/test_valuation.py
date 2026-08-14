@@ -14,6 +14,7 @@ from loo.valuation import (
     custom_prices_from_executed,
     order_surplus,
     order_surplus_native,
+    order_volume_native,
     solution_total,
     surplus_over,
     to_native,
@@ -160,6 +161,24 @@ class TestNativeConversion:
             order_surplus_native(order, {WETH: ONE})
 
 
+class TestVolumeNative:
+    def test_received_leg_at_the_buy_token_price(self):
+        order = sell_order(executed_sell=1000, executed_buy=2100)
+        assert order_volume_native(order, {USDC: ONE // 2}) == 1050
+
+    def test_buy_order_uses_the_same_leg(self):
+        """Both order kinds are valued on the received (buy) leg, through the same
+        buy-token price `to_native` puts into the surplus — so that price cancels out
+        of the per-order Δsurplus / volume ratio."""
+        order = buy_order(executed_sell=900, executed_buy=2000)
+        assert order_volume_native(order, {USDC: ONE}) == 2000
+
+    def test_missing_price_raises(self):
+        order = sell_order(executed_sell=1000, executed_buy=2100)
+        with pytest.raises(ValuationError, match="missing native price"):
+            order_volume_native(order, {DAI: ONE})
+
+
 class TestValueSolution:
     def test_aggregates_by_raw_directed_pair(self):
         orders = [
@@ -171,6 +190,7 @@ class TestValueSolution:
         )
         assert valuation.pair_surplus == {(WETH, USDC): 150}
         assert valuation.total == 150
+        assert valuation.order_volume_native == {"a" * 112: 2100, "c" * 112: 2050}
 
     def test_non_contributing_orders_are_skipped_but_still_claim_their_pair(self):
         """`score_by_token_pair` skips them; `pick_winners` does not."""
@@ -211,6 +231,8 @@ class TestValueSolution:
             orders, {"a" * 112: True, "c" * 112: False}, {USDC: ONE}, WETH
         )
         assert valuation.total == 100
+        # Volumes track contributing orders exactly, like `order_surplus_native`.
+        assert valuation.order_volume_native == {"a" * 112: 2100}
 
 
 class TestSolutionTotal:

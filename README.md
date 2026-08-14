@@ -177,6 +177,14 @@ attached. Give every outcome-rule run of a solver-window together; a group witho
 older `analyse` (the format marker is checked) are refused with "re-run analyse" —
 the files are cheap to regenerate and a silently misread one is not.
 
+Beside the absolute Δsurplus, the table reads the price-movement slice in relative
+terms: on the fill-or-kill orders that trade on both sides and whose surplus moved,
+the volume-weighted price change in basis points of the baseline received value, with
+the median moved order beside it. Partially fillable orders are excluded — their two
+sides can execute different amounts, which would mix quantity into a price figure —
+and within an order the ratio is immune to a wrong native price, since surplus and
+volume are valued through the same buy-token price, which cancels.
+
 USD columns are display-only conversions at each auction's own stablecoin-implied rate
 (the analytics DB has no USD table —
 [details](docs/analytics-db.md#no-usd-prices--stablecoin-native-prices-imply-the-rate)).

@@ -19,7 +19,9 @@ import pytest
 from loo.aggregate import (
     CAVEATS,
     REPORT_FORMAT,
+    PriceImpact,
     Table,
+    bps,
     comparison,
     cow_amount,
     distribution,
@@ -38,20 +40,36 @@ from loo.primitives import usd_per_native
 
 ONE = 10**18
 
+DEFAULT_VOLUME = 100 * ONE
+"""Received-leg volume an executed side gets unless a test says otherwise, so the
+default moved order is ONE of delta over 100 ETH — exactly 100 bps."""
+
 
 def diff(
     surplus_base: int | None,
     surplus_loo: int | None,
     *,
     contributes: bool = True,
+    volume_base: int | None = None,
+    volume_loo: int | None = None,
+    partially_fillable: bool = False,
 ) -> dict[str, Any]:
-    """One serialized order diff; a `None` surplus is an unexecuted side."""
+    """One serialized order diff; a `None` surplus is an unexecuted side, which gets
+    no volume either. An executed side defaults to `DEFAULT_VOLUME`; pass an explicit
+    volume (0 included) to override."""
+    if volume_base is None and surplus_base is not None:
+        volume_base = DEFAULT_VOLUME
+    if volume_loo is None and surplus_loo is not None:
+        volume_loo = DEFAULT_VOLUME
     return {
         "contributes": contributes,
         "executed_base": surplus_base is not None,
         "executed_loo": surplus_loo is not None,
         "surplus_base": surplus_base,
         "surplus_loo": surplus_loo,
+        "volume_base": volume_base,
+        "volume_loo": volume_loo,
+        "partially_fillable": partially_fillable,
     }
 
 
@@ -270,6 +288,90 @@ class TestLoadReport:
 
         with pytest.raises(ValueError, match="delta_rewards_capped"):
             load_report(path)
+
+
+class TestPriceImpact:
+    """The relative reading of the price-movement slice, derived at load time from
+    the changed auctions' order diffs — fill-or-kill orders trading on both sides."""
+
+    def load(self, tmp_path: Path, changed: list[dict[str, Any]]) -> PriceImpact:
+        return load_report(
+            write_report(tmp_path, "r.json", payload(changed=changed))
+        ).price_impact
+
+    def test_weighted_and_median_over_moved_orders(self, tmp_path: Path):
+        impact = self.load(
+            tmp_path,
+            [
+                move(
+                    7,
+                    -2 * ONE,
+                    order_diffs=[
+                        diff(2 * ONE, ONE, volume_base=10_000 * ONE),  # -1 bps
+                        diff(2 * ONE, ONE, volume_base=2_000 * ONE),  # -5 bps
+                    ],
+                )
+            ],
+        )
+        assert impact.orders_still_traded == 2
+        assert impact.orders_moved == 2
+        assert impact.delta_surplus == -2 * ONE
+        assert impact.volume_base == 12_000 * ONE
+        # Volume-weighted, so the big order pulls the average toward its -1 bps.
+        assert impact.weighted_bps == Decimal(-2 * ONE) * 10_000 / Decimal(12_000 * ONE)
+        assert impact.median_bps == Decimal(-3)
+
+    def test_partially_fillable_orders_are_excluded_and_counted(self, tmp_path: Path):
+        impact = self.load(
+            tmp_path,
+            [
+                move(
+                    7,
+                    -2 * ONE,
+                    order_diffs=[
+                        diff(2 * ONE, ONE),
+                        diff(2 * ONE, ONE, partially_fillable=True),
+                    ],
+                )
+            ],
+        )
+        assert impact.orders_partially_fillable == 1
+        assert impact.orders_still_traded == 1
+        assert impact.orders_moved == 1
+        assert impact.delta_surplus == -ONE
+
+    def test_orders_not_trading_on_both_sides_stay_out(self, tmp_path: Path):
+        """The coverage slice is an absolute story — losing a fill is not a worse
+        price — and so is its mirror image."""
+        impact = self.load(
+            tmp_path,
+            [move(7, -ONE, order_diffs=[diff(2 * ONE, None), diff(None, ONE)])],
+        )
+        assert impact.orders_still_traded == 0
+        assert impact.weighted_bps is None
+        assert impact.median_bps is None
+
+    def test_a_zero_delta_still_traded_order_is_not_moved(self, tmp_path: Path):
+        """Re-executed identically: counted as still trading, but it carries no price
+        information and must not dilute the bps figures toward zero."""
+        impact = self.load(tmp_path, [move(7, 0, order_diffs=[diff(ONE, ONE)])])
+        assert impact.orders_still_traded == 1
+        assert impact.orders_moved == 0
+        assert impact.weighted_bps is None
+
+    def test_a_moved_order_with_zero_volume_has_no_denominator(self, tmp_path: Path):
+        """A dust fill whose native volume floors to 0 wei cannot be expressed in bps."""
+        impact = self.load(
+            tmp_path, [move(7, -ONE, order_diffs=[diff(2 * ONE, ONE, volume_base=0)])]
+        )
+        assert impact.orders_still_traded == 1
+        assert impact.orders_moved == 0
+
+    def test_non_contributing_orders_stay_out(self, tmp_path: Path):
+        impact = self.load(
+            tmp_path, [move(7, 0, order_diffs=[diff(2 * ONE, ONE, contributes=False)])]
+        )
+        assert impact.orders_still_traded == 0
 
 
 class TestDistribution:
@@ -499,6 +601,38 @@ class TestComparison:
         assert "counterfactual minus actual" in text
         assert "counterfactual minus actual" in markdown
 
+    def test_relative_price_rows(self, tmp_path: Path):
+        """Fractal's one moved order: +ONE of delta over the default 100 ETH volume,
+        so exactly +100 bps; the coverage order in auction 2 stays out."""
+        table = self.build(tmp_path)
+
+        rows = dict(table.rows)
+        fractal = list(table.columns).index("Fractal")
+        assert rows["relative price change, still-traded orders"][fractal] == (
+            "+100.00 bps volume-weighted over 100.00 ETH (1 of 1 orders moved)"
+        )
+        assert rows["  median moved order"][fractal] == "+100.00 bps over 1 orders"
+
+    def test_no_moved_order_reads_as_such(self, tmp_path: Path):
+        changed = [
+            move(
+                2,
+                -ONE // 2,
+                order_diffs=[
+                    diff(ONE // 2, None),
+                    diff(ONE, ONE, partially_fillable=True),
+                ],
+            )
+        ]
+        report = load_report(write_report(tmp_path, "n.json", payload(changed=changed)))
+        table = comparison(group_reports([report]))
+
+        rows = dict(table.rows)
+        assert rows["relative price change, still-traded orders"][0] == (
+            "no still-traded order moved; 1 partially fillable excluded"
+        )
+        assert rows["  median moved order"][0] == "n/a"
+
     def test_window_shown_only_when_windows_differ(self, tmp_path: Path):
         reports = [
             load_report(write_report(tmp_path, "a.json", payload())),
@@ -540,6 +674,11 @@ class TestFormatters:
         assert pct(1, 0) == "n/a"
         assert cow_amount(Decimal(3 * ONE) / 2) == "1.50"
 
+    def test_bps_marks_positive_like_signed_eth(self):
+        assert bps(Decimal(2)) == "+2.00 bps"
+        assert bps(Decimal("-1.5")) == "-1.50 bps"
+        assert bps(Decimal(0)) == "0.00 bps"
+
 
 class TestReportRoundTrip:
     """`run.write_report` and `load_report` are the two ends of one contract; a full
@@ -564,6 +703,8 @@ class TestReportRoundTrip:
                     executed_loo=True,
                     surplus_base=100,
                     surplus_loo=40,
+                    volume_base=600_000,
+                    volume_loo=590_000,
                 ),
                 OrderDiff(
                     order_uid="cd",
@@ -625,15 +766,20 @@ class TestReportRoundTrip:
         assert report.orders_only_with_solver == 1
         assert report.delta_surplus_only_with == -40
         assert report.moves[0].delta_surplus_only_with == -40
+        # The relative reading survives the round trip: -60 over 600,000 is -1 bps.
+        assert report.price_impact.orders_moved == 1
+        assert report.price_impact.weighted_bps == Decimal(-1)
+        assert report.price_impact.median_bps == Decimal(-1)
 
 
 def test_caveats_cover_the_plan_list():
-    """The plan names six caveats, plus the USD one and the missing-data one; a
-    comparison must carry them all, so their disappearance should fail loudly here."""
-    assert len(CAVEATS) == 8
+    """The plan names six caveats, plus the USD one, the missing-data one and the
+    relative-price one; a comparison must carry them all, so their disappearance
+    should fail loudly here."""
+    assert len(CAVEATS) == 9
     themes = (
         "behavioural", "Settlement", "proxy", "Quote", "reward", "Price",
-        "neither order table", "USD",
+        "neither order table", "relative price", "USD",
     )
     for theme, caveat in zip(themes, CAVEATS, strict=True):
         assert theme.lower() in caveat.lower()

@@ -108,7 +108,9 @@ def bundle(bids: list[Bid]) -> AuctionBundle:
     )
 
 
-def valued(entry_bid: Bid, surplus: dict[str, int]) -> ValuedBid:
+def valued(
+    entry_bid: Bid, surplus: dict[str, int], volumes: dict[str, int] | None = None
+) -> ValuedBid:
     """A `ValuedBid` carrying exactly the per-order surplus the test wants."""
     return ValuedBid(
         bid=entry_bid,
@@ -119,6 +121,7 @@ def valued(entry_bid: Bid, surplus: dict[str, int]) -> ValuedBid:
             order_surplus_atoms={},
             winner_pairs=frozenset({A}),
             order_uids=frozenset(o.uid for o in entry_bid.orders),
+            order_volume_native=volumes or {},
         ),
     )
 
@@ -339,6 +342,32 @@ class TestSideOutcomes:
         assert side.orders["o1"].executed is True
         assert side.orders["o1"].surplus_native == 0
 
+    def test_volume_and_partial_flag_ride_along(self):
+        entry = valued(
+            bid(0, "a", 100, [sell_order("o1")]), {"o1": 100}, volumes={"o1": 2100}
+        )
+        side = side_outcomes(
+            [entry],
+            outcome_rule="assume-settled",
+            settled={},
+            recorded_winner_uids=frozenset(),
+        )
+        assert side.orders["o1"].volume_native == 2100
+        assert side.orders["o1"].partially_fillable is False
+
+    def test_an_unexecuted_order_has_no_volume(self):
+        """Like `surplus_native`: an order that does not trade has no received leg."""
+        entry = valued(
+            bid(0, "a", 100, [sell_order("o1")]), {"o1": 100}, volumes={"o1": 2100}
+        )
+        side = side_outcomes(
+            [entry],
+            outcome_rule="inherited",
+            settled={0: NOT_SETTLED},
+            recorded_winner_uids=frozenset({0}),
+        )
+        assert side.orders["o1"].volume_native is None
+
     def test_a_non_contributing_order_is_executed_at_zero_user_surplus(self):
         """A JIT order outside `surplus_capturing_jit_order_owners`: traded, but its
         surplus is the market maker's, not a user's."""
@@ -400,6 +429,29 @@ class TestDiffOutcomes:
         (diff,) = diff_outcomes({"o1": jit}, {"o1": self.outcome(5)})
         assert diff.contributes
 
+    def test_volumes_and_the_partial_flag_are_carried(self):
+        base = OrderOutcome(
+            executed=True,
+            surplus_native=100,
+            contributes=True,
+            volume_native=1000,
+            partially_fillable=True,
+        )
+        loo = OrderOutcome(
+            executed=True, surplus_native=60, contributes=True, volume_native=990
+        )
+        (diff,) = diff_outcomes({"o1": base}, {"o1": loo})
+        assert (diff.volume_base, diff.volume_loo) == (1000, 990)
+        # A property of the order, so whichever side saw it decides.
+        assert diff.partially_fillable
+
+    def test_an_unexecuted_side_has_no_volume(self):
+        base = OrderOutcome(
+            executed=True, surplus_native=100, contributes=True, volume_native=1000
+        )
+        (diff,) = diff_outcomes({"o1": base}, {})
+        assert (diff.volume_base, diff.volume_loo) == (1000, None)
+
 
 class TestAnalyseAuction:
     def test_an_auction_the_solver_skipped_is_still_counted(self):
@@ -440,6 +492,11 @@ class TestAnalyseAuction:
         # `x`'s batch settled, so the replacement inherits a settled slot.
         assert result.inherited_reverts_loo == frozenset()
         assert result.orphans_loo == frozenset()
+        # The received legs at USDC's native price of 1 — the denominator for the
+        # relative reading of the same move.
+        (diff,) = result.order_diffs
+        assert (diff.volume_base, diff.volume_loo) == (2200, 2100)
+        assert diff.partially_fillable is False
 
     def test_a_reverted_slot_stays_reverted_in_the_counterfactual(self):
         """The whole point of the `inherited` rule. `x` won the slot and reverted, so the
