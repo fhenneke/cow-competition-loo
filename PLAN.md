@@ -53,6 +53,7 @@ stays in the sections and docs each row links to; the milestone sections cite th
 | D21 | Conversion rates are fetched **per accounting period, never per block**: one `between` range scan with a group-by returns `(first_block, last_block, rate)` per weekly period and blocks map client-side ([§10](#10-m8--sweep-efficiency--done), [table](docs/analytics-db.md#int_accounting_period_data__conversion_rates-is-per-block-and-unindexed)) | `block_number = any(<thousands of blocks>)` — the model is one row per block with no index, so the array is probed against every row of a full scan; a sweep of those drove the shared DB's CPU alert on 2026-08-14 | `extract.CONVERSION_RATES_SQL`, `extract.load_conversion_rates`; rates loaded **once per window** for all runs in `run.analyse_window` | an index on `block_number` (offered by the DB on-call) would make the range scan an index scan — worth accepting, not worth depending on |
 | D22 | **Outcome rules share the one extraction pass**, like solvers (D18): `analyse_window` takes `outcome_rules` and arbitrates each bundle once per (solver, rule) as it streams past; `--outcome-rule` is repeatable with a `{rule}` placeholder in `--out` ([§10](#10-m8--sweep-efficiency--done)) | one rule per invocation (M6's shape) — extraction is rule-independent and nearly all the cost, so a two-rule sweep did exactly twice the DB work for milliseconds of avoided arbitration | `run.analyse_window`, `cli.run_analyse` | — |
 | D23 | The **overall average price change** spreads the moved-order Δsurplus over the window's whole executed fill-or-kill volume: the **recorded** winners' received legs under the outcome rule, summed over every clean analysed auction, solver present or not (D10's denominator logic) ([§11](#11-m9--overall-average-price-change--done)) | deriving the denominator from our re-arbitrated baseline — would force full arbitration of every absent-solver auction (most of a window) to compute a denominator that differs from the record in 5 of 7,745 validation auctions; leaving the question to the conditional figure alone — "when a price moves" and "the average traded unit" are both fair readings and conflating them invites misquotation | `counterfactual.recorded_executed_volume`, `Analysis.window_volume_base`, `aggregate.Report.overall_bps` | — |
+| D24 | The coverage count gets a **window-level second reading**: only-with executions over every user-order execution the recorded winners traded in the window, **partially fillable included** — both sides counted per auction-order execution — with a distinct-order decomposition beneath it whose share exists for the fill-or-kill part only ([§12](#12-m10--coverage-share-of-all-traded-orders--done)) | quoting "of N compared" alone — it is relative to the solver's own auctions and overstates window-level dependence for a selective bidder (measured 35.2% vs under 1% for a solver bidding in 5.7% of auctions); a fill-or-kill-only share reusing D23's count — built first to avoid a format bump, revised in review: partially fillable orders dominate coverage exactly where coverage matters (xdai July: 5,316 of 5,698 distinct only-with orders) and the extraction already sees every execution, so the fuller denominator was judged worth format 5 and a sweep re-run; a distinct-order share for partially fillable orders — no window-wide distinct count exists and one would understate them exactly where they trade most | `counterfactual.recorded_executed_volume`, `Analysis.window_order_executions_base`, `aggregate.Report.coverage_share`, `coverage_share_fok` | — |
 
 ## 2. Two valuations, deliberately separate
 
@@ -834,3 +835,37 @@ requirement is exactly the analysis's own.
 
 Report format 4 (`window_volume_base`, `window_orders_base`); older files refuse with
 "re-run analyse" — a sweep is ~12 minutes since M8.
+
+## 12. M10 — coverage share of all traded orders — **done**
+
+The coverage row's "of N compared" is relative to orders traded in auctions **the
+solver bid in** (`Analysis.add` returns before the order-diff accumulation when the
+solver is absent), counted per auction-order execution. Read as "how much would
+service degrade if this solver left" it overstates dependence for a selective bidder:
+a solver bidding in 5.7% of Arbitrum auctions showed 35.2% of compared where the
+window-level share is under 1% — and even at Rizzolver's 34% mainnet participation
+the two readings differ ~5× (July 2026). This milestone renders the window-level
+reading beside it (D24): **only-with executions over every user-order execution the
+recorded winners traded in the whole window**, solver present or not, partially
+fillable included.
+
+The denominator went through one revision, recorded in D24's row. The first build
+reused D23's fill-or-kill order count so the share could be derived at load time
+from format-4 reports with no re-run — but a fill-or-kill-only numerator drops
+partially fillable coverage, and that is most of the coverage exactly where coverage
+is the story (xdai July 2026: 5,316 of the 5,698 distinct only-with orders are
+partially fillable). Review judged the full picture worth the cost: the extraction
+already walks every executed order, so `recorded_executed_volume` now returns the
+all-orders count alongside the fill-or-kill volume and count, and the report is
+**format 5** (`window_order_executions_base`); older files refuse with "re-run
+analyse".
+
+Definitional choices that survived the revision: both sides of the share count per
+auction-order execution — an execution lost is an execution lost whatever the
+order's fillability, and a partially fillable order weighs as often as it trades —
+and the distinct-order decomposition beneath the share names actual orders, with a
+share of its own only for the fill-or-kill part, where distinct orders and
+executions coincide and D23's window count is the denominator. No distinct-order
+share exists for partially fillable orders and none is offered: their loss is the
+Δsurplus sub-row. The caveat list gains the two-denominators explanation, rendered
+with every comparison.

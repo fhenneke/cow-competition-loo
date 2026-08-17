@@ -202,19 +202,25 @@ def recorded_executed_volume(
     *,
     outcome_rule: OutcomeRule,
     settled: Mapping[int, Settlement],
-) -> tuple[int, int]:
-    """(volume, orders) the auction actually traded: the received-leg value of every
-    fill-or-kill user order the **recorded** winners executed, under the outcome
-    rule's settlement reading.
+) -> tuple[int, int, int]:
+    """(volume, fill-or-kill orders, all orders) the auction actually traded: what the
+    **recorded** winners executed, under the outcome rule's settlement reading.
 
-    The denominator for "averaged over all traded volume". It reads the recorded
-    winners rather than our re-arbitrated baseline, deliberately: the denominator
-    must exist for every auction, including the ones the removed solver never bid in,
-    and those are exactly the auctions the counterfactual never arbitrates. The
-    record differs from our baseline in 5 of 7,745 validation auctions — noise in a
-    window denominator, and arguably the more literal reading of "volume users
-    actually traded"."""
-    volume = orders = 0
+    The volume and the fill-or-kill count are over fill-or-kill user orders only — the
+    denominator for "averaged over all traded volume", where a partially fillable
+    order's Δsurplus would mix price and quantity. The third count is every executed
+    user order regardless of fillability — the denominator of the coverage share,
+    where an execution lost is an execution lost either way (D24). Summed over a
+    window it counts order *executions*: a partially fillable order executing in five
+    auctions contributes five.
+
+    It reads the recorded winners rather than our re-arbitrated baseline,
+    deliberately: the denominator must exist for every auction, including the ones
+    the removed solver never bid in, and those are exactly the auctions the
+    counterfactual never arbitrates. The record differs from our baseline in 5 of
+    7,745 validation auctions — noise in a window denominator, and arguably the more
+    literal reading of "volume users actually traded"."""
+    volume = orders = orders_all = 0
     for entry in valued:
         uid = entry.bid.uid
         if uid not in db_winner_uids:
@@ -231,15 +237,16 @@ def recorded_executed_volume(
             if not outcome.counts_as_executed:
                 continue
         for order in entry.bid.orders:
-            if order.partially_fillable:
-                continue
             order_volume = entry.valuation.order_volume_native.get(order.uid)
             if order_volume is None:
                 # Non-contributing (JIT) order: not a user's volume.
                 continue
+            orders_all += 1
+            if order.partially_fillable:
+                continue
             volume += order_volume
             orders += 1
-    return volume, orders
+    return volume, orders, orders_all
 
 
 def recorded_settlement_by_pair(
@@ -628,10 +635,13 @@ class AuctionCounterfactual:
     auction's own accounting-period rate."""
     executed_volume_base: int = 0
     executed_orders_base: int = 0
-    """What the auction really traded under the outcome rule: received-leg value and
-    count of the recorded winners' executed fill-or-kill user orders
-    (`recorded_executed_volume`). Computed whether or not the removed solver bid —
-    the window sum is the denominator of "averaged over all traded volume"."""
+    executed_orders_all_base: int = 0
+    """What the auction really traded under the outcome rule
+    (`recorded_executed_volume`): received-leg value and count of the recorded
+    winners' executed fill-or-kill user orders, and the count of *every* executed
+    user order, partially fillable included. Computed whether or not the removed
+    solver bid — the window sums are the denominators of "averaged over all traded
+    volume" and of the coverage share (D24)."""
     un_filtered_uids: frozenset[int] = frozenset()
     un_filtered_winner_uids: frozenset[int] = frozenset()
     order_diffs: tuple[OrderDiff, ...] = ()
@@ -773,9 +783,9 @@ def analyse_auction(
         bundle.bids, bundle.native_prices, weth, mode=mode
     )
 
-    executed_volume = executed_orders = 0
+    executed_volume = executed_orders = executed_orders_all = 0
     if not failures:
-        executed_volume, executed_orders = recorded_executed_volume(
+        executed_volume, executed_orders, executed_orders_all = recorded_executed_volume(
             valued, db_winner_uids, outcome_rule=outcome_rule, settled=settled
         )
 
@@ -792,6 +802,7 @@ def analyse_auction(
             price_suspect_uids=suspects,
             executed_volume_base=executed_volume,
             executed_orders_base=executed_orders,
+            executed_orders_all_base=executed_orders_all,
         )
 
     solutions = [v.solution for v in valued]
@@ -914,6 +925,7 @@ def analyse_auction(
         block_deadline=bundle.block_deadline,
         executed_volume_base=executed_volume,
         executed_orders_base=executed_orders,
+        executed_orders_all_base=executed_orders_all,
         un_filtered_uids=relaxed,
         un_filtered_winner_uids=relaxed & loo.winner_uids,
         order_diffs=diff_outcomes(base.orders, loo_side.orders),
@@ -959,11 +971,16 @@ class Analysis:
 
     window_volume_base: int = 0
     window_orders_base: int = 0
-    """Received-leg value and count of every executed fill-or-kill user order of the
-    window's recorded winners, under the outcome rule — the denominator of "averaged
-    over all traded volume". Unlike `surplus_base`, summed over **every** clean
-    analysed auction, present solver or not (D10's denominator logic): an auction the
-    solver never bid in has zero price change but its volume still happened."""
+    window_order_executions_base: int = 0
+    """What the window's recorded winners executed under the outcome rule:
+    received-leg value and count of every fill-or-kill user order — the denominator
+    of "averaged over all traded volume" — and the count of every executed user
+    order, partially fillable included, which is the denominator of the coverage
+    share (D24). The last counts order *executions*: an order is counted once per
+    auction it executes in, so a partially fillable order weighs as often as it
+    trades. Unlike `surplus_base`, all three are summed over **every** clean analysed
+    auction, present solver or not (D10's denominator logic): an auction the solver
+    never bid in has zero price change but its volume still happened."""
 
     rewards_base: int = 0
     rewards_loo: int = 0
@@ -1098,6 +1115,7 @@ class Analysis:
         # analysed auction, not just the ones the solver bid in.
         self.window_volume_base += result.executed_volume_base
         self.window_orders_base += result.executed_orders_base
+        self.window_order_executions_base += result.executed_orders_all_base
         if not result.solver_present:
             return
 

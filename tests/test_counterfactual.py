@@ -465,16 +465,20 @@ class TestRecordedExecutedVolume:
         )
         assert inherited.executed_volume_base == 0
         assert inherited.executed_orders_base == 0
+        assert inherited.executed_orders_all_base == 0
 
         assumed = analyse_auction(
             auction, WETH, frozenset({"x"}), outcome_rule="assume-settled"
         )
         assert assumed.executed_volume_base == 2100
         assert assumed.executed_orders_base == 1
+        assert assumed.executed_orders_all_base == 1
 
-    def test_partially_fillable_orders_are_not_in_the_denominator(self):
-        """The numerator excludes them (their Δsurplus mixes quantity into price), so
-        counting their volume would dilute the average by construction."""
+    def test_partially_fillable_orders_split_the_denominators(self):
+        """The price figure's numerator excludes them (their Δsurplus mixes quantity
+        into price), so their volume and fill-or-kill count stay out — but an executed
+        order is an executed order for the coverage share (D24), so the all-orders
+        count sees them."""
         partial = replace(sell_order("o1"), partially_fillable=True)
         result = analyse_auction(
             bundle([bid(0, "a", 100, [partial], is_winner=True)]),
@@ -484,6 +488,7 @@ class TestRecordedExecutedVolume:
         )
         assert result.executed_volume_base == 0
         assert result.executed_orders_base == 0
+        assert result.executed_orders_all_base == 1
 
     def test_jit_orders_are_not_user_volume(self):
         result = analyse_auction(
@@ -495,6 +500,7 @@ class TestRecordedExecutedVolume:
             settled={0: SETTLED},
         )
         assert result.executed_volume_base == 0
+        assert result.executed_orders_all_base == 0
 
     def test_a_non_winning_bid_contributes_nothing(self):
         result = analyse_auction(
@@ -556,6 +562,7 @@ class TestAnalyseAuction:
         assert (analysis.auctions, analysis.auctions_with_solver) == (1, 0)
         assert analysis.window_volume_base == 2100
         assert analysis.window_orders_base == 1
+        assert analysis.window_order_executions_base == 1
 
     def test_a_replaced_winner_gives_users_less(self):
         """`x` wins the pair with a better fill; without it the runner-up wins the same
