@@ -9,6 +9,7 @@ never lead with anything but the `inherited` rule.
 
 from __future__ import annotations
 
+import itertools
 import json
 from decimal import Decimal
 from pathlib import Path
@@ -45,6 +46,9 @@ DEFAULT_VOLUME = 100 * ONE
 default moved order is ONE of delta over 100 ETH — exactly 100 bps."""
 
 
+_uids = itertools.count()
+
+
 def diff(
     surplus_base: int | None,
     surplus_loo: int | None,
@@ -53,15 +57,18 @@ def diff(
     volume_base: int | None = None,
     volume_loo: int | None = None,
     partially_fillable: bool = False,
+    order_uid: str | None = None,
 ) -> dict[str, Any]:
     """One serialized order diff; a `None` surplus is an unexecuted side, which gets
     no volume either. An executed side defaults to `DEFAULT_VOLUME`; pass an explicit
-    volume (0 included) to override."""
+    volume (0 included) to override. The uid defaults to a fresh one — pass the same
+    uid twice to model a partially fillable order executing in several auctions."""
     if volume_base is None and surplus_base is not None:
         volume_base = DEFAULT_VOLUME
     if volume_loo is None and surplus_loo is not None:
         volume_loo = DEFAULT_VOLUME
     return {
+        "order_uid": order_uid if order_uid is not None else f"uid{next(_uids)}",
         "contributes": contributes,
         "executed_base": surplus_base is not None,
         "executed_loo": surplus_loo is not None,
@@ -152,6 +159,7 @@ def payload(
         "orders_only_without_solver": 3,
         "window_volume_base": 10_000 * ONE,
         "window_orders_base": 50_000,
+        "window_order_executions_base": 60_000,
         "changed": changed,
     }
     base.update(overrides)
@@ -290,6 +298,68 @@ class TestLoadReport:
 
         with pytest.raises(ValueError, match="delta_rewards_capped"):
             load_report(path)
+
+
+class TestCoverageShare:
+    """The window-level readings of the only-with count (D24). `coverage_share`
+    counts per auction-order execution on both sides, partially fillable included;
+    `coverage_share_fok` is the distinct-order reading, which exists only for
+    fill-or-kill because the window holds no distinct count of partially fillable
+    orders — one of them re-executing across auctions is one order, many
+    executions."""
+
+    def test_executions_over_the_window_executions(self, tmp_path: Path):
+        changed = [
+            # Two fill-or-kill only-with orders, a partially fillable one executing
+            # in both auctions (two executions, one distinct order), and a
+            # still-traded order that is not coverage at all.
+            move(
+                7,
+                -3 * ONE,
+                order_diffs=[
+                    diff(ONE, None),
+                    diff(ONE, None, partially_fillable=True, order_uid="pf"),
+                    diff(ONE, ONE),
+                ],
+            ),
+            move(
+                8,
+                -2 * ONE,
+                order_diffs=[
+                    diff(ONE, None),
+                    diff(ONE, None, partially_fillable=True, order_uid="pf"),
+                ],
+            ),
+        ]
+        path = write_report(
+            tmp_path,
+            "r.json",
+            payload(
+                changed=changed,
+                window_orders_base=400,
+                window_order_executions_base=800,
+            ),
+        )
+
+        report = load_report(path)
+
+        assert report.orders_only_with_solver == 4
+        assert report.coverage_share == Decimal(4) / Decimal(800)
+        assert report.orders_only_with_fok == 2
+        assert report.orders_only_with_partial == 1
+        assert report.coverage_share_fok == Decimal(2) / Decimal(400)
+
+    def test_a_window_that_traded_nothing_has_no_share(self, tmp_path: Path):
+        path = write_report(
+            tmp_path,
+            "r.json",
+            payload(
+                changed=[], window_orders_base=0, window_order_executions_base=0
+            ),
+        )
+        report = load_report(path)
+        assert report.coverage_share is None
+        assert report.coverage_share_fok is None
 
 
 class TestPriceImpact:
@@ -753,6 +823,9 @@ class TestReportRoundTrip:
                 )
             },
             block_deadline=123,
+            executed_volume_base=600_000,
+            executed_orders_base=1,
+            executed_orders_all_base=2,
         )
         analysis = Analysis(
             solver="TestSolver", addresses=frozenset({"aa"}), capped_estimate=True
@@ -790,6 +863,11 @@ class TestReportRoundTrip:
         assert [m.auction_id for m in report.moves] == [7]
         assert report.moves[0].delta_rewards_capped == Decimal(-3)
         assert report.orders_only_with_solver == 1
+        assert report.orders_only_with_fok == 1
+        assert report.orders_only_with_partial == 0
+        assert report.window_volume == 600_000
+        assert (report.window_orders, report.window_executions) == (1, 2)
+        assert report.coverage_share == Decimal(1) / Decimal(2)
         assert report.delta_surplus_only_with == -40
         assert report.moves[0].delta_surplus_only_with == -40
         # The relative reading survives the round trip: -60 over 600,000 is -1 bps.
@@ -799,13 +877,13 @@ class TestReportRoundTrip:
 
 
 def test_caveats_cover_the_plan_list():
-    """The plan names six caveats, plus the USD one, the missing-data one and the
-    relative-price one; a comparison must carry them all, so their disappearance
-    should fail loudly here."""
-    assert len(CAVEATS) == 9
+    """The plan names six caveats, plus the USD one, the missing-data one, the
+    coverage-denominator one and the relative-price one; a comparison must carry them
+    all, so their disappearance should fail loudly here."""
+    assert len(CAVEATS) == 10
     themes = (
         "behavioural", "Settlement", "proxy", "Quote", "reward", "Price",
-        "neither order table", "relative price", "USD",
+        "neither order table", "two denominators", "relative price", "USD",
     )
     for theme, caveat in zip(themes, CAVEATS, strict=True):
         assert theme.lower() in caveat.lower()

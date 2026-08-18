@@ -44,14 +44,16 @@ WEI = Decimal(10) ** 18
 HEADLINE_RULE = "inherited"
 ALTERNATIVE_RULES = ("assume-settled",)
 
-REPORT_FORMAT = 4
+REPORT_FORMAT = 5
 """Version marker of the `analyse --out` payload, required by `load_report`. Bumped
 when the shape changes, so a stale file fails with "re-run analyse" instead of a
-KeyError deep inside a comparison. Format 4 added the window's recorded executed
-volume — the denominator of "averaged over all traded volume". Format 3 added
-per-order volumes and `partially_fillable` to the order diffs; format 2 derived its
-keys from the `Analysis` and `AuctionCounterfactual` field names; format 1 (unmarked)
-was the hand-written `*_wei`-suffixed shape."""
+KeyError deep inside a comparison. Format 5 added the window's executed order count
+including partially fillable orders — the denominator of the coverage share (D24).
+Format 4 added the window's recorded executed volume — the denominator of "averaged
+over all traded volume". Format 3 added per-order volumes and `partially_fillable`
+to the order diffs; format 2 derived its keys from the `Analysis` and
+`AuctionCounterfactual` field names; format 1 (unmarked) was the hand-written
+`*_wei`-suffixed shape."""
 
 SIGN_CONVENTION_ID = "counterfactual-minus-actual"
 """Written into every `analyse --out` JSON and required by `load_report`, so a report
@@ -96,6 +98,17 @@ CAVEATS = (
     "batches, so an unsettled solution's JIT orders are unrecoverable and its auction "
     "cannot be replayed faithfully. The exclusions are not random — they are "
     "JIT-heavy and reverted-winner auctions.",
+    "Coverage has two denominators, and they answer different questions. \"Of N "
+    "compared\" is relative to orders traded in auctions the solver bid in — it "
+    "describes the solver's own turf and overstates window-level dependence for a "
+    "selective bidder. The share of the window's order executions divides the same "
+    "count by every user order the recorded winners executed in any clean analysed "
+    "auction, partially fillable included — the service-degradation reading. Both "
+    "count per auction-order execution, so a partially fillable order weighs as often "
+    "as it trades; the distinct-orders row decomposes the count into actual orders, "
+    "with a share of its own only for the fill-or-kill part, whose window order count "
+    "exists (it is the averaged-price-change denominator) and for which distinct "
+    "orders and executions coincide.",
     "The relative price change is over fill-or-kill user orders executed on both sides "
     "whose surplus moved: partially fillable orders are excluded because the two sides "
     "can execute different amounts, which makes Δsurplus a mixture of price and "
@@ -165,6 +178,15 @@ class Report:
     orders_compared: int
     orders_only_with_solver: int
     orders_only_without_solver: int
+    orders_only_with_fok: int
+    orders_only_with_partial: int
+    """Distinct orders behind `orders_only_with_solver` — which counts per-auction
+    executions — split fill-or-kill / partially fillable. The fill-or-kill count over
+    `window_orders` is `coverage_share_fok`, the distinct-order reading; the
+    partially fillable count has no distinct-order share because a partially fillable
+    order executes many times and a distinct count would understate it exactly where
+    it trades most — its weight is in `coverage_share` instead. Derived from the
+    changed auctions' order diffs at load time, like `delta_surplus_only_with`."""
     delta_surplus_only_with: int
     """The part of `delta_surplus` from the `orders_only_with_solver` orders — the
     coverage slice. Without the solver these orders do not trade at all, so users lose
@@ -179,7 +201,11 @@ class Report:
     window_orders: int
     """The window's recorded executed fill-or-kill user volume (received leg) and
     order count, over every clean analysed auction — solver present or not. The
-    denominator of `overall_bps`."""
+    denominator of `overall_bps`; the order count also anchors `coverage_share_fok`."""
+    window_executions: int
+    """Every executed user order of the window's recorded winners, partially fillable
+    included, counted once per auction it executes in — order executions. The
+    denominator of `coverage_share` (D24)."""
     moves: tuple[AuctionMove, ...]
 
     @property
@@ -193,6 +219,30 @@ class Report:
             Decimal(self.price_impact.delta_surplus) * 10_000
             / Decimal(self.window_volume)
         )
+
+    @property
+    def coverage_share(self) -> Decimal | None:
+        """Only-with executions over every user-order execution the window traded —
+        the service-degradation reading of the coverage count, the full picture with
+        partially fillable orders in. The "of N compared" companion is relative to
+        auctions the solver bid in, so it overstates window-level dependence for a
+        selective bidder; this share is over the whole window instead. Both sides
+        count per auction-order execution, so an execution lost is an execution lost
+        whatever the order's fillability. `None` when the window traded nothing."""
+        if not self.window_executions:
+            return None
+        return Decimal(self.orders_only_with_solver) / Decimal(self.window_executions)
+
+    @property
+    def coverage_share_fok(self) -> Decimal | None:
+        """The distinct-order companion of `coverage_share`, where "order" keeps its
+        plain meaning: distinct fill-or-kill only-with orders over the window's
+        fill-or-kill order count (D23's denominator — it holds no partially fillable
+        orders, which is why the distinct reading exists only for fill-or-kill).
+        `None` when the window traded nothing."""
+        if not self.window_orders:
+            return None
+        return Decimal(self.orders_only_with_fok) / Decimal(self.window_orders)
 
     @property
     def analysed(self) -> int:
@@ -340,6 +390,19 @@ def load_report(path: str) -> Report:
     )
     cow = payload["cow"]
 
+    # One pass over the only-with diffs serves two ends: the distinct-order split
+    # behind `coverage_share`, and the instance count that must equal the report's own
+    # total (checked below).
+    only_with = 0
+    fok_uids: set[str] = set()
+    partial_uids: set[str] = set()
+    for row in payload["changed"]:
+        for diff in row["order_diffs"]:
+            if diff["contributes"] and diff["executed_base"] and not diff["executed_loo"]:
+                only_with += 1
+                uids = partial_uids if diff["partially_fillable"] else fok_uids
+                uids.add(diff["order_uid"])
+
     report = Report(
         path=path,
         solver=payload["solver"],
@@ -375,23 +438,20 @@ def load_report(path: str) -> Report:
         orders_compared=payload["orders_compared"],
         orders_only_with_solver=payload["orders_only_with_solver"],
         orders_only_without_solver=payload["orders_only_without_solver"],
+        orders_only_with_fok=len(fok_uids),
+        orders_only_with_partial=len(partial_uids),
         delta_surplus_only_with=sum(m.delta_surplus_only_with for m in moves),
         price_impact=_price_impact(payload["changed"]),
         window_volume=payload["window_volume_base"],
         window_orders=payload["window_orders_base"],
+        window_executions=payload["window_order_executions_base"],
         moves=moves,
     )
 
     # An order executed only with the solver implies its winning solution changed, so
     # every such order lives in a `changed` auction and the count re-derived there must
-    # equal the report's own total — the completeness assumption `delta_surplus_only_with`
-    # rests on.
-    only_with = sum(
-        1
-        for row in payload["changed"]
-        for diff in row["order_diffs"]
-        if diff["contributes"] and diff["executed_base"] and not diff["executed_loo"]
-    )
+    # equal the report's own total — the completeness assumption that
+    # `delta_surplus_only_with` and the distinct-order split rest on.
     if only_with != report.orders_only_with_solver:
         raise ValueError(
             f"{path}: orders_only_with_solver is {report.orders_only_with_solver} but "
@@ -649,6 +709,8 @@ def comparison(
     net = row("net change (Δsurplus − capped Δrewards)")
     saved = row("orders executed only with the solver")
     saved_surplus = row("  Δsurplus from those orders")
+    saved_share = row("  share of the window's order executions")
+    saved_distinct = row("  of which distinct orders")
     only_without = row("orders executed only without")
     price_change = row("relative price change, still-traded orders")
     price_median = row("  median moved order")
@@ -725,6 +787,26 @@ def comparison(
             }
             saved_cell += f" ({usd_amount(usd_total(only_with_deltas, usd))})"
         saved_surplus.append(saved_cell)
+        share = report.coverage_share
+        if share is None:
+            saved_share.append("n/a — the window traded nothing")
+            saved_distinct.append("n/a — the window traded nothing")
+        else:
+            saved_share.append(
+                f"{share:.3%} ({report.orders_only_with_solver:,} of "
+                f"{report.window_executions:,})"
+            )
+            distinct = report.orders_only_with_fok + report.orders_only_with_partial
+            share_fok = report.coverage_share_fok
+            fok_part = f"{report.orders_only_with_fok:,} fill-or-kill" + (
+                f" ({share_fok:.3%} of {report.window_orders:,})"
+                if share_fok is not None
+                else ""
+            )
+            saved_distinct.append(
+                f"{distinct:,} — {fok_part}, "
+                f"{report.orders_only_with_partial:,} partially fillable"
+            )
         only_without.append(f"{report.orders_only_without_solver:,}")
 
         impact = report.price_impact
