@@ -796,3 +796,48 @@ class TestAnalysis:
         assert analysis.jit_orders_only_with_solver == 1
         assert analysis.orders_compared == 1
         assert analysis.delta_surplus == -100  # the JIT order's surplus is not the user's
+
+
+class TestJointRemoval:
+    """Several solvers in `removed` leave in one re-arbitration: the joint
+    counterfactual, with nothing attributed to individual members."""
+
+    def test_all_removed_solvers_leave_in_one_arbitration(self):
+        result = analyse_auction(
+            bundle(
+                [
+                    bid(0, "x", 300, [sell_order("o1", executed_buy=2300)], is_winner=True),
+                    bid(1, "y", 200, [sell_order("o1", executed_buy=2200)]),
+                    bid(2, "z", 100, [sell_order("o1", executed_buy=2100)]),
+                ]
+            ),
+            WETH,
+            frozenset({"x", "y"}),
+            settled={0: SETTLED},
+        )
+        # The runner-up leaves with the winner, so the third solution wins: the fill
+        # degrades by 200 atoms, not the 100 a single removal of "x" would cost.
+        assert result.loo_winner_uids == frozenset({2})
+        assert result.delta_surplus == -200
+        assert result.removed_present == frozenset({"x", "y"})
+        assert result.solver_won_db and result.solver_won_baseline
+
+    def test_any_present_member_makes_the_auction_count_and_is_recorded(self):
+        result = analyse_auction(
+            bundle(
+                [
+                    bid(0, "x", 200, [sell_order("o1", executed_buy=2200)], is_winner=True),
+                    bid(1, "y", 100, [sell_order("o1", executed_buy=2100)]),
+                ]
+            ),
+            WETH,
+            frozenset({"y", "ghost"}),
+            settled={0: SETTLED},
+        )
+        assert result.solver_present
+        assert result.removed_present == frozenset({"y"})
+
+        analysis = Analysis(addresses=frozenset({"y", "ghost"}))
+        analysis.add(result)
+        # `addresses - addresses_seen` is the dead weight the CLI refuses to carry.
+        assert analysis.addresses_seen == frozenset({"y"})

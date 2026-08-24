@@ -1,8 +1,8 @@
 # Leave-one-out solver analysis
 
-Counterfactual analysis of the CoW Protocol solver competition: remove one solver from
-past auctions, re-run winner selection, and measure the impact on user surplus, solver
-rewards and order coverage.
+Counterfactual analysis of the CoW Protocol solver competition: remove one solver —
+or several at once — from past auctions, re-run winner selection, and measure the
+impact on user surplus, solver rewards and order coverage.
 
 ## Setup
 
@@ -43,6 +43,13 @@ uv run loo analyse --solver Fractal --solver Sector \
 The `{solver}` placeholder in `--out` becomes each solver's slug and `{rule}` the
 outcome rule; each is required when several of its values are given.
 
+A comma-separated `--solver` removes those solvers **together**:
+`--solver "Fractal,Sector"` is one counterfactual with both absent at once, not two
+runs. The deltas describe the joint scenario and are deliberately not attributed to
+individual members — and the single removals do not sum to the joint one, because
+removed solvers stop replacing each other. Mixing forms compares the two directly:
+`--solver Fractal --solver "Fractal,Sector"`.
+
 **2. The comparison table** — seconds, it only reads the JSONs (plus one DB query for
 the USD columns):
 
@@ -76,8 +83,11 @@ uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04
 Removes one or more solvers from every auction in the window, re-runs winner selection,
 and reports what users would have gained or lost. `--solver` takes a name or a
 submission address, matched exactly — `Arc` and `Arctic` are different solvers and both
-compete — and may be repeated; the solvers share one extraction pass and each gets its
-own report.
+compete — or a comma-separated list of them, which is removed **jointly** as one
+counterfactual (all absent at once, nothing attributed to individual members). It may
+be repeated; the scenarios share one extraction pass and each gets its own report. If
+a group member ends up bidding in none of the analysed auctions the run errors rather
+than passing a smaller group's numbers off under the full label.
 
 | flag | |
 | --- | --- |
@@ -100,6 +110,8 @@ window = run.analyse_window(conn, ["Fractal", "Sector"], "2026-08-01", "2026-08-
 for solver_run in window.runs:
     print(solver_run.solver, solver_run.analysis.delta_surplus)
 ```
+
+An entry `"Fractal,Sector"` would instead remove both in one joint counterfactual.
 
 #### The outcome rule
 

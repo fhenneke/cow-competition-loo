@@ -1,8 +1,8 @@
 # Leave-one-out solver analysis
 
-Counterfactual analysis of CoW Protocol solver competition: remove one solver from past
-auctions, re-run winner selection, and measure the impact on user surplus, solver rewards,
-and order coverage.
+Counterfactual analysis of CoW Protocol solver competition: remove one solver — or
+several jointly — from past auctions, re-run winner selection, and measure the impact
+on user surplus, solver rewards, and order coverage.
 
 - **[PLAN.md](PLAN.md)** — what to build, milestone by milestone. Start here.
 - **[docs/analytics-db.md](docs/analytics-db.md)** — DB connection, tables, join keys,

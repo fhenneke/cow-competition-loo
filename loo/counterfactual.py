@@ -1,4 +1,10 @@
-"""Re-run one auction with a solver removed, and diff the two outcomes.
+"""Re-run one auction with one or more solvers removed, and diff the two outcomes.
+
+`removed` is a set of submission addresses and everything in it goes at once. With
+several solvers that makes the *joint* counterfactual — all of them absent together —
+and nothing here attributes the change to individual members: interaction effects
+(one removed solver replacing another) make any per-member split a different, and much
+more expensive, question.
 
 The counterfactual is a **full re-arbitration** — steps 3-6 of
 docs/winner-selection.md, not just the winner pick. Removing a solver can lower a
@@ -111,10 +117,12 @@ def leave_one_out(
     removed: frozenset[str],
     max_winners: int = MAX_WINNERS,
 ) -> Ranking:
-    """`arbitrate` over everything the removed solver did not submit.
+    """`arbitrate` over everything the removed solvers did not submit.
 
     A solver can have several solutions in one auction and all of them go, which is what
-    `compute_reference_scores` does too (`arbitrator.rs:620`).
+    `compute_reference_scores` does too (`arbitrator.rs:620`). With several solvers in
+    `removed` all of their solutions leave in the one re-arbitration — the joint
+    counterfactual, not a sequence of single removals.
     """
     return arbitrate([s for s in solutions if s.solver not in removed], max_winners)
 
@@ -594,12 +602,17 @@ class AuctionCounterfactual:
     auction_id: int
     n_solutions: int
     solver_present: bool
-    """Did the removed solver bid at all? When it did not, the two sides are identical by
+    """Did any removed solver bid at all? When none did, the two sides are identical by
     construction and the auction is skipped — but it stays in the denominator, so rates
-    are over the whole window rather than over the solver's own auctions."""
+    are over the whole window rather than over the removed solvers' own auctions."""
+    removed_present: frozenset[str] = frozenset()
+    """The removed addresses that actually bid here — the members `solver_present` is
+    "any" of. `Analysis.addresses_seen` accumulates these so a removal-group member
+    that influenced no analysed auction can be reported instead of silently padding
+    the group's label."""
     solver_won_baseline: bool = False
     solver_won_db: bool = False
-    """Whether the removed solver won by our own arbitration and by the DB's record.
+    """Whether any removed solver won by our own arbitration and by the DB's record.
     The first is what the counterfactual is measured against; the second is the fact
     about reality the comparison table reports."""
     baseline_winner_uids: frozenset[int] = frozenset()
@@ -774,7 +787,8 @@ def analyse_auction(
     without it only uncapped rewards are computed."""
     settled = settled or {}
     db_winner_uids = frozenset(b.uid for b in bundle.bids if b.is_winner)
-    present = any(b.solver in removed for b in bundle.bids)
+    removed_present = frozenset(b.solver for b in bundle.bids) & removed
+    present = bool(removed_present)
     suspects = frozenset(
         b.uid for b in bundle.bids if price_imbalanced(b, bundle.native_prices)
     )
@@ -796,6 +810,7 @@ def analyse_auction(
             auction_id=bundle.auction_id,
             n_solutions=len(bundle.bids),
             solver_present=present,
+            removed_present=removed_present,
             solver_won_db=bool(removed & {b.solver for b in bundle.bids if b.is_winner}),
             valuation_failures=tuple(sorted(failures.items())),
             block_deadline=bundle.block_deadline,
@@ -906,6 +921,7 @@ def analyse_auction(
         auction_id=bundle.auction_id,
         n_solutions=len(bundle.bids),
         solver_present=True,
+        removed_present=removed_present,
         solver_won_baseline=any(s.solver in removed for s in baseline.winners),
         solver_won_db=bool(removed & {b.solver for b in bundle.bids if b.is_winner}),
         baseline_winner_uids=baseline.winner_uids,
@@ -942,13 +958,25 @@ def analyse_auction(
 class Analysis:
     """Window aggregate.
 
-    `auctions` counts every auction in the window, including the ones the removed solver
-    never bid in — those stay in the denominator (D10) so the rates describe the window
-    rather than the solver's own subset.
+    `auctions` counts every auction in the window, including the ones no removed solver
+    bid in — those stay in the denominator (D10) so the rates describe the window
+    rather than the removed solvers' own subset.
+
+    `addresses` may cover **several solvers removed together** (D25): every statistic
+    then describes the joint counterfactual — all of them absent at once — and the
+    "solver bid" / "solver won" counters read as "any of them". Nothing here splits a
+    joint delta back onto individual members.
     """
 
     solver: str = ""
+    """The removal scenario's label: one solver name or address, or the comma-joined
+    members of a removal group."""
     addresses: frozenset[str] = frozenset()
+    addresses_seen: frozenset[str] = frozenset()
+    """Removed addresses that bid in at least one clean analysed auction.
+    `addresses - addresses_seen` is a removal group's dead weight — members whose
+    presence in the label suggests a joint finding they contributed nothing to. The
+    CLI refuses to report a group with dead weight (`run.absent_members`)."""
     mode: Mode = "score"
     outcome_rule: OutcomeRule = "inherited"
 
@@ -988,9 +1016,10 @@ class Analysis:
     auction — i.e. over the auctions the removed solver bid in, since the others cancel
     identically and are skipped. Score mode only; zero in surplus mode."""
     removed_reward_base: int = 0
-    """The removed solver's own share of `rewards_base`. The rest of the delta is the
-    change in rivals' rewards, which is usually negative — without the solver their
-    reference scores fall, so the protocol pays them more."""
+    """The removed solvers' own share of `rewards_base` (a group's members counted
+    together). The rest of the delta is the change in rivals' rewards, which is
+    usually negative — without the removed solvers their reference scores fall, so
+    the protocol pays them more."""
     auctions_rewards_moved: int = 0
     """Auctions where any solver's uncapped reward differs between the sides. Wider
     than `auctions_winner_set_changed` (D8): a reference score moving alone moves a
@@ -1120,6 +1149,7 @@ class Analysis:
             return
 
         self.auctions_with_solver += 1
+        self.addresses_seen |= result.removed_present
         self.auctions_solver_won_baseline += result.solver_won_baseline
         self.auctions_winner_set_changed += result.winner_set_changed
         self.auctions_filter_relaxed += result.filter_relaxed

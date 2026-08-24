@@ -54,6 +54,7 @@ stays in the sections and docs each row links to; the milestone sections cite th
 | D22 | **Outcome rules share the one extraction pass**, like solvers (D18): `analyse_window` takes `outcome_rules` and arbitrates each bundle once per (solver, rule) as it streams past; `--outcome-rule` is repeatable with a `{rule}` placeholder in `--out` ([§10](#10-m8--sweep-efficiency--done)) | one rule per invocation (M6's shape) — extraction is rule-independent and nearly all the cost, so a two-rule sweep did exactly twice the DB work for milliseconds of avoided arbitration | `run.analyse_window`, `cli.run_analyse` | — |
 | D23 | The **overall average price change** spreads the moved-order Δsurplus over the window's whole executed fill-or-kill volume: the **recorded** winners' received legs under the outcome rule, summed over every clean analysed auction, solver present or not (D10's denominator logic) ([§11](#11-m9--overall-average-price-change--done)) | deriving the denominator from our re-arbitrated baseline — would force full arbitration of every absent-solver auction (most of a window) to compute a denominator that differs from the record in 5 of 7,745 validation auctions; leaving the question to the conditional figure alone — "when a price moves" and "the average traded unit" are both fair readings and conflating them invites misquotation | `counterfactual.recorded_executed_volume`, `Analysis.window_volume_base`, `aggregate.Report.overall_bps` | — |
 | D24 | The coverage count gets a **window-level second reading**: only-with executions over every user-order execution the recorded winners traded in the window, **partially fillable included** — both sides counted per auction-order execution — with a distinct-order decomposition beneath it whose share exists for the fill-or-kill part only ([§12](#12-m10--coverage-share-of-all-traded-orders--done)) | quoting "of N compared" alone — it is relative to the solver's own auctions and overstates window-level dependence for a selective bidder (measured 35.2% vs under 1% for a solver bidding in 5.7% of auctions); a fill-or-kill-only share reusing D23's count — built first to avoid a format bump, revised in review: partially fillable orders dominate coverage exactly where coverage matters (xdai July: 5,316 of 5,698 distinct only-with orders) and the extraction already sees every execution, so the fuller denominator was judged worth format 5 and a sweep re-run; a distinct-order share for partially fillable orders — no window-wide distinct count exists and one would understate them exactly where they trade most | `counterfactual.recorded_executed_volume`, `Analysis.window_order_executions_base`, `aggregate.Report.coverage_share`, `coverage_share_fok` | — |
+| D25 | A comma-separated `--solver` entry is a **removal group**: one counterfactual with every member absent at once, whose deltas describe the joint scenario and are **never attributed to individual members** ([§13](#13-m11--joint-removal-of-multiple-solvers--done)) | summing single-solver runs — wrong in both directions, removed solvers stop replacing each other; per-member attribution (Shapley-style) — needs 2^n scenario runs and answers a different question; rejecting overlapping scenarios (the pre-M11 shared-address rule) — would forbid exactly the single-vs-joint comparison the feature exists for, so only *identical* address sets are rejected as duplicates | `run.analyse_window` (group resolution), `counterfactual.leave_one_out` (already set-based), `run.absent_members` + `Analysis.addresses_seen` (a member absent from every analysed auction fails the run rather than padding the label) | the reader combines scenarios; to attribute, run the subsets as separate groups |
 
 ## 2. Two valuations, deliberately separate
 
@@ -869,3 +870,43 @@ executions coincide and D23's window count is the denominator. No distinct-order
 share exists for partially fillable orders and none is offered: their loss is the
 Δsurplus sub-row. The caveat list gains the two-denominators explanation, rendered
 with every comparison.
+
+## 13. M11 — joint removal of multiple solvers — **done**
+
+One `--solver` argument may name several solvers separated by commas; they are removed
+**together** in a single counterfactual — one re-arbitration with all of them absent —
+and every delta describes that joint scenario (D25). Nothing attributes the change to
+individual members, deliberately: removed solvers stop replacing each other, so a
+per-member split is a different question (and the single removals do not sum to the
+joint one, in either direction). The flag stays repeatable, scenarios may overlap
+(`--solver Fractal --solver "Fractal,Sector"` compares a single removal with the
+joint one directly), and everything still shares the one extraction pass.
+
+The counterfactual core needed no change: `removed` has been a `frozenset` of
+addresses since M1 because a key rotation already makes one solver several addresses,
+and `analyse_auction`, the fairness-filter monotonicity argument, and the reward path
+are all set-based. The work is in resolution and honesty around the label:
+
+- `run.analyse_window` parses each entry into members, resolves each with
+  `resolve_solver` (so each member must exist and bid in the window), unions the
+  addresses, and labels the run with the comma-joined names. A competitor named twice
+  within one group is an error; across entries, only two scenarios resolving to the
+  *identical* address set are rejected — the old any-shared-address rule would have
+  forbidden exactly the overlap comparisons joint removal exists for, while still
+  catching the alias case (two names, same competitor) it was written for.
+- The "solver bid" / "solver won" counters were already any-member semantics
+  (`removed & bidders`); their docstrings now say so, and the CLI prints a
+  `joint removal` header line so a group report cannot be read as a single solver's.
+- The one new measurement: `AuctionCounterfactual.removed_present` records which
+  removed addresses actually bid, `Analysis.addresses_seen` accumulates it, and
+  `run.absent_members` names group members that influenced no analysed auction —
+  `--limit` or the price-suspect exclusion can produce them despite resolution's
+  whole-window check. The CLI errors on those (exit 4, like the all-absent case)
+  instead of passing a smaller group's numbers off under the full label.
+
+Report shape: still **format 5** — `compare` needs nothing new, a group is one column
+labelled with the comma-joined names, and the `{solver}` slug hyphenates the commas.
+`addresses_seen`/`removed_present` ride along as extra keys old readers ignore.
+Attribution (Shapley-style splits over 2^n subsets) is explicitly out of scope; the
+milestone's stance is that the joint number is the defensible one and the reader
+combines scenarios, not the pipeline.

@@ -19,7 +19,17 @@ CONN = cast(Connection, None)
 ONE = 10**18
 WETH = "c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
 USDC = "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
-SOLVER, RIVAL = "aa" * 20, "bb" * 20
+SOLVER, RIVAL, GHOST = "aa" * 20, "bb" * 20, "cc" * 20
+
+ADDRESSES = {
+    "TestSolver": SOLVER,
+    "Rival": RIVAL,
+    # Resolves (it bid somewhere in the window) but appears in no stubbed bundle —
+    # the shape `--limit` produces.
+    "Ghost": GHOST,
+    # The same competitor under a second catalogue name.
+    "AliasOfTestSolver": SOLVER,
+}
 
 
 def order(executed_buy: int) -> Order:
@@ -83,9 +93,10 @@ def stubbed(monkeypatch: pytest.MonkeyPatch) -> Calls:
     calls = Calls()
 
     def resolve_solver(conn: Connection, solver: str, start: str, end: str):
-        return frozenset({SOLVER}), [
+        address = ADDRESSES[solver]
+        return frozenset({address}), [
             SolverMatch(
-                address=SOLVER,
+                address=address,
                 name=solver,
                 environment="prod",
                 active=True,
@@ -178,3 +189,72 @@ class TestAnalyseWindow:
             run.analyse_window(
                 CONN, ["TestSolver"], "2026-07-01", "2026-08-01", outcome_rules=()
             )
+
+
+class TestRemovalGroups:
+    """A comma-separated `--solver` entry removes its members together — one joint
+    counterfactual, never a per-member attribution."""
+
+    def test_a_group_removes_all_members_jointly(self, stubbed: Calls):
+        window = run.analyse_window(
+            CONN, ["TestSolver,Rival"], "2026-07-01", "2026-08-01"
+        )
+        (solver_run,) = window.runs
+        assert solver_run.solver == "TestSolver,Rival"
+        assert solver_run.addresses == frozenset({SOLVER, RIVAL})
+        # With both bidders gone nothing executes: each auction loses the winner's
+        # full 200 atoms of surplus, not the 100-atom downgrade to the rival.
+        assert solver_run.analysis.delta_surplus == -400
+        assert solver_run.analysis.addresses_seen == frozenset({SOLVER, RIVAL})
+        assert run.absent_members(solver_run) == []
+
+    def test_a_group_may_overlap_a_single_scenario(self, stubbed: Calls):
+        """Removing A alone and {A,B} together are different scenarios of one window —
+        exactly the comparison joint removal exists for — and they share the one
+        extraction pass like any other pair of runs."""
+        window = run.analyse_window(
+            CONN, ["TestSolver", "TestSolver,Rival"], "2026-07-01", "2026-08-01"
+        )
+        assert [r.analysis.delta_surplus for r in window.runs] == [-200, -400]
+        assert stubbed.extractions == 1
+
+    def test_the_label_is_normalised(self, stubbed: Calls):
+        window = run.analyse_window(
+            CONN, ["TestSolver, Rival"], "2026-07-01", "2026-08-01"
+        )
+        assert window.runs[0].solver == "TestSolver,Rival"
+
+    def test_a_competitor_named_twice_in_one_group_is_rejected(self, stubbed: Calls):
+        with pytest.raises(extract.SolverResolutionError, match="once"):
+            run.analyse_window(
+                CONN, ["TestSolver,AliasOfTestSolver"], "2026-07-01", "2026-08-01"
+            )
+
+    def test_identical_scenarios_are_rejected(self, stubbed: Calls):
+        with pytest.raises(extract.SolverResolutionError, match="same removal"):
+            run.analyse_window(
+                CONN,
+                ["TestSolver,Rival", "Rival, TestSolver"],
+                "2026-07-01",
+                "2026-08-01",
+            )
+
+    def test_the_same_competitor_under_two_names_is_still_rejected(self, stubbed: Calls):
+        with pytest.raises(extract.SolverResolutionError, match="same removal"):
+            run.analyse_window(
+                CONN, ["TestSolver", "AliasOfTestSolver"], "2026-07-01", "2026-08-01"
+            )
+
+    def test_an_empty_group_is_rejected(self, stubbed: Calls):
+        with pytest.raises(extract.SolverResolutionError, match="names no solver"):
+            run.analyse_window(CONN, [" , "], "2026-07-01", "2026-08-01")
+
+    def test_a_member_absent_from_every_analysed_auction_is_reported(self, stubbed: Calls):
+        """The group's numbers are then the smaller group's numbers wearing the full
+        label — `absent_members` is what lets the CLI refuse that."""
+        window = run.analyse_window(
+            CONN, ["TestSolver,Ghost"], "2026-07-01", "2026-08-01"
+        )
+        (solver_run,) = window.runs
+        assert run.absent_members(solver_run) == ["Ghost"]
+        assert solver_run.analysis.delta_surplus == -200  # the single-solver result

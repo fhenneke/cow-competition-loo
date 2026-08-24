@@ -2,8 +2,9 @@
 
 Four subcommands:
 
-- `analyse` removes one or more solvers from a window's auctions, re-runs the
-  competition and reports what users and the protocol would have lost or saved.
+- `analyse` removes one or more solvers from a window's auctions — each on its own,
+  or several together as one joint counterfactual — re-runs the competition and
+  reports what users and the protocol would have lost or saved.
 - `compare` aggregates several `analyse --out` reports into the per-solver
   comparison table, with medians beside the sums and USD conversion.
 - `validate` reproduces the recorded competition over a date window and accounts for
@@ -68,7 +69,10 @@ def main(argv: list[str] | None = None) -> int:
 
     analyse = sub.add_parser(
         "analyse",
-        help="remove one or more solvers, re-run the competition, and diff the outcomes",
+        help=(
+            "remove one or more solvers — separately or jointly — re-run the "
+            "competition, and diff the outcomes"
+        ),
     )
     analyse.add_argument("--network", default="mainnet")
     analyse.add_argument(
@@ -77,8 +81,10 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help=(
             "solver name (as in dune_data__cow_protocol__solvers) or submission "
-            "address; repeatable — every solver shares one extraction pass, so "
-            "analysing several costs barely more than one"
+            "address; a comma-separated list removes those solvers TOGETHER — one "
+            "joint counterfactual with all of them absent, attributing nothing to "
+            "individual members. Repeatable — every scenario shares one extraction "
+            "pass, so analysing several costs barely more than one"
         ),
     )
     analyse.add_argument("--start", required=True, help="inclusive, e.g. 2026-08-01")
@@ -411,6 +417,7 @@ def run_analyse(args: argparse.Namespace) -> int:
         return 1
 
     never_bid: list[str] = []
+    reduced: dict[str, list[str]] = {}
     skipped = False
     for solver_run in window.runs:
         report_analysis(solver_run.analysis, args, solver_run.cow)
@@ -420,11 +427,12 @@ def run_analyse(args: argparse.Namespace) -> int:
             )
             run.write_report(path, window, solver_run)
             print(f"\nfull report written to {path}", file=sys.stderr)
-        if (
-            not solver_run.analysis.auctions_with_solver
-            and solver_run.solver not in never_bid
-        ):
-            never_bid.append(solver_run.solver)
+        absent = run.absent_members(solver_run)
+        if absent and len(absent) == len(solver_run.members):
+            if solver_run.solver not in never_bid:
+                never_bid.append(solver_run.solver)
+        elif absent:
+            reduced.setdefault(solver_run.solver, absent)
         skipped = skipped or bool(solver_run.analysis.auctions_skipped)
 
     if never_bid:
@@ -439,6 +447,19 @@ def run_analyse(args: argparse.Namespace) -> int:
             f"trivially zero rather than a finding. Widen the window or drop --limit.",
             file=sys.stderr,
         )
+    for label, absent in reduced.items():
+        # The same misreading, one level down: the group's numbers are real, but with a
+        # member absent from every analysed auction they are the smaller group's numbers
+        # wearing the full group's label.
+        print(
+            f"\nERROR: {', '.join(absent)} (of the removal group {label!r}) did not "
+            f"bid in any of the {len(window.auction_ids)} auctions analysed, so the "
+            f"joint counterfactual above is really the removal of the remaining "
+            f"members alone. Widen the window, drop --limit, or drop the absent "
+            f"members from the group.",
+            file=sys.stderr,
+        )
+    if never_bid or reduced:
         return 4
 
     # A valuation failure means an auction could not be arbitrated at all, so its
@@ -515,6 +536,13 @@ def report_analysis(
     print(f"window          {args.start} .. {args.end} on {args.network}")
     print(f"ranking mode    {analysis.mode}")
     print(f"outcome rule    {analysis.outcome_rule} — {counterfactual.OUTCOME_RULE[analysis.outcome_rule]}")
+    members = analysis.solver.count(",") + 1
+    if members > 1:
+        print(
+            f"joint removal   {members} solvers removed together — every \"solver\" "
+            f"line below reads \"any of them\", and no delta is attributed to an "
+            f"individual member"
+        )
 
     missing = analysis.missing_data_auctions
     print(f"\nauctions in window            {total + len(missing)}")

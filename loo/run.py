@@ -1,12 +1,14 @@
 """The library entry point: leave-one-out analysis for solvers over one window.
 
 `analyse_window` is the whole pipeline as one call — resolve the solvers, pull the
-window's auctions, arbitrate each one with and without every solver, convert reward
-deltas to COW — and the `analyse` CLI subcommand is a thin rendering around it.
+window's auctions, arbitrate each one with and without every removal scenario,
+convert reward deltas to COW — and the `analyse` CLI subcommand is a thin rendering
+around it. A scenario is one solver, or a comma-separated group removed **together**
+as one joint counterfactual (D25).
 
 Extraction dominates the cost (nearly all of a ~5-minute window run; the arbitration
-itself is milliseconds per auction), so all solvers share a single pass over the
-auctions: analysing five solvers costs one extraction, not five.
+itself is milliseconds per auction), so all scenarios share a single pass over the
+auctions: analysing five costs one extraction, not five.
 """
 
 from __future__ import annotations
@@ -29,6 +31,25 @@ from .counterfactual import (
 from .db import Connection
 from .primitives import MAX_WINNERS, wrapped_native_token
 from .valuation import Mode
+
+
+class GroupMember(NamedTuple):
+    """One solver of a removal scenario, as the caller named it and as it resolved."""
+
+    given: str
+    addresses: frozenset[str]
+
+
+def parse_removal_group(entry: str) -> list[str]:
+    """The solver names of one `solvers` entry: one name, or several separated by
+    commas, which are removed **together** as one joint counterfactual."""
+    names = [part.strip() for part in entry.split(",") if part.strip()]
+    if not names:
+        raise extract.SolverResolutionError(
+            f"{entry!r} names no solver — give a name/address, or several separated "
+            f"by commas to remove them together"
+        )
+    return names
 
 
 class CowConversion(NamedTuple):
@@ -86,16 +107,35 @@ def convert_delta_rewards(
 
 @dataclass
 class SolverRun:
-    """One solver's leave-one-out result over the window."""
+    """One removal scenario's leave-one-out result over the window."""
 
     solver: str
-    """The name or address as the caller gave it — the report's identity."""
+    """The scenario as the caller gave it — a solver name or address, or the
+    comma-joined members of a removal group — and the report's identity."""
     addresses: frozenset[str]
+    """The union over the members: everything in it is removed at once."""
     matches: list[extract.SolverMatch]
+    members: tuple[GroupMember, ...]
+    """One entry per name the caller gave. The joint counterfactual attributes nothing
+    to them; they are kept so a member's absence from the analysed auctions can be
+    reported per member (`absent_members`)."""
     analysis: Analysis
     cow: CowConversion | None = None
     """Native -> COW conversion of the reward deltas; `None` in surplus mode, where no
     rewards exist to convert."""
+
+
+def absent_members(solver_run: SolverRun) -> list[str]:
+    """Members of the scenario that bid in no clean analysed auction.
+
+    `resolve_solver` guarantees every member bid somewhere in the window, but
+    `--limit` can slice those auctions away and the price-suspect exclusion can eat
+    the rest. A report labelled "A,B" when B never influenced an analysed auction
+    would pass a single-solver result off as a joint finding, so the CLI treats a
+    non-empty return the way it treats an all-zero single-solver run: an error, not
+    a number."""
+    seen = solver_run.analysis.addresses_seen
+    return [m.given for m in solver_run.members if not (m.addresses & seen)]
 
 
 @dataclass
@@ -126,14 +166,23 @@ def analyse_window(
     limit: int | None = None,
     log: Callable[[str], None] | None = None,
 ) -> WindowAnalysis:
-    """Remove each solver from every auction in `[start, end)` and diff the outcomes.
+    """Remove each scenario's solvers from every auction in `[start, end)` and diff
+    the outcomes.
 
-    One extraction serves every solver **and every outcome rule**: the auction bundles
-    are solver- and rule-independent, so each is arbitrated once per (solver, rule) as
-    it streams past. Extraction is nearly all of a run's cost, so asking for the second
-    rule costs minutes of arbitration, not a second pass over the DB. Solvers are
-    resolved before anything is extracted — a bad `--solver` fails in seconds, not
-    after five minutes.
+    Each `solvers` entry is one removal scenario: a single name/address, or several
+    separated by commas, which are removed **together** — one counterfactual with all
+    of them absent, whose deltas are never attributed to individual members (D25).
+    Overlapping scenarios are legitimate (`["Fractal", "Fractal,Sector"]` compares a
+    single removal with a joint one); only two entries resolving to the *same* address
+    set are rejected as a duplicate run, and one competitor may not appear twice
+    within one group.
+
+    One extraction serves every scenario **and every outcome rule**: the auction
+    bundles are solver- and rule-independent, so each is arbitrated once per
+    (scenario, rule) as it streams past. Extraction is nearly all of a run's cost, so
+    asking for the second rule costs minutes of arbitration, not a second pass over
+    the DB. Solvers are resolved before anything is extracted — a bad `--solver`
+    fails in seconds, not after five minutes.
 
     Raises `extract.SolverResolutionError` when a solver does not resolve to exactly
     one competitor that bid in the window, and `counterfactual.MissingSettlementError`
@@ -146,39 +195,62 @@ def analyse_window(
     emit: Callable[[str], None] = log or (lambda message: None)
     weth = wrapped_native_token(network)
 
-    resolved: list[tuple[str, frozenset[str], list[extract.SolverMatch]]] = []
-    for solver in solvers:
-        addresses, matches = extract.resolve_solver(conn, solver, start, end)
-        for match in matches:
-            emit(
-                f"solver {solver!r} -> {match.address}  {match.name} "
-                f"({match.environment}, active={match.active})  "
-                f"{match.solutions} solutions in {match.auctions_bid} auctions, "
-                f"{match.winning_solutions} winning"
-            )
-        if len(matches) > 1:
-            # A key rotation: the same competitor under two submission addresses. All of
-            # them have to go together, or reference scores would treat one half of the
-            # rotation as a rival of the other.
-            emit(
-                f"note: {len(matches)} addresses resolved; removing all of them as one "
-                f"solver"
-            )
-        for earlier_solver, earlier_addresses, _ in resolved:
-            if earlier_addresses & addresses:
+    resolved: list[
+        tuple[str, tuple[GroupMember, ...], frozenset[str], list[extract.SolverMatch]]
+    ] = []
+    for entry in solvers:
+        members: list[GroupMember] = []
+        matches: list[extract.SolverMatch] = []
+        group_addresses: frozenset[str] = frozenset()
+        for name in parse_removal_group(entry):
+            addresses, member_matches = extract.resolve_solver(conn, name, start, end)
+            if addresses & group_addresses:
                 raise extract.SolverResolutionError(
-                    f"{solver!r} and {earlier_solver!r} resolve to the same competitor "
-                    f"(shared address); give each solver once"
+                    f"{name!r} resolves to a competitor already named in {entry!r}; "
+                    f"each solver goes into a removal group once"
                 )
-        resolved.append((solver, addresses, matches))
+            for match in member_matches:
+                emit(
+                    f"solver {name!r} -> {match.address}  {match.name} "
+                    f"({match.environment}, active={match.active})  "
+                    f"{match.solutions} solutions in {match.auctions_bid} auctions, "
+                    f"{match.winning_solutions} winning"
+                )
+            if len(member_matches) > 1:
+                # A key rotation: the same competitor under two submission addresses.
+                # All of them have to go together, or reference scores would treat one
+                # half of the rotation as a rival of the other.
+                emit(
+                    f"note: {len(member_matches)} addresses resolved; removing all of "
+                    f"them as one solver"
+                )
+            members.append(GroupMember(name, addresses))
+            matches.extend(member_matches)
+            group_addresses |= addresses
+        label = ",".join(m.given for m in members)
+        if len(members) > 1:
+            emit(
+                f"note: {label!r} removes {len(members)} solvers together — one joint "
+                f"counterfactual, with nothing attributed to individual members"
+            )
+        for earlier_label, _, earlier_addresses, _ in resolved:
+            # Overlap is legitimate — removing A alone and {A,B} together are two
+            # different scenarios — but the same address set twice is the same run.
+            if earlier_addresses == group_addresses:
+                raise extract.SolverResolutionError(
+                    f"{label!r} and {earlier_label!r} resolve to the same removal "
+                    f"(identical addresses); give each scenario once"
+                )
+        resolved.append((label, tuple(members), group_addresses, matches))
 
     runs = [
         SolverRun(
-            solver=solver,
+            solver=label,
             addresses=addresses,
             matches=matches,
+            members=members,
             analysis=Analysis(
-                solver=solver,
+                solver=label,
                 addresses=addresses,
                 mode=mode,
                 outcome_rule=rule,
@@ -186,7 +258,7 @@ def analyse_window(
                 exclude_price_suspect=not include_price_suspects,
             ),
         )
-        for solver, addresses, matches in resolved
+        for label, members, addresses, matches in resolved
         for rule in outcome_rules
     ]
 

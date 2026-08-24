@@ -843,6 +843,7 @@ class TestReportRoundTrip:
             solver="TestSolver",
             addresses=frozenset({"aa"}),
             matches=[],
+            members=(run_module.GroupMember("TestSolver", frozenset({"aa"})),),
             analysis=analysis,
             cow=run_module.CowConversion(
                 Decimal(1), Decimal(2), 5, 0, 0, Decimal(0)
