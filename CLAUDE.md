@@ -29,8 +29,11 @@ Both are read-only references here. Do not modify them.
    `psycopg2.connect(url)` fails on it.
 2. `proposed_trade_executions.solution_uid` joins `proposed_solutions.uid`, **not `.id`**.
    The two collide for some rows, so the wrong join half-works silently.
-3. `stg_backend_data__fee_policies` only has rows for **executed** orders, so it is not a
-   test for auction membership and protocol fees cannot be recomputed for unexecuted orders.
+3. `stg_backend_data__fee_policies` has rows for every auction order of every
+   **non-filtered-out** solution — not just executed orders, as this line used to claim.
+   It is still not a test for auction membership (use `competition_auctions.order_uids`),
+   but protocol fees *can* be recomputed for 98.9% of proposed executions
+   ([rule and measurement](docs/analytics-db.md#fee-policies-cover-every-order-of-every-kept-solution)).
 4. Surplus and score are **not** interchangeable — median score/surplus is 1.08, p90 is
    2.70, and 3.2% of bids are fee-dominated. See
    [docs/winner-selection.md](docs/winner-selection.md#measured-divergence--surplus-is-not-a-stand-in-for-score).

@@ -286,18 +286,45 @@ in recent data, despite looking like a convenient denormalised copy. Use
 `stg_backend_data__auction_prices`, which had 917 rows for auction `13509867` while the
 array columns were null.
 
-## Fee policies are incomplete
+## Fee policies cover every order of every kept solution
 
-`stg_backend_data__fee_policies` **only has rows for orders that were executed**, even
-though essentially every order carries one or more policies (only some JIT orders are
-exempt). Consequences:
+An earlier version of this section claimed the table "only has rows for orders that were
+executed". That is wrong, and it understates the coverage by an order of magnitude. The
+autopilot writes policies for the orders of every **non-filtered-out** solution
+(`autopilot/src/run_loop.rs:551`), which iterates `ranking.ranked()` — the kept set, with
+`Ranking::filtered_out` a separate field — and looks each order up in `auction.orders`.
+So the rule is:
 
-- It is not a test for "is this an auction order" — use `competition_auctions.order_uids`.
-- Protocol fees cannot be recomputed for orders that were never executed. This is why
-  solution scores are read from `proposed_solutions.score` rather than recomputed.
-- Where policies are genuinely needed for a non-executed order, backfill from another
-  auction in which the same `order_uid` was executed — policies derive from order class,
-  app data, and the quote, so they are stable across auctions for a given order.
+> An auction order has its fee policies recorded for auction `a` **iff** it appears in at
+> least one solution of `a` with `filtered_out = false`.
+
+Executed-ness never enters. Verified over auctions 13480599–13517908 with no exceptions in
+either direction: all 20,210 (auction, order) pairs appearing in a kept solution have
+policy rows, none of the 1,638 appearing only in filtered-out solutions do, and there are
+zero policy rows for an order with no trade execution in that auction.
+
+Consequences:
+
+- Still not a test for "is this an auction order" — use `competition_auctions.order_uids`.
+  An order in a filtered-out-only solution *is* an auction order with no rows.
+- Protocol fees **can** be recomputed for the great majority of proposed executions,
+  including unexecuted ones — 98.9% of execution rows in that window, and 100% of those in
+  kept solutions. See
+  [PROPOSAL-fee-aware-scoring.md](../PROPOSAL-fee-aware-scoring.md), which measures the gap
+  and reproduces `proposed_solutions.score` wei-exactly from the table.
+- JIT orders are never in `auction.orders`, so they never carry policies and their protocol
+  fee is exactly 0. That is the right answer, not a gap.
+- A covered order with no rows means "genuinely no policies, fee 0". The coverage test
+  above is what separates that from "not recorded".
+- Where policies are needed for an uncovered order, backfill from another auction
+  containing the same `order_uid` — policies derive from order class, app data, and the
+  quote, so they are stable across auctions. Measured exactly stable: of 1,485 orders
+  appearing with policies in more than one auction in that window, **all 1,485** have
+  identical policy lists in every one.
+
+`application_order` is a **global** serial, not a per-order index, so only its relative
+order within one order is meaningful — sort ascending to get the application sequence
+(which `protocol_fees` then walks in reverse).
 
 ## JIT orders are recorded only when the batch settles
 

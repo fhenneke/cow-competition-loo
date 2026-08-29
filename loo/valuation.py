@@ -1,10 +1,14 @@
 """Per-order surplus and per-solution totals, in native wei.
 
-Mirrors the surplus half of `arbitrator.rs`. Protocol fees are deliberately *not*
-reimplemented — they cannot be recomputed for orders that were never executed, because
-`stg_backend_data__fee_policies` only has rows for executed orders (see
-docs/analytics-db.md). Score therefore comes from `proposed_solutions.score`, and this
-module supplies user surplus plus the per-pair decomposition the fairness filter needs.
+Mirrors the surplus half of `arbitrator.rs`. Protocol fees are not reimplemented here:
+score comes from `proposed_solutions.score`, and this module supplies user surplus plus
+the per-pair decomposition the fairness filter needs.
+
+That split is not forced by the data. `stg_backend_data__fee_policies` covers every order
+of every non-filtered-out solution, which is enough to recompute fees for 98.9% of
+proposed executions and to put the filter's per-pair comparison on the score scale — see
+../PROPOSAL-fee-aware-scoring.md, which measures the gap and reproduces
+`proposed_solutions.score` wei-exactly. Until that lands, the filter runs on surplus.
 
 Integer arithmetic throughout.
 """
