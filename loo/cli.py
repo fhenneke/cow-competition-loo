@@ -589,6 +589,23 @@ def report_analysis(
         "   <- every delta is counterfactual minus actual"
     )
 
+    print(f"\nprotocol fee with solver      {eth(analysis.protocol_and_partner_fees_base)} ETH")
+    print(f"  of which partner fees       {eth(analysis.partner_fees_base)} ETH")
+    print(f"  the DAO's own revenue       {eth(analysis.protocol_fees_base)} ETH")
+    print(f"delta protocol fee            {eth(analysis.delta_protocol_and_partner_fees)} ETH")
+    print(f"delta partner fees            {eth(analysis.delta_partner_fees)} ETH")
+    print(
+        f"delta DAO fee revenue         {eth(analysis.delta_protocol_fees)} ETH"
+        "   <- negative: the DAO collects less without the solver"
+    )
+    if analysis.auctions_fees_incomplete:
+        print(
+            f"  {analysis.auctions_fees_incomplete} of "
+            f"{analysis.auctions_fees_counted + analysis.auctions_fees_incomplete} "
+            f"auctions left out: a filtered-out solution wins the counterfactual and "
+            f"its fee policies are unrecorded"
+        )
+
     if analysis.mode == "score":
         print(f"\nuncapped rewards with solver  {eth(analysis.rewards_base)} ETH")
         print(f"uncapped rewards without      {eth(analysis.rewards_loo)} ETH")

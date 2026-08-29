@@ -1,16 +1,17 @@
 """Per-order surplus and per-solution totals, in native wei.
 
-Mirrors the surplus half of `arbitrator.rs`. Protocol fees are not reimplemented here:
-score comes from `proposed_solutions.score`, and this module supplies user surplus plus
-the per-pair decomposition the fairness filter needs.
+Mirrors the surplus half of `arbitrator.rs`. The fee half is `fees.py`, and passing a
+`FeeContext` here adds the per-order protocol-fee decomposition alongside surplus — the
+two are exactly additive, `surplus_native + fee_native == compute_order_score(order)`.
 
-That split is not forced by the data. `stg_backend_data__fee_policies` covers every order
-of every non-filtered-out solution, which is enough to recompute fees for 98.9% of
-proposed executions and to put the filter's per-pair comparison on the score scale — see
-../PROPOSAL-fee-aware-scoring.md, which measures the gap and reproduces
-`proposed_solutions.score` wei-exactly. Until that lands, the filter runs on surplus.
+Solution *totals* still come from `proposed_solutions.score` rather than from
+`surplus + fees`: the recorded score needs no reconstruction, and the fee path has a
+narrow coverage gap the score does not (M13). The fairness filter still compares
+per-pair **surplus** — putting it on the score scale is the open proposal in
+../PROPOSAL-fee-aware-scoring.md, not something this module does yet.
 
-Integer arithmetic throughout.
+Integer arithmetic throughout, except where `fees.py` reproduces the Rust's own `f64`
+detours.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
+from .fees import EMPTY_FEE_CONTEXT, FeeContext, FeeError, order_fees
 from .primitives import Pair, as_erc20, ceil_div, price_in_eth
 from .winner_selection import Solution
 
@@ -180,10 +182,39 @@ class SolutionValuation:
     order_volume_native: dict[str, int] = field(default_factory=dict[str, int])
     """Native value of each contributing order's received leg — the denominator for
     relative price statements. Same keys as `order_surplus_native`."""
+    order_fee_native: dict[str, int] = field(default_factory=dict[str, int])
+    """Native protocol fee per contributing order, **including** partner fees — the
+    quantity `arbitrator.rs` adds to surplus to reach the score. Absent for orders whose
+    policies are not recorded for this auction; those uids are in `fees_unknown`."""
+    order_partner_fee_native: dict[str, int] = field(default_factory=dict[str, int])
+    """The partners' share of `order_fee_native`. What the DAO keeps is the difference,
+    which is non-negative because the native conversion is monotone."""
+    fees_unknown: frozenset[str] = frozenset()
+    """Contributing orders whose fee could not be computed — their policies are not
+    recorded for this auction. Every order of a solution the arbitrator *kept* is
+    recorded, so this is only ever non-empty for solutions that were filtered out."""
 
     @property
     def total(self) -> int:
         return sum(self.pair_surplus.values())
+
+    @property
+    def fee_native(self) -> int:
+        """Total protocol fee of the solution, partner fees included."""
+        return sum(self.order_fee_native.values())
+
+    @property
+    def partner_fee_native(self) -> int:
+        return sum(self.order_partner_fee_native.values())
+
+    @property
+    def protocol_fee_native_net(self) -> int:
+        """What the protocol itself keeps."""
+        return self.fee_native - self.partner_fee_native
+
+    @property
+    def fees_complete(self) -> bool:
+        return not self.fees_unknown
 
 
 def value_solution(
@@ -191,6 +222,7 @@ def value_solution(
     contributes: dict[str, bool],
     native_prices: dict[str, int],
     weth: str,
+    fee_context: FeeContext = EMPTY_FEE_CONTEXT,
 ) -> SolutionValuation:
     """Value one solution (`score_by_token_pair`, `arbitrator.rs:176`).
 
@@ -198,13 +230,23 @@ def value_solution(
     their token pair in `winner_pairs` — `pick_winners` iterates every order in the
     solution, not just the contributing ones.
 
+    `fee_context` is optional: with the default every fee reads as unrecorded, and the
+    valuation is the surplus-only one this module has always produced. Passing a real
+    one adds the protocol-fee decomposition without changing any surplus number.
+
     Raises `ValuationError` if any contributing order cannot be valued; the caller must
-    then discard the entire solution.
+    then discard the entire solution. A fee that cannot be computed is **not** such a
+    failure — `arbitrator.rs` would have discarded the solution, but here the total comes
+    from the recorded score either way, so the order is recorded in `fees_unknown` and
+    the surplus side stays intact.
     """
     pair_surplus: dict[Pair, int] = {}
     native: dict[str, int] = {}
     atoms: dict[str, int] = {}
     volumes: dict[str, int] = {}
+    fee_native: dict[str, int] = {}
+    partner_fee_native: dict[str, int] = {}
+    fees_unknown: set[str] = set()
     winner_pairs: set[Pair] = set()
     uids: set[str] = set()
 
@@ -226,6 +268,30 @@ def value_solution(
         pair = (order.sell_token, order.buy_token)
         pair_surplus[pair] = pair_surplus.get(pair, 0) + surplus_native
 
+        try:
+            split = order_fees(order, fee_context)
+        except FeeError:
+            split = None
+        if split is None:
+            fees_unknown.add(order.uid)
+        else:
+            # Each share is converted as a *difference of conversions* rather than on
+            # its own, so the decomposition is exactly additive:
+            #
+            #     surplus_native + fee_native == compute_order_score(order)
+            #
+            # to the wei, and `0 <= dao <= fee` follows from `to_native` being monotone.
+            # Converting the fee directly instead loses up to one surplus-token atom per
+            # order to the intermediate floor in `to_native` — on a six-decimal token
+            # that is ~5e8 wei, small but not nothing, and it would put a systematic
+            # gap between this decomposition and the recorded score.
+            score_native = to_native(order, surplus_atoms + split.total, native_prices)
+            protocol_native = (
+                to_native(order, surplus_atoms + split.protocol, native_prices) - surplus_native
+            )
+            fee_native[order.uid] = score_native - surplus_native
+            partner_fee_native[order.uid] = score_native - surplus_native - protocol_native
+
     return SolutionValuation(
         pair_surplus=pair_surplus,
         order_surplus_native=native,
@@ -233,6 +299,9 @@ def value_solution(
         winner_pairs=frozenset(winner_pairs),
         order_uids=frozenset(uids),
         order_volume_native=volumes,
+        order_fee_native=fee_native,
+        order_partner_fee_native=partner_fee_native,
+        fees_unknown=frozenset(fees_unknown),
     )
 
 
@@ -271,6 +340,7 @@ def build_solutions(
     weth: str,
     *,
     mode: Mode = "score",
+    fee_context: FeeContext = EMPTY_FEE_CONTEXT,
 ) -> tuple[list[ValuedBid], dict[int, str]]:
     """Value every bid in an auction, in `bid` order.
 
@@ -289,7 +359,9 @@ def build_solutions(
 
     for bid in bids:
         try:
-            valuation = value_solution(bid.orders, bid.contributes, native_prices, weth)
+            valuation = value_solution(
+                bid.orders, bid.contributes, native_prices, weth, fee_context
+            )
             total = solution_total(valuation, mode, bid.score)
         except ValuationError as error:
             failures[bid.uid] = str(error)

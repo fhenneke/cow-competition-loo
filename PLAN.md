@@ -910,3 +910,204 @@ labelled with the comma-joined names, and the `{solver}` slug hyphenates the com
 Attribution (Shapley-style splits over 2^n subsets) is explicitly out of scope; the
 milestone's stance is that the joint number is the defensible one and the reader
 combines scenarios, not the pipeline.
+
+## 14. M13 — protocol fee deltas — **done**
+
+`delta_surplus` says what a solver is worth to *users* and `delta_rewards` what it costs
+the protocol to run the competition. Neither says what the solver earns the protocol.
+This milestone adds that third number: how the protocol fee charged by the winning
+solutions changes when a solver is removed.
+
+The enabling fact is M12's, recorded in
+[docs/analytics-db.md](docs/analytics-db.md#fee-policies-cover-every-order-of-every-kept-solution):
+`stg_backend_data__fee_policies` covers every auction order of every non-filtered-out
+solution, so fees are recomputable for essentially every solution the counterfactual has
+to price — and every solution the arbitrator *kept*, by construction.
+
+### Partner fees are most of the total, so the split is not optional
+
+Over 2026-08-01..04, `int_backend_data__fees_per_trade` splits 64.7 ETH of fees into
+**33.9 ETH partner and 30.8 ETH protocol**. A "protocol fee delta" that lumps them
+together overstates what the protocol keeps by roughly a factor of two. So the report
+carries all three: `delta_protocol_and_partner_fees` (the gross figure the mechanism
+charges), `delta_partner_fees` (passed on), and `delta_protocol_fees` (what the protocol
+keeps).
+
+**Naming deliberately follows budget usage, not the database's.** The dbt models and
+`arbitrator.rs` both call the *gross* amount the "protocol fee" and need
+`protocol_fee_without_partner_fee_native` for the net one; a budget discussion means the
+net figure by "protocol fee". Since the two conventions collide on the same words, the
+gross quantity is named for what it contains — `protocol_and_partner_fees` — and
+`protocol_fees` is reserved for what the protocol keeps. `loo/fees.py` carries the
+mapping table.
+
+The split is positional, not by policy kind: the trailing `n` policies in application
+order are partner fees, where `n` is the number of recipients in the order's app data,
+with one guard (a single policy is always the protocol's). Policy kind does **not**
+identify it —
+volume policies appear on both sides of the split, 16,337 protocol and 4,592 partner.
+`n` comes from `stg_backend_data__app_data.partner_fee_recipients` joined through
+`orders.app_data`, which is a property of the app data rather than of any settlement, so
+it is available for orders that never traded. (`partner_fee_item_count` on the same table
+is NULL for all 888,760 rows — use `array_length` on the recipients.)
+
+### What was built
+
+- `loo/fees.py` — a port of `protocol_fees` (`arbitrator.rs:260`): the three policy
+  kinds, reverse application order with prices re-adjusted between policies, the quote
+  fee as an exact floored rational, and `mul_f64` reproducing `checked_mul_f64`. Plus
+  `fee_split`, the trailing-`n` rule.
+- `loo/extract.py` — policies, partner counts and quotes per chunk, and the coverage set
+  derived from data already in hand: an order is covered iff it appears in a
+  non-filtered-out solution of that auction, or is a JIT order (never has policies, so
+  its fee is a known zero). `with_fees=False` turns the three queries off.
+- `loo/valuation.py` — per-order `order_fee_native` and `order_partner_fee_native`.
+- `loo/counterfactual.py` — the fee carried through `OrderOutcome` and `OrderDiff` to
+  `delta_protocol_fees` / `delta_partner_fees` / `delta_protocol_fees` per auction and per
+  window.
+- Report **format 6**. The table is ordered by what a reader should hit first:
+**Δsurplus, Δprotocol fee, orders no longer executed**, then the relative price change
+and Δpartner fee, then the rest. `Δprotocol fee` is the gross figure — what the mechanism
+charges — with the partner and protocol split one tier below it. The lost-order count is
+over **every execution the window traded**, not over the solver's own auctions: a
+selective bidder would otherwise look indispensable. The order is asserted in
+`tests/test_aggregate.py` rather than left to drift.
+
+### The decomposition is exactly additive
+
+Each share is converted to native as a *difference of conversions* rather than on its
+own:
+
+```
+fee_native = to_native(surplus + fee) - to_native(surplus)
+dao_native = to_native(surplus + dao) - to_native(surplus)
+```
+
+so `surplus_native + fee_native == compute_order_score(order)` to the wei, and
+`0 <= dao <= fee` follows from `to_native` being monotone. Converting the fee directly
+loses up to one surplus-token atom per order to the intermediate floor — ~5e8 wei on a
+six-decimal token, which showed up immediately as a constant per-order offset against the
+recorded score.
+
+### Validation
+
+Three independent checks, all exact:
+
+| check | result |
+| --- | --- |
+| `surplus + fees` vs `proposed_solutions.score`, through the real extraction path | **2,512 / 2,512** wei-exact (13509000–13509867) |
+| fee **atoms** and the partner split vs `int_backend_data__fees_per_trade` | **9,340 / 9,340** exact, both quantities (13480599–13500000) |
+| the standalone port vs the recorded score | 19,653 / 19,653 (M12, auctions 13505000–13509867) |
+
+The second is the one that matters for this milestone: it validates the trailing-`n`
+partner rule against a model derived from settlement data by a completely different
+route, on both the total and the split, with not one row differing in either quantity.
+`proposals/fee-aware-scoring/` carries the M12 scripts; this one is
+`tests/test_fees.py` plus the cross-check described above.
+
+### Cost
+
+The three extra queries add about **12%** to extraction — 27.5 → 30.9 ms/auction warm,
+measured over 238 auctions. They are indexed lookups (`fee_policies` is unique on
+`(auction_id, order_uid, application_order)`) and the quote query is restricted to orders
+that actually carry a price-improvement policy. `with_fees=False` turns them off for
+callers that do not need fees.
+
+### Coverage of the fee delta
+
+An auction's fee deltas are formed only when **every** executed contributing order on
+both sides could be priced; otherwise both sides drop together and the auction is counted
+in `auctions_fees_incomplete`, the same like-for-like discipline `auctions_capped_skipped`
+uses. The gap is one-sided and narrow — it needs a solution the recorded competition
+filtered out to win the counterfactual. Over 2026-08-01..04 it is **4 to 7 auctions per
+solver** (0.07–0.17%): 4 of 5,842 for Fractal, 6 of 4,839 for Sector, 7 of 4,117 for
+Barter.
+
+Note the "executed" in that rule: an order that did not trade pays nothing, so its fee is
+a known zero whatever its policies say, and only an *executed* order can be unpriced.
+Getting that wrong excluded auctions where a winner simply failed to settle.
+
+### The deltas run over the union of both sides, not the intersection
+
+`protocol_fees_base`/`_loo` sum over every order either side's winners traded, with the
+absent side reading 0, so an order that **stops being executed** contributes its whole
+fee to the delta rather than dropping out of the comparison. That is the same convention
+`delta_surplus` uses, and it is not a detail — decomposing Δprotocol fees for Sector over
+2026-08-01:
+
+| | Δprotocol fees | orders |
+| --- | --- | --- |
+| executed on both sides | −0.1266 ETH | 1,991 |
+| **executed only with the solver** | **−0.1380 ETH** | **58** |
+| executed only without | +0.0008 ETH | 2 |
+| total | −0.2637 ETH | |
+
+**More than half the fee delta comes from 58 orders that stop trading at all**, against
+1,991 that trade on both sides. A fee delta restricted to still-traded orders would miss
+the larger half, which is why `orders no longer executed` is a headline row beside the
+fee itself.
+
+### Reading the number
+
+`delta_protocol_fees` is **gross** revenue. The protocol also pays for the competition, so it
+belongs in the same sentence as `delta_rewards`. Over 2026-08-01..04 on mainnet, in ETH
+(deltas are counterfactual − actual, so negative means the protocol gets less without the
+solver):
+
+| removed | Δsurplus | Δprotocol fees | Δpartner fees | Δrewards | protocol fees with it |
+| --- | --- | --- | --- | --- | --- |
+| Fractal | −0.2631 | **−0.3757** | −0.0014 | +0.1784 | 8.3292 |
+| Sector | −1.3259 | **−1.1773** | −0.0079 | +3.0783 | 9.9366 |
+| Barter | −0.4740 | **−0.4659** | −0.0026 | −0.6055 | 6.0508 |
+
+The fee delta is the **same order as the surplus delta** and for Fractal 1.4x larger, so
+a solver's value to the protocol is not a small correction on its value to users. That is
+not an artefact of one solver: score is surplus plus fees, and 3.2% of bids are
+fee-dominated with a median score/surplus of 1.08
+([measured](docs/winner-selection.md#measured-divergence--surplus-is-not-a-stand-in-for-score)),
+so a mechanism that ranks on score is buying fee capture as much as user surplus. Until
+now the analysis could only see one of those.
+
+The reward column does not follow the fee column: removing Fractal or Sector makes the
+protocol pay *more* while collecting less, but removing Barter lowers both. Whether a
+solver is worth its rewards is therefore a genuinely per-solver question, which is the
+argument for reporting the three deltas side by side rather than reducing them.
+
+### How much of the fee delta is the partners' varies enormously by chain
+
+Partner fees are the larger half of the mainnet *level* — 33.9 ETH against 30.8 ETH over
+2026-08-01..04 — and on mainnet their *delta* is three orders of magnitude below the
+protocol's. It is tempting to conclude that partner fees carry the revenue and none of
+the sensitivity, and an earlier draft of this section said exactly that. **The July
+multi-chain run refutes it.** The partners' share of the fee delta, per solver-chain:
+
+| | partner share of Δ(protocol and partner) fees |
+| --- | --- |
+| Baseline on polygon | **74%** ($132 of $179) |
+| Rizzolver on base | 27% |
+| Rizzolver on mainnet | 12% |
+| Baseline on xdai, plasma | **~0%** |
+
+The mechanism survives and explains the spread. A partner fee is a **volume** policy
+(4,592 of 4,634 partner rows in the M1 window), so it depends only on whether the order
+filled, not on the price it got: it is untouched when a rival simply wins the same order,
+and lost entirely when the order stops trading. So the partner share of the delta tracks
+**how much of the removal's cost is coverage rather than price**. Mainnet removals are
+mostly price effects, so partner fees sit still; polygon's Baseline removal costs 5.2% of
+the chain's executions, so they go with the orders.
+
+The lesson for the report shape is unchanged — the split has to be shown, because neither
+half is a fixed fraction of the other — but the generalisation "partner fees do not move"
+is mainnet-only and should not be repeated.
+
+The mechanism is in the policy kinds: partner fees are essentially all volume policies
+(4,592 of 4,634 partner rows in the M1 window), so they track whether an order trades at
+all. The protocol's own fees are surplus and price-improvement policies, which track how
+*well* the order is filled. So on a chain where removal costs price, the movement is
+almost entirely the protocol's own revenue; on a chain where it costs coverage, the
+partners lose too. Lumping the two together both doubles the apparent level and hides
+which of the two effects a solver's value actually consists of.
+
+Out of scope, deliberately: netting fees against rewards into a single "solver profit"
+figure. The two have different confidence (fees are exact, uncapped rewards are not the
+payout) and combining them would hide that.

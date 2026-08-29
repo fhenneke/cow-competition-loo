@@ -326,6 +326,46 @@ Consequences:
 order within one order is meaningful — sort ascending to get the application sequence
 (which `protocol_fees` then walks in reverse).
 
+## Partner fees are the trailing policies, and they are most of the total
+
+An order's fee policies are not all the protocol's. The list ends with one entry per
+partner declared in the order's app data, and those are passed straight on, so a
+"protocol fee" that includes them roughly doubles what the protocol actually keeps.
+Measured
+over 2026-08-01..04 on `int_backend_data__fees_per_trade`: **33.9 ETH partner against
+30.8 ETH protocol**.
+
+The split is **positional**, and policy kind does not encode it — volume policies appear
+on both sides (16,337 protocol, 4,592 partner), and even price improvement shows up as a
+partner fee occasionally (42 rows). The rule
+(`int_backend_data__fees_per_trade.sql`) is:
+
+> With `L` fee policies in application order and `n` partner recipients declared in the
+> order's app data, the **trailing `n`** are partner fees and the rest are the
+> protocol's — except that `L = 1` is always the protocol's, whatever `n` says.
+
+`n` comes from `stg_backend_data__app_data`, joined `orders.app_data =
+app_data.contract_app_data`:
+
+```sql
+coalesce(array_length(ad.partner_fee_recipients, 1), 0)
+```
+
+Two traps in that one line:
+
+- **`partner_fee_item_count` is dead** — NULL for all 888,760 rows. It looks like exactly
+  the column you want. Use `array_length` on `partner_fee_recipients`, which is populated
+  (111,537 rows with one recipient, 979 with two).
+- The join is on **app data, not on a settlement**, so unlike
+  `int_backend_data__trade_data_unprocessed` it answers for orders that never traded —
+  which is what a counterfactual needs. Coverage is 17,813 of 17,877 traded user orders
+  (99.6%); the missing rows default to zero partners.
+
+Verified by reproducing the model's own split from `stg_backend_data__fee_policies` plus
+this count: **16,431 of 16,431 settled trades match exactly**, and the policy-list length
+agrees with the model's fee count on every one of them. `loo.fees.fee_split` implements
+it.
+
 ## JIT orders are recorded only when the batch settles
 
 `stg_backend_data__jit_orders` is populated from settlements, so the JIT orders of

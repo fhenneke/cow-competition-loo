@@ -339,8 +339,30 @@ def analyse_window(
 # `aggregate.load_report`. The payload is derived from the dataclasses, so a statistic
 # is named once — on its field or property — and the file follows.
 
-_ANALYSIS_PROPERTIES = ("delta_surplus", "delta_rewards", "delta_rewards_capped")
-_AUCTION_PROPERTIES = ("delta_surplus", "delta_rewards", "delta_rewards_capped")
+_FEE_PROPERTIES = (
+    "delta_protocol_and_partner_fees",
+    "delta_partner_fees",
+    "delta_protocol_fees",
+    "protocol_fees_base",
+    "protocol_fees_loo",
+)
+_ANALYSIS_PROPERTIES = (
+    "delta_surplus",
+    "delta_rewards",
+    "delta_rewards_capped",
+    *_FEE_PROPERTIES,
+)
+_AUCTION_PROPERTIES = (
+    "delta_surplus",
+    "delta_rewards",
+    "delta_rewards_capped",
+    "fees_complete",
+    "protocol_and_partner_fees_base",
+    "protocol_and_partner_fees_loo",
+    "partner_fees_base",
+    "partner_fees_loo",
+    *_FEE_PROPERTIES,
+)
 
 
 def _fields_and_properties(obj: Any, properties: Sequence[str]) -> dict[str, Any]:

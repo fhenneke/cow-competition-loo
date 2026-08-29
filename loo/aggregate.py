@@ -26,7 +26,7 @@ implied per auction by the median stablecoin price in the auction's own price ve
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, getcontext
 from statistics import median
@@ -44,10 +44,11 @@ WEI = Decimal(10) ** 18
 HEADLINE_RULE = "inherited"
 ALTERNATIVE_RULES = ("assume-settled",)
 
-REPORT_FORMAT = 5
+REPORT_FORMAT = 6
 """Version marker of the `analyse --out` payload, required by `load_report`. Bumped
 when the shape changes, so a stale file fails with "re-run analyse" instead of a
-KeyError deep inside a comparison. Format 5 added the window's executed order count
+KeyError deep inside a comparison. Format 6 added the protocol-fee deltas — total,
+partner share and the DAO's own revenue (M13). Format 5 added the window's executed order count
 including partially fillable orders — the denominator of the coverage share (D24).
 Format 4 added the window's recorded executed volume — the denominator of "averaged
 over all traded volume". Format 3 added per-order volumes and `partially_fillable`
@@ -139,6 +140,11 @@ class AuctionMove:
     rather than moved to a worse price."""
     delta_rewards: int
     delta_rewards_capped: Decimal | None
+    delta_protocol_and_partner_fees: int = 0
+    delta_partner_fees: int = 0
+    delta_protocol_fees: int = 0
+    """Per-auction fee deltas, so the USD conversion uses each auction's own rate rather
+    than a window average — the same treatment Δsurplus gets."""
 
 
 @dataclass(frozen=True)
@@ -169,6 +175,19 @@ class Report:
     auctions_filter_relaxed: int
     auctions_newly_kept_won: int
     delta_surplus: int
+    delta_protocol_and_partner_fees: int
+    delta_partner_fees: int
+    delta_protocol_fees: int
+    protocol_fees_base: int
+    auctions_fees_incomplete: int
+    """How the protocol fee changes without the solver. `delta_protocol_and_partner_fees` is the
+    whole fee the mechanism charges and is the headline; `delta_partner_fees` is the
+    share passed on to partners, and `delta_protocol_fees` the remainder the DAO keeps.
+    Partner fees are most of the *level* and almost none of the movement — see
+    docs/analytics-db.md. All three are over the **union** of orders traded by either
+    side, so an order that stops being executed contributes its whole fee.
+    `auctions_fees_incomplete` counts auctions left out of all three because some
+    executed order's policies are unrecorded (M13)."""
     delta_rewards: int | None
     delta_rewards_capped: Decimal | None
     auctions_capped_skipped: int
@@ -385,6 +404,9 @@ def load_report(path: str) -> Report:
                 if row["delta_rewards_capped"] is not None
                 else None
             ),
+            delta_protocol_and_partner_fees=row["delta_protocol_and_partner_fees"],
+            delta_partner_fees=row["delta_partner_fees"],
+            delta_protocol_fees=row["delta_protocol_fees"],
         )
         for row in payload["changed"]
     )
@@ -416,6 +438,11 @@ def load_report(path: str) -> Report:
         missing_data=len(payload["missing_data_auctions"]),
         auctions=payload["auctions"],
         auctions_with_solver=payload["auctions_with_solver"],
+        delta_protocol_and_partner_fees=payload["delta_protocol_and_partner_fees"],
+        delta_partner_fees=payload["delta_partner_fees"],
+        delta_protocol_fees=payload["delta_protocol_fees"],
+        protocol_fees_base=payload["protocol_fees_base"],
+        auctions_fees_incomplete=payload["auctions_fees_incomplete"],
         auctions_solver_won=payload["auctions_solver_won_baseline"],
         auctions_winner_set_changed=payload["auctions_winner_set_changed"],
         auctions_filter_relaxed=payload["auctions_filter_relaxed"],
@@ -679,6 +706,22 @@ def _surplus_cell(report: Report, usd: UsdContext | None) -> str:
     return cell
 
 
+def _fee_cell(
+    report: Report,
+    usd: UsdContext | None,
+    total: int,
+    per_auction: Callable[[AuctionMove], int],
+) -> str:
+    """A fee delta with its USD restatement, converted **per auction** at that auction's
+    own rate — the same treatment `_surplus_cell` gives Δsurplus, which matters because
+    a month of a volatile chain is not well described by one rate."""
+    cell = f"{signed_eth(total)} ETH"
+    if usd:
+        deltas = {move.auction_id: per_auction(move) for move in report.moves}
+        cell += f" ({usd_amount(usd_total(deltas, usd))})"
+    return cell
+
+
 def comparison(
     windows: Sequence[SolverWindow],
     usd_by_network: Mapping[str, UsdContext] | None = None,
@@ -696,25 +739,38 @@ def comparison(
         rows.append((label, cells))
         return cells
 
+    # Row order is the reading order: the three headline numbers first, the two
+    # second-tier ones next, then the detail behind each. Sub-rows are indented and
+    # follow the row they qualify.
     auctions = row("auctions analysed")
     bid = row("solver bid")
     won = row("solver won")
+
+    # --- headline
     surplus = row("Δsurplus (inherited)")
     alternatives = {rule: row(f"  {rule}") for rule in ALTERNATIVE_RULES}
+    protocol_and_partner_fees = row("Δprotocol and partner fees")
+    saved_share = row("orders no longer executed")
+
+    # --- second tier
+    price_change = row("relative price change, still-traded orders")
+    price_median = row("  median moved order")
+    partner_fees = row("Δpartner fee")
+    protocol_fees = row("Δprotocol fee")
+
+    # --- detail
     surplus_median = row("  median non-zero auction")
     surplus_signs = row("  auctions moved + / −")
     surplus_whale = row("  largest single auction")
+    saved_surplus = row("  Δsurplus from orders no longer executed")
+    saved = row("  share of orders in auctions the solver bid in")
+    saved_distinct = row("  of which distinct orders")
+    only_without = row("orders executed only without")
+    price_overall = row("  price change over all traded volume")
+    protocol_fees_base_row = row("  DAO fee revenue with the solver")
     rewards_uncapped = row("Δrewards uncapped")
     rewards_capped = row("Δrewards capped (estimate)")
     net = row("net change (Δsurplus − capped Δrewards)")
-    saved = row("orders executed only with the solver")
-    saved_surplus = row("  Δsurplus from those orders")
-    saved_share = row("  share of the window's order executions")
-    saved_distinct = row("  of which distinct orders")
-    only_without = row("orders executed only without")
-    price_change = row("relative price change, still-traded orders")
-    price_median = row("  median moved order")
-    price_overall = row("  averaged over all traded volume")
     affected = row("auctions where anything moved")
     relaxed = row("fairness filter relaxed")
 
@@ -771,14 +827,35 @@ def comparison(
         else:
             surplus_whale.append("n/a")
 
+        # The headline fee number is the whole protocol fee, partner share included —
+        # that is what the mechanism charges. The split follows one tier down, because
+        # partner fees are most of the *level* but almost none of the sensitivity.
+        headline = _fee_cell(
+            report, usd, report.delta_protocol_and_partner_fees,
+            lambda m: m.delta_protocol_and_partner_fees,
+        )
+        if report.auctions_fees_incomplete:
+            headline += f" ({report.auctions_fees_incomplete:,} auctions unpriced)"
+        protocol_and_partner_fees.append(headline)
+        partner_fees.append(
+            _fee_cell(
+                report, usd, report.delta_partner_fees, lambda m: m.delta_partner_fees
+            )
+        )
+        protocol_fees.append(
+            _fee_cell(
+                report, usd, report.delta_protocol_fees, lambda m: m.delta_protocol_fees
+            )
+        )
+        protocol_fees_base_row.append(f"{eth(report.protocol_fees_base, 4)} ETH")
+
         rewards_uncapped.append(_rewards_cell(report, usd, capped=False))
         rewards_capped.append(_rewards_cell(report, usd, capped=True))
         net.append(_net_cell(report, usd))
 
         saved.append(
-            f"{report.orders_only_with_solver:,} "
-            f"({pct(report.orders_only_with_solver, report.orders_compared)} "
-            f"of {report.orders_compared:,} compared)"
+            f"{pct(report.orders_only_with_solver, report.orders_compared)} "
+            f"of {report.orders_compared:,} compared"
         )
         saved_cell = f"{signed_eth(report.delta_surplus_only_with)} ETH"
         if usd:
@@ -789,12 +866,12 @@ def comparison(
         saved_surplus.append(saved_cell)
         share = report.coverage_share
         if share is None:
-            saved_share.append("n/a — the window traded nothing")
+            saved_share.append(f"{report.orders_only_with_solver:,} — no window total")
             saved_distinct.append("n/a — the window traded nothing")
         else:
             saved_share.append(
-                f"{share:.3%} ({report.orders_only_with_solver:,} of "
-                f"{report.window_executions:,})"
+                f"{report.orders_only_with_solver:,} "
+                f"({share:.3%} of the window's {report.window_executions:,} executions)"
             )
             distinct = report.orders_only_with_fok + report.orders_only_with_partial
             share_fok = report.coverage_share_fok

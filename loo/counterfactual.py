@@ -179,6 +179,18 @@ class OrderOutcome:
     """Carried so the aggregation can exclude partially fillable orders from the
     relative-price statistic: the two sides may execute different amounts, and Δsurplus
     over one side's volume is then a mixture of price and quantity."""
+    fee_native: int | None = None
+    """Protocol fee this order paid, partner fees included — the rest of the CIP-38
+    score. `None` when the order did not execute *or* when its policies are not recorded
+    for this auction; `fees_known` tells the two apart, because an unrecorded fee must
+    not be read as a fee of zero."""
+    partner_fee_native: int | None = None
+    """The partners' share of `fee_native`. What the DAO keeps is the difference."""
+    fees_known: bool = True
+    """False only when the order **executed** and its fee could not be computed. An
+    unexecuted order pays nothing, so its contribution is a known zero however its
+    policies stand. Only ever false for a solution the recorded arbitration filtered
+    out, since every order of a kept solution has its policies recorded."""
 
 
 UNEXECUTED = OrderOutcome(executed=False, surplus_native=None, contributes=False)
@@ -484,6 +496,21 @@ def side_outcomes(
                     else None
                 ),
                 partially_fillable=order.partially_fillable,
+                fee_native=(
+                    entry.valuation.order_fee_native.get(order.uid, 0)
+                    if executed and order.uid not in entry.valuation.fees_unknown
+                    else None
+                ),
+                partner_fee_native=(
+                    entry.valuation.order_partner_fee_native.get(order.uid, 0)
+                    if executed and order.uid not in entry.valuation.fees_unknown
+                    else None
+                ),
+                # An order that did not execute pays no fee, whether or not its
+                # policies are recorded — so only an executed order can be unpriced.
+                fees_known=(
+                    not executed or order.uid not in entry.valuation.fees_unknown
+                ),
             )
 
     return SideOutcomes(
@@ -531,6 +558,44 @@ class OrderDiff:
     partially_fillable: bool = False
     """Excluded from the relative-price statistic: the two sides may execute different
     amounts, and Δsurplus over one side's volume is then not a price change."""
+
+    fee_base: int | None = None
+    fee_loo: int | None = None
+    partner_fee_base: int | None = None
+    partner_fee_loo: int | None = None
+    """Protocol fee and its partner share on each side, `None` when that side did not
+    execute the order or could not compute the fee."""
+    fees_known_base: bool = True
+    fees_known_loo: bool = True
+    """False when that side executed the order but its policies are unrecorded. The
+    auction's fee deltas are then not computable and are reported as unavailable —
+    substituting zero would read as "the fee did not move"."""
+
+    @property
+    def fees_known(self) -> bool:
+        """Can this order's fee delta be formed at all?"""
+        return self.fees_known_base and self.fees_known_loo
+
+    @property
+    def delta_protocol_and_partner_fee(self) -> int:
+        """Counterfactual minus actual, over the whole protocol fee (partner included).
+
+        Negative means less fee was charged without the removed solver.
+        """
+        return (self.fee_loo or 0) - (self.fee_base or 0)
+
+    @property
+    def delta_partner_fee(self) -> int:
+        return (self.partner_fee_loo or 0) - (self.partner_fee_base or 0)
+
+    @property
+    def delta_protocol_fee(self) -> int:
+        """The protocol's own revenue: `delta_protocol_and_partner_fee` net of the partners' share.
+
+        This is the direct value-to-the-protocol number. Negative means the DAO would
+        collect less without the removed solver.
+        """
+        return self.delta_protocol_and_partner_fee - self.delta_partner_fee
 
     @property
     def unsettled_base(self) -> bool:
@@ -590,6 +655,12 @@ def diff_outcomes(
                 volume_loo=right.volume_native,
                 # A property of the order itself, so any side that saw it agrees.
                 partially_fillable=left.partially_fillable or right.partially_fillable,
+                fee_base=left.fee_native,
+                fee_loo=right.fee_native,
+                partner_fee_base=left.partner_fee_native,
+                partner_fee_loo=right.partner_fee_native,
+                fees_known_base=left.fees_known,
+                fees_known_loo=right.fees_known,
             )
         )
     return tuple(diffs)
@@ -722,6 +793,63 @@ class AuctionCounterfactual:
         return sum(d.surplus_loo or 0 for d in self.order_diffs if d.contributes)
 
     @property
+    def fees_complete(self) -> bool:
+        """Could every executed contributing order's fee be computed, on both sides?
+
+        When false the auction's fee deltas are not formed at all. The gap is narrow and
+        one-sided: every order of a solution the arbitrator kept has its policies
+        recorded, so this can only fail where a solution the recorded competition
+        filtered out wins the counterfactual.
+        """
+        return all(d.fees_known for d in self.order_diffs if d.contributes)
+
+    @property
+    def protocol_and_partner_fees_base(self) -> int:
+        """Protocol fee charged by the winners, partner fees included."""
+        return sum(d.fee_base or 0 for d in self.order_diffs if d.contributes)
+
+    @property
+    def protocol_and_partner_fees_loo(self) -> int:
+        return sum(d.fee_loo or 0 for d in self.order_diffs if d.contributes)
+
+    @property
+    def partner_fees_base(self) -> int:
+        return sum(d.partner_fee_base or 0 for d in self.order_diffs if d.contributes)
+
+    @property
+    def partner_fees_loo(self) -> int:
+        return sum(d.partner_fee_loo or 0 for d in self.order_diffs if d.contributes)
+
+    @property
+    def protocol_fees_base(self) -> int:
+        """What the protocol itself kept — the total net of partner fees."""
+        return self.protocol_and_partner_fees_base - self.partner_fees_base
+
+    @property
+    def protocol_fees_loo(self) -> int:
+        return self.protocol_and_partner_fees_loo - self.partner_fees_loo
+
+    @property
+    def delta_protocol_and_partner_fees(self) -> int:
+        """Change in total protocol fee: without-solver minus with-solver."""
+        return self.protocol_and_partner_fees_loo - self.protocol_and_partner_fees_base
+
+    @property
+    def delta_partner_fees(self) -> int:
+        return self.partner_fees_loo - self.partner_fees_base
+
+    @property
+    def delta_protocol_fees(self) -> int:
+        """Change in the protocol's own fee revenue — the value-to-the-protocol number.
+
+        Negative means the DAO collects less without the removed solver, i.e. the solver
+        was earning the protocol money. Note this is a *gross* revenue change: the
+        protocol also pays rewards, and `delta_rewards` moves the other way, so the two
+        belong in the same sentence.
+        """
+        return self.protocol_fees_loo - self.protocol_fees_base
+
+    @property
     def rewards_base(self) -> int:
         return sum(r.uncapped_reward for r in self.baseline_rewards.values())
 
@@ -794,7 +922,11 @@ def analyse_auction(
     )
 
     valued, failures = build_solutions(
-        bundle.bids, bundle.native_prices, weth, mode=mode
+        bundle.bids,
+        bundle.native_prices,
+        weth,
+        mode=mode,
+        fee_context=bundle.fee_context,
     )
 
     executed_volume = executed_orders = executed_orders_all = 0
@@ -997,6 +1129,22 @@ class Analysis:
     surplus_base: int = 0
     surplus_loo: int = 0
 
+    protocol_and_partner_fees_base: int = 0
+    protocol_and_partner_fees_loo: int = 0
+    partner_fees_base: int = 0
+    partner_fees_loo: int = 0
+    """Protocol fee charged by the winners on each side, and the partners' share of it,
+    summed over the auctions where **both** sides could be priced in full. The
+    protocol's own revenue is the difference, and its delta is the direct
+    value-to-the-protocol number: the fee side of what a solver is worth, where
+    `delta_surplus` is the user side and `delta_rewards` the cost side."""
+    auctions_fees_counted: int = 0
+    auctions_fees_incomplete: int = 0
+    """Auctions left out of the fee sums because some executed order's policies are not
+    recorded — which happens only when a solution the recorded competition filtered out
+    wins the counterfactual. Both sides drop together so the fee delta stays
+    like-for-like, exactly as `auctions_capped_skipped` does for capped rewards."""
+
     window_volume_base: int = 0
     window_orders_base: int = 0
     window_order_executions_base: int = 0
@@ -1114,6 +1262,37 @@ class Analysis:
         return self.surplus_loo - self.surplus_base
 
     @property
+    def delta_protocol_and_partner_fees(self) -> int:
+        """Counterfactual minus actual, over the whole protocol fee (partner included).
+        Negative means less fee was charged without the solver."""
+        return self.protocol_and_partner_fees_loo - self.protocol_and_partner_fees_base
+
+    @property
+    def delta_partner_fees(self) -> int:
+        return self.partner_fees_loo - self.partner_fees_base
+
+    @property
+    def protocol_fees_base(self) -> int:
+        return self.protocol_and_partner_fees_base - self.partner_fees_base
+
+    @property
+    def protocol_fees_loo(self) -> int:
+        return self.protocol_and_partner_fees_loo - self.partner_fees_loo
+
+    @property
+    def delta_protocol_fees(self) -> int:
+        """Counterfactual minus actual, over the protocol's own fee revenue.
+
+        Negative means the DAO would collect less without the solver — the direct
+        value-to-the-protocol number, and the one to read rather than
+        `delta_protocol_and_partner_fees`, since partner fees are passed straight on.
+
+        It is a *gross* revenue change. The protocol also pays for the competition, and
+        `delta_rewards` usually moves the other way, so the two belong together.
+        """
+        return self.protocol_fees_loo - self.protocol_fees_base
+
+    @property
     def delta_rewards(self) -> int:
         """Counterfactual minus actual: positive means the protocol would pay more
         without the solver."""
@@ -1157,6 +1336,14 @@ class Analysis:
         self.auctions_baseline_differs_from_db += not result.baseline_matches_db
         self.surplus_base += result.surplus_base
         self.surplus_loo += result.surplus_loo
+        if result.fees_complete:
+            self.auctions_fees_counted += 1
+            self.protocol_and_partner_fees_base += result.protocol_and_partner_fees_base
+            self.protocol_and_partner_fees_loo += result.protocol_and_partner_fees_loo
+            self.partner_fees_base += result.partner_fees_base
+            self.partner_fees_loo += result.partner_fees_loo
+        else:
+            self.auctions_fees_incomplete += 1
         self.rewards_base += result.rewards_base
         self.rewards_loo += result.rewards_loo
         self.removed_reward_base += sum(

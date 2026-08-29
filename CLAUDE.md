@@ -62,7 +62,12 @@ Both are read-only references here. Do not modify them.
     the M1 window, so any `ilike '%…%'` silently removes two competitors. One name can also
     mean several addresses (key rotations) and all of them must go together
     ([traps](docs/analytics-db.md#resolving-a-solver-name)).
-11. `stg_backend_data__jit_orders` only records JIT orders of **settled** batches, so an
+11. Partner fees are **most** of the protocol fee (33.9 of 64.7 ETH over 2026-08-01..04),
+    and they are identified by **position** — the trailing `n` policies in application
+    order — not by policy kind. `n` is `array_length(app_data.partner_fee_recipients, 1)`;
+    the `partner_fee_item_count` column that looks made for this is NULL in all 888,760
+    rows ([rule](docs/analytics-db.md#partner-fees-are-the-trailing-policies-and-they-are-most-of-the-total)).
+12. `stg_backend_data__jit_orders` only records JIT orders of **settled** batches, so an
     unsettled solution's JIT orders are in neither order table and its auction cannot be
     arbitrated faithfully. `analyse`/`validate` exclude such auctions transparently
     (~0.8% of a month, D17); a crash on `MissingOrderError` means a caller bypassed the

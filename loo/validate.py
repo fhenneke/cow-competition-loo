@@ -314,7 +314,11 @@ def check_auction(
 ) -> AuctionReport:
     """Reproduce one auction and diff it against the DB."""
     valued, failures = build_solutions(
-        bundle.bids, bundle.native_prices, weth, mode=mode
+        bundle.bids,
+        bundle.native_prices,
+        weth,
+        mode=mode,
+        fee_context=bundle.fee_context,
     )
     solutions = [v.solution for v in valued]
     ranking = arbitrate(solutions, max_winners)

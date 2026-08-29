@@ -86,17 +86,22 @@ def move(
     rewards: int = 0,
     capped: str | None = "0",
     order_diffs: list[dict[str, Any]] | None = None,
+    fees: tuple[int, int, int] = (0, 0, 0),
 ) -> dict[str, Any]:
     if order_diffs is None:
         # Executed on both sides by default: the delta is price movement, so the
         # coverage slice stays zero unless a test asks for an only-with diff.
         order_diffs = [diff(max(-surplus, 0), max(surplus, 0))] if surplus else []
+    gross, partner, protocol = fees
     return {
         "auction_id": auction_id,
         "delta_surplus": surplus,
         "delta_rewards": rewards,
         "delta_rewards_capped": capped,
         "order_diffs": order_diffs,
+        "delta_protocol_and_partner_fees": gross,
+        "delta_partner_fees": partner,
+        "delta_protocol_fees": protocol,
     }
 
 
@@ -131,6 +136,11 @@ def payload(
         "auctions_filter_relaxed": 2,
         "auctions_newly_kept_won": 2,
         "delta_surplus": sum(m["delta_surplus"] for m in changed),
+        "delta_protocol_and_partner_fees": -5 * ONE,
+        "delta_partner_fees": -2 * ONE,
+        "delta_protocol_fees": -3 * ONE,
+        "protocol_fees_base": 20 * ONE,
+        "auctions_fees_incomplete": 0,
         "delta_rewards": sum(m["delta_rewards"] for m in changed),
         "capped_estimate": True,
         "delta_rewards_capped": str(
@@ -601,11 +611,74 @@ class TestComparison:
         assert rows["net change (Δsurplus − capped Δrewards)"][fractal] == "-0.5000 ETH"
         assert "over 2 auctions" in rows["  median non-zero auction"][fractal]
         assert "auction 1" in rows["  largest single auction"][fractal]
-        assert rows["orders executed only with the solver"][fractal].startswith(
-            "1 (0.2% of 500"
+        # The headline count is over every execution the window traded, not over the
+        # solver's own auctions: a selective bidder would otherwise look indispensable.
+        assert rows["orders no longer executed"][fractal] == (
+            "1 (0.002% of the window's 60,000 executions)"
         )
-        assert rows["  Δsurplus from those orders"][fractal] == "-0.5000 ETH"
-        assert rows["  Δsurplus from those orders"][sector] == "0.0000 ETH"
+        assert rows["  share of orders in auctions the solver bid in"][fractal] == (
+            "0.2% of 500 compared"
+        )
+        assert rows["  Δsurplus from orders no longer executed"][fractal] == "-0.5000 ETH"
+        assert rows["  Δsurplus from orders no longer executed"][sector] == "0.0000 ETH"
+
+    def test_headline_rows_lead_the_table(self, tmp_path: Path):
+        """Row order is the reading order, so it is asserted rather than left to drift.
+
+        Δsurplus, Δprotocol fee and the count of orders that stop trading are the three
+        numbers a reader should hit first; the relative price change and the partner
+        split come next, and everything else is detail behind them.
+        """
+        table = self.build(tmp_path)
+        labels = [label for label, _ in table.rows]
+
+        top_level = [label for label in labels if not label.startswith("  ")]
+        assert top_level[:6] == [
+            "auctions analysed",
+            "solver bid",
+            "solver won",
+            "Δsurplus (inherited)",
+            "Δprotocol and partner fees",
+            "orders no longer executed",
+        ]
+        assert top_level[6:9] == [
+            "relative price change, still-traded orders",
+            "Δpartner fee",
+            "Δprotocol fee",
+        ]
+        assert labels.index("Δrewards uncapped") > labels.index("Δprotocol fee")
+
+    def test_fee_deltas_are_converted_per_auction(self, tmp_path: Path):
+        """A month of a volatile chain is not well described by one rate, so the fee
+        columns convert per auction at that auction's own rate — the same treatment
+        Δsurplus already gets. Without this the artifact's cross-chain totals would
+        silently mix a window average into an otherwise per-auction table."""
+        changed = [
+            move(1, ONE, fees=(-2 * ONE, -ONE, -ONE)),
+            move(2, ONE, fees=(-4 * ONE, -ONE, -3 * ONE)),
+        ]
+        path = write_report(tmp_path, "r.json", payload(changed=changed))
+        report = load_report(path)
+
+        assert [m.delta_protocol_and_partner_fees for m in report.moves] == [
+            -2 * ONE,
+            -4 * ONE,
+        ]
+        assert [m.delta_protocol_fees for m in report.moves] == [-ONE, -3 * ONE]
+
+    def test_fee_labels_follow_budget_usage_not_the_database(self, tmp_path: Path):
+        """The headline is the gross figure the mechanism charges, named for what it
+        contains. "Δprotocol fee" is reserved for what the protocol actually keeps,
+        which is what a budget means by the term — the DB and `arbitrator.rs` both use
+        "protocol fee" for the gross, and that collision is the whole reason to be
+        explicit here."""
+        table = self.build(tmp_path)
+        rows = dict(table.rows)
+        fractal = list(table.columns).index("Fractal")
+
+        assert rows["Δprotocol and partner fees"][fractal] == "-5.0000 ETH"
+        assert rows["Δpartner fee"][fractal] == "-2.0000 ETH"
+        assert rows["Δprotocol fee"][fractal] == "-3.0000 ETH"
 
     def test_missing_data_exclusions_widen_the_window_total(self, tmp_path: Path):
         reports = [
@@ -642,7 +715,7 @@ class TestComparison:
         # +1 ETH at 2000 and −0.5 ETH at 1000 → $1,500.
         assert rows["Δsurplus (inherited)"][fractal] == "+0.5000 ETH ($1,500.00)"
         # The coverage slice converts at its own auction's rate too.
-        assert rows["  Δsurplus from those orders"][fractal] == "-0.5000 ETH (-$500.00)"
+        assert rows["  Δsurplus from orders no longer executed"][fractal] == "-0.5000 ETH (-$500.00)"
         # Sector's single move is auction 1 at its own rate.
         sector = list(table.columns).index("Sector")
         assert rows["Δsurplus (inherited)"][sector] == "+1.0000 ETH ($2,000.00)"
@@ -705,7 +778,7 @@ class TestComparison:
         )
         assert rows["  median moved order"][fractal] == "+100.00 bps over 1 orders"
         # The same +1 ETH spread over the fixture's 10,000 ETH window.
-        assert rows["  averaged over all traded volume"][fractal] == (
+        assert rows["  price change over all traded volume"][fractal] == (
             "+1.000 bps of 10000.00 ETH traded (50,000 orders)"
         )
 

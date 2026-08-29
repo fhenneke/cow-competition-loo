@@ -1,0 +1,631 @@
+<title>Leave-one-out: Rizzolver, Baseline, ExtQuasimodo — July 2026</title>
+<style>
+  :root {
+    --bg: #F6F7F9;
+    --surface: #FFFFFF;
+    --ink: #1B2431;
+    --muted: #5C6675;
+    --line: #E3E7ED;
+    --accent: #2B5FBF;
+    --neg: #B0364A;
+    --pos: #2C7A4B;
+    --warn-bg: #FBF4E4;
+    --warn-ink: #8A5F1C;
+    --chip-bg: #EBF0F9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12161D;
+      --surface: #1A2029;
+      --ink: #E6EAF0;
+      --muted: #98A2B0;
+      --line: #2A323E;
+      --accent: #82A9EE;
+      --neg: #E58B9B;
+      --pos: #7BC898;
+      --warn-bg: #2B2416;
+      --warn-ink: #D9B36A;
+      --chip-bg: #232C3D;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12161D;
+    --surface: #1A2029;
+    --ink: #E6EAF0;
+    --muted: #98A2B0;
+    --line: #2A323E;
+    --accent: #82A9EE;
+    --neg: #E58B9B;
+    --pos: #7BC898;
+    --warn-bg: #2B2416;
+    --warn-ink: #D9B36A;
+    --chip-bg: #232C3D;
+  }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    margin: 0;
+    padding: 3rem 1.25rem 5rem;
+  }
+  main { max-width: 64rem; margin: 0 auto; }
+  h1, h2, h3 {
+    font-family: "Iowan Old Style", "Palatino Nova", Palatino, "Book Antiqua", Georgia, serif;
+    line-height: 1.2;
+    text-wrap: balance;
+    margin: 0;
+  }
+  h1 { font-size: 2rem; font-weight: 600; }
+  h2 { font-size: 1.4rem; font-weight: 600; margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.1rem; font-weight: 600; margin-top: 1.8rem; }
+  p, li { max-width: 70ch; }
+  .eyebrow {
+    font-size: 0.75rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+    margin-bottom: 0.6rem;
+  }
+  .subtitle { color: var(--muted); margin-top: 0.7rem; }
+  .lead { font-size: 1.05rem; }
+  section > p, section > ul { margin: 0.9rem 0; }
+  ul { padding-left: 1.2rem; }
+  li { margin: 0.45rem 0; }
+  strong { font-weight: 650; }
+  .tablewrap {
+    overflow-x: auto;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    margin: 1.4rem 0 0.4rem;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 0.86rem; }
+  th, td { padding: 0.55rem 0.8rem; text-align: right; white-space: nowrap; }
+  th {
+    font-size: 0.72rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+    border-bottom: 1px solid var(--line);
+    vertical-align: bottom;
+  }
+  td { border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  th:first-child, td:first-child { text-align: left; }
+  td.group {
+    text-align: left;
+    font-family: "Iowan Old Style", "Palatino Nova", Palatino, Georgia, serif;
+    font-weight: 600;
+    font-size: 0.95rem;
+    background: var(--chip-bg);
+  }
+  td.num-neg { color: var(--neg); }
+  td.num-pos { color: var(--pos); }
+  .native { color: var(--muted); font-size: 0.78rem; }
+  .chip {
+    display: inline-block;
+    background: var(--chip-bg);
+    color: var(--accent);
+    border-radius: 3px;
+    padding: 0.05rem 0.4rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+  }
+  .footnote, figcaption { color: var(--muted); font-size: 0.82rem; max-width: 75ch; }
+  .callout {
+    background: var(--warn-bg);
+    color: var(--warn-ink);
+    border-radius: 6px;
+    padding: 0.8rem 1rem;
+    font-size: 0.9rem;
+    max-width: 72ch;
+    margin: 1.2rem 0;
+  }
+  .callout strong { color: inherit; }
+  ol.caveats { padding-left: 1.3rem; }
+  ol.caveats li { margin: 0.7rem 0; max-width: 75ch; }
+  code {
+    font: 0.85em ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    background: var(--chip-bg);
+    padding: 0.08em 0.35em;
+    border-radius: 3px;
+  }
+  th.sec, td.sec { color: var(--muted); font-weight: 400; }
+  td.sec .native { color: var(--muted); }
+  .sign-note {
+    border-left: 3px solid var(--accent);
+    padding: 0.2rem 0 0.2rem 1rem;
+    color: var(--muted);
+    font-size: 0.92rem;
+    max-width: 70ch;
+    margin: 1.4rem 0;
+  }
+</style>
+
+<main>
+
+  <header>
+    <div class="eyebrow">Leave-one-out solver analysis · CoW Protocol</div>
+    <h1>Rizzolver, Baseline, and ExtQuasimodo without themselves: July 2026</h1>
+    <p class="subtitle">Every auction of 2026-07-01 → 2026-08-01 re-arbitrated with one solver
+    removed, on every chain that solver bid on: Rizzolver on 4 chains, Baseline on 10,
+    ExtQuasimodo on 9 (it has no mainnet presence) — 23 solver-chain combinations.
+    Headline Δsurplus figures use the <code>inherited</code> settlement scenario, explained
+    with the table below.</p>
+  </header>
+
+  <div class="sign-note">
+    <strong>What was measured:</strong> each auction’s winner selection is re-run on the
+    recorded bids with one solver’s bids removed, and the outcome is compared with what
+    actually happened. <strong>Signs:</strong> every delta is counterfactual − actual —
+    negative Δsurplus means users would have received less without the solver, negative
+    Δfees means the protocol would have collected less, and positive Δrewards means it
+    would have paid more. <strong>USD figures</strong> are
+    display-only conversions at each auction’s own stablecoin-implied rate, on every chain.
+  </div>
+
+  <section>
+    <h2>Headline findings</h2>
+    <ul class="lead">
+      <li><strong>Rizzolver is the largest by every measure:</strong> ≈ $236k/month of user
+        surplus and ≈ $132k of protocol fee. Averaged over everything each chain traded in
+        July, its removal makes prices 0.63 bps worse on mainnet (≈ $2.1B of volume), 2.1
+        bps on bnb and 1.1 bps on base. 1.6% of mainnet’s executed orders and 0.5% of
+        bnb’s and base’s traded only because it bid.</li>
+      <li><strong>Baseline: ≈ $3.9k/month of surplus and ≈ $365 of fee</strong>, with its
+        footprint in coverage on the small chains — 14.2% of everything xdai executed,
+        14.0% on plasma, 9.0% on avalanche and 5.2% on polygon traded only because Baseline
+        was there. In dollars those orders are small (xdai’s 7,111 carry $6.73); in service
+        terms they are the chain’s long tail.</li>
+      <li><strong>ExtQuasimodo: ≈ $957/month of surplus and ≈ $519 of fee</strong>, three
+        quarters of it on Gnosis ($714 surplus, $449 fee; 3.3% of the chain’s executions
+        traded only through it). Everywhere else its removal moves single- to double-digit
+        dollars.</li>
+      <li><strong>Fee relative to surplus differs by solver.</strong> Rizzolver returns 56%
+        of its surplus figure as protocol fee and ExtQuasimodo 54%, against 9% for
+        Baseline, whose value sits in coverage of orders that carry little fee.</li>
+      <li><strong>Chain size dwarfs win share.</strong> Baseline’s 41% win share on
+        polygon is worth ≈ $1k/month; Rizzolver’s 10% share on mainnet is worth $184k.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>The month, one row per solver-chain</h2>
+    <p>USD first, native and detail beneath, converted per auction at the auction’s own
+    stablecoin-implied rate. <strong>The three left columns are the headline:</strong>
+    Δsurplus under the <code>inherited</code> settlement scenario — what users lose per
+    month without the solver; the fee the mechanism would stop charging; and the share of
+    all executed orders that would not have traded at all. The muted columns to the right
+    carry the supporting detail — definitions in the footnote, fine print in the
+    caveats.</p>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Chain</th>
+            <th>Δsurplus / month (inherited)</th>
+            <th>Δprotocol and partner fees / month</th>
+            <th>Orders no longer executed, share of all</th>
+            <th class="sec">Δprotocol fee</th>
+            <th class="sec">Δprice, all traded volume</th>
+            <th class="sec">Won</th>
+            <th class="sec">Δrewards (capped)</th>
+            <th class="sec">Δsurplus (assume-settled)</th>
+            <th class="sec">Largest auction share</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td class="group" colspan="10">Rizzolver — −$236,540/month of user surplus, −$132,236 of protocol fee, across 4 chains</td></tr>
+          <tr>
+            <td>mainnet <span class="chip">ETH</span></td>
+            <td class="num-neg">−$184,150 <span class="native">−101.8017 ETH</span></td>
+            <td class="num-neg">−$134,558 <span class="native">−73.8160 ETH · 59 auctions unpriced</span></td>
+            <td>1.6% <span class="native">1,689 orders · −$29,929 surplus</span></td>
+            <td class="sec">−$118,357 <span class="native">−$16,201 partner</span></td>
+            <td class="sec">−0.634 bps <span class="native">still-traded −2.47 bps · median −1.30 bps · 6,449 moved</span></td>
+            <td class="sec">10.3% <span class="native">8,620 won · bid 34.7%</span></td>
+            <td class="sec">−$59,528</td>
+            <td class="sec">−$194,477</td>
+            <td class="sec">4%</td>
+          </tr>
+          <tr>
+            <td>bnb <span class="chip">BNB</span></td>
+            <td class="num-neg">−$37,289 <span class="native">−65.4570 BNB</span></td>
+            <td class="num-neg">−$6,096 <span class="native">−10.7208 BNB · 24 auctions unpriced</span></td>
+            <td>0.52% <span class="native">1,659 orders · −$7,836 surplus</span></td>
+            <td class="sec">−$6,047 <span class="native">−$49 partner</span></td>
+            <td class="sec">−2.116 bps <span class="native">still-traded −6.02 bps · median −2.52 bps · 20,969 moved</span></td>
+            <td class="sec">10.6% <span class="native">21,449 won · bid 22.1%</span></td>
+            <td class="sec">−$5,815</td>
+            <td class="sec">−$37,253</td>
+            <td class="sec">4%</td>
+          </tr>
+          <tr>
+            <td>base <span class="chip">ETH</span></td>
+            <td class="num-neg">−$9,763 <span class="native">−5.2801 ETH</span></td>
+            <td class="num-neg">−$6,887 <span class="native">−3.8861 ETH · 16 auctions unpriced</span></td>
+            <td>0.47% <span class="native">350 orders · −$314 surplus</span></td>
+            <td class="sec">−$4,997 <span class="native">−$1,891 partner</span></td>
+            <td class="sec">−1.058 bps <span class="native">still-traded −2.91 bps · median −2.93 bps · 9,958 moved</span></td>
+            <td class="sec">15.0% <span class="native">10,416 won · bid 35.6%</span></td>
+            <td class="sec">−$1,281</td>
+            <td class="sec">−$9,766</td>
+            <td class="sec">3%</td>
+          </tr>
+          <tr>
+            <td>arbitrum-one <span class="chip">ETH</span></td>
+            <td class="num-neg">−$5,339 <span class="native">−2.9267 ETH</span></td>
+            <td class="num-neg">−$3,385 <span class="native">−1.8283 ETH · 2 auctions unpriced</span></td>
+            <td>0.14% <span class="native">127 orders · −$2,031 surplus</span></td>
+            <td class="sec">−$2,835 <span class="native">−$549 partner</span></td>
+            <td class="sec">−0.373 bps <span class="native">still-traded −1.52 bps · median −1.23 bps · 1,399 moved</span></td>
+            <td class="sec">1.8% <span class="native">1,556 won · bid 6.6%</span></td>
+            <td class="sec">−$1,568</td>
+            <td class="sec">−$5,345</td>
+            <td class="sec">31% ⚠</td>
+          </tr>
+          <tr><td class="group" colspan="10">Baseline — −$3,962/month of user surplus, −$365 of protocol fee, across 10 chains</td></tr>
+          <tr>
+            <td>mainnet <span class="chip">ETH</span></td>
+            <td class="num-neg">−$1,556 <span class="native">−0.8788 ETH</span></td>
+            <td class="num-neg">−$207 <span class="native">−0.1119 ETH · 15 auctions unpriced</span></td>
+            <td>0.34% <span class="native">356 orders · −$740 surplus</span></td>
+            <td class="sec">−$193 <span class="native">−$14 partner</span></td>
+            <td class="sec">−0.004 bps <span class="native">still-traded −0.82 bps · median −1.97 bps · 7,335 moved</span></td>
+            <td class="sec">9.9% <span class="native">8,263 won · bid 36.1%</span></td>
+            <td class="sec">+$373</td>
+            <td class="sec">−$1,124</td>
+            <td class="sec">37% ⚠</td>
+          </tr>
+          <tr>
+            <td>avalanche <span class="chip">AVAX</span></td>
+            <td class="num-neg">−$1,138 <span class="native">−171.8294 AVAX</span></td>
+            <td class="num-neg">−$57 <span class="native">−8.5627 AVAX · 1 auctions unpriced</span></td>
+            <td>9.0% <span class="native">449 orders · −$1,076 surplus</span></td>
+            <td class="sec">−$52 <span class="native">−$5.36 partner</span></td>
+            <td class="sec">−0.040 bps <span class="native">still-traded −3.14 bps · median −0.02 bps · 134 moved</span></td>
+            <td class="sec">14.0% <span class="native">725 won · bid 43.8%</span></td>
+            <td class="sec">−$14</td>
+            <td class="sec">−$1,314</td>
+            <td class="sec">9%</td>
+          </tr>
+          <tr>
+            <td>polygon <span class="chip">POL</span></td>
+            <td class="num-neg">−$1,013 <span class="native">−13786.0822 POL</span></td>
+            <td class="num-neg">−$179 <span class="native">−2432.0534 POL · 19 auctions unpriced</span></td>
+            <td>5.2% <span class="native">640 orders · −$538 surplus</span></td>
+            <td class="sec">−$47 <span class="native">−$132 partner</span></td>
+            <td class="sec">−0.480 bps <span class="native">still-traded −5.90 bps · median −1.27 bps · 4,128 moved</span></td>
+            <td class="sec">41.2% <span class="native">5,103 won · bid 76.5%</span></td>
+            <td class="sec">+$17</td>
+            <td class="sec">−$1,506</td>
+            <td class="sec">9%</td>
+          </tr>
+          <tr>
+            <td>bnb <span class="chip">BNB</span></td>
+            <td class="num-neg">−$133 <span class="native">−0.2341 BNB</span></td>
+            <td class="num-neg">−$61 <span class="native">−0.1069 BNB · 5 auctions unpriced</span></td>
+            <td>0.36% <span class="native">1,162 orders · −$97 surplus</span></td>
+            <td class="sec">−$37 <span class="native">−$24 partner</span></td>
+            <td class="sec">−0.002 bps <span class="native">still-traded −6.99 bps · median −2.94 bps · 2,417 moved</span></td>
+            <td class="sec">1.8% <span class="native">3,540 won · bid 39.0%</span></td>
+            <td class="sec">+$57</td>
+            <td class="sec">−$144</td>
+            <td class="sec">11%</td>
+          </tr>
+          <tr>
+            <td>base <span class="chip">ETH</span></td>
+            <td class="num-neg">−$50 <span class="native">−0.0280 ETH</span></td>
+            <td class="num-neg">−$16 <span class="native">−0.0084 ETH · 3 auctions unpriced</span></td>
+            <td>0.84% <span class="native">626 orders · −$48 surplus</span></td>
+            <td class="sec">−$8.98 <span class="native">−$7.12 partner</span></td>
+            <td class="sec">−0.000 bps <span class="native">still-traded −0.26 bps · median −0.95 bps · 293 moved</span></td>
+            <td class="sec">1.4% <span class="native">946 won · bid 13.9%</span></td>
+            <td class="sec">+$3.75</td>
+            <td class="sec">−$50</td>
+            <td class="sec">17%</td>
+          </tr>
+          <tr>
+            <td>arbitrum-one <span class="chip">ETH</span></td>
+            <td class="num-neg">−$41 <span class="native">−0.0230 ETH</span></td>
+            <td class="num-neg">−$4.27 <span class="native">−0.0023 ETH · 1 auctions unpriced</span></td>
+            <td>0.02% <span class="native">18 orders · −$0.74 surplus</span></td>
+            <td class="sec">−$4.29 <span class="native">+$0.01 partner</span></td>
+            <td class="sec">−0.006 bps <span class="native">still-traded −2.45 bps · median −0.64 bps · 184 moved</span></td>
+            <td class="sec">0.2% <span class="native">213 won · bid 5.7%</span></td>
+            <td class="sec">+$15</td>
+            <td class="sec">−$42</td>
+            <td class="sec">35% ⚠</td>
+          </tr>
+          <tr>
+            <td>xdai <span class="chip">xDAI</span></td>
+            <td class="num-neg">−$21 <span class="native">−21.2152 xDAI</span></td>
+            <td class="num-neg">−$20 <span class="native">−19.6787 xDAI · 13 auctions unpriced</span></td>
+            <td>14.2% <span class="native">7,111 orders · −$6.73 surplus</span></td>
+            <td class="sec">−$20 <span class="native">−$0.00 partner</span></td>
+            <td class="sec">−0.020 bps <span class="native">still-traded −10.57 bps · median −3.50 bps · 331 moved</span></td>
+            <td class="sec">18.3% <span class="native">8,240 won · bid 42.9%</span></td>
+            <td class="sec">+$14</td>
+            <td class="sec">−$22</td>
+            <td class="sec">38% ⚠</td>
+          </tr>
+          <tr>
+            <td>ink <span class="chip">ETH</span></td>
+            <td class="num-neg">−$5.97 <span class="native">−0.0032 ETH</span></td>
+            <td class="num-neg">−$0.24 <span class="native">−0.0001 ETH</span></td>
+            <td>0.4% <span class="native">8 orders · −$5.97 surplus</span></td>
+            <td class="sec">−$0.24 <span class="native">$0 partner</span></td>
+            <td class="sec">−0.000 bps <span class="native">still-traded −3.70 bps · median −9.66 bps · 38 moved</span></td>
+            <td class="sec">2.4% <span class="native">47 won · bid 16.7%</span></td>
+            <td class="sec">−$0.25</td>
+            <td class="sec">−$5.97</td>
+            <td class="sec">100% ⚠</td>
+          </tr>
+          <tr>
+            <td>plasma <span class="chip">XPL</span></td>
+            <td class="num-neg">−$2.75 <span class="native">−30.1695 XPL</span></td>
+            <td class="num-neg">−$2.95 <span class="native">−35.3608 XPL</span></td>
+            <td>14.0% <span class="native">88 orders · −$2.31 surplus</span></td>
+            <td class="sec">−$2.95 <span class="native">−$0.00 partner</span></td>
+            <td class="sec">−0.021 bps <span class="native">still-traded −0.78 bps · median −19.94 bps · 91 moved</span></td>
+            <td class="sec">36.8% <span class="native">234 won · bid 96.4%</span></td>
+            <td class="sec">+$4.46</td>
+            <td class="sec">−$2.77</td>
+            <td class="sec">30% ⚠</td>
+          </tr>
+          <tr>
+            <td>linea <span class="chip">ETH</span></td>
+            <td class="num-neg">−$2.03 <span class="native">−0.0011 ETH</span></td>
+            <td class="num-neg">−$0.32 <span class="native">−0.0002 ETH</span></td>
+            <td>0.68% <span class="native">1 orders · −$0.08 surplus</span></td>
+            <td class="sec">−$0.32 <span class="native">+$0.00 partner</span></td>
+            <td class="sec">−0.227 bps <span class="native">still-traded −96.49 bps · median −61.11 bps · 9 moved</span></td>
+            <td class="sec">6.7% <span class="native">10 won · bid 6.7%</span></td>
+            <td class="sec">−$0.03</td>
+            <td class="sec">−$2.03</td>
+            <td class="sec">57% ⚠</td>
+          </tr>
+          <tr><td class="group" colspan="10">ExtQuasimodo — −$957/month of user surplus, −$519 of protocol fee, across 9 chains</td></tr>
+          <tr>
+            <td>xdai <span class="chip">xDAI</span></td>
+            <td class="num-neg">−$714 <span class="native">−720.0756 xDAI</span></td>
+            <td class="num-neg">−$458 <span class="native">−450.8498 xDAI · 36 auctions unpriced</span></td>
+            <td>3.3% <span class="native">1,654 orders · −$252 surplus</span></td>
+            <td class="sec">−$449 <span class="native">−$9.12 partner</span></td>
+            <td class="sec">−0.662 bps <span class="native">still-traded −2.62 bps · median −0.84 bps · 2,787 moved</span></td>
+            <td class="sec">13.7% <span class="native">6,161 won · bid 39.0%</span></td>
+            <td class="sec">+$170</td>
+            <td class="sec">−$748</td>
+            <td class="sec">10%</td>
+          </tr>
+          <tr>
+            <td>arbitrum-one <span class="chip">ETH</span></td>
+            <td class="num-neg">−$157 <span class="native">−0.0880 ETH</span></td>
+            <td class="num-neg">−$36 <span class="native">−0.0210 ETH</span></td>
+            <td>0.068% <span class="native">62 orders · −$16 surplus</span></td>
+            <td class="sec">−$33 <span class="native">−$3.32 partner</span></td>
+            <td class="sec">−0.020 bps <span class="native">still-traded −3.97 bps · median −0.66 bps · 376 moved</span></td>
+            <td class="sec">0.5% <span class="native">458 won · bid 11.4%</span></td>
+            <td class="sec">+$64</td>
+            <td class="sec">−$184</td>
+            <td class="sec">11%</td>
+          </tr>
+          <tr>
+            <td>linea <span class="chip">ETH</span></td>
+            <td class="num-neg">−$31 <span class="native">−0.0178 ETH</span></td>
+            <td class="num-neg">−$16 <span class="native">−0.0092 ETH</span></td>
+            <td>5.4% <span class="native">8 orders · −$30 surplus</span></td>
+            <td class="sec">−$9.55 <span class="native">−$6.67 partner</span></td>
+            <td class="sec">−0.121 bps <span class="native">still-traded −12.74 bps · median −10.24 bps · 21 moved</span></td>
+            <td class="sec">20.8% <span class="native">31 won · bid 30.2%</span></td>
+            <td class="sec">−$10</td>
+            <td class="sec">−$31</td>
+            <td class="sec">49% ⚠</td>
+          </tr>
+          <tr>
+            <td>avalanche <span class="chip">AVAX</span></td>
+            <td class="num-neg">−$24 <span class="native">−3.5182 AVAX</span></td>
+            <td class="num-neg">−$24 <span class="native">−3.6164 AVAX · 1 auctions unpriced</span></td>
+            <td>0.66% <span class="native">33 orders · −$0.60 surplus</span></td>
+            <td class="sec">−$24 <span class="native">−$0.05 partner</span></td>
+            <td class="sec">−0.014 bps <span class="native">still-traded −2.09 bps · median −0.07 bps · 60 moved</span></td>
+            <td class="sec">2.5% <span class="native">127 won · bid 23.4%</span></td>
+            <td class="sec">+$15</td>
+            <td class="sec">−$24</td>
+            <td class="sec">71% ⚠</td>
+          </tr>
+          <tr>
+            <td>bnb <span class="chip">BNB</span></td>
+            <td class="num-neg">−$18 <span class="native">−0.0306 BNB</span></td>
+            <td class="num-neg">−$7.20 <span class="native">−0.0126 BNB · 3 auctions unpriced</span></td>
+            <td>0.027% <span class="native">85 orders · −$11 surplus</span></td>
+            <td class="sec">−$5.12 <span class="native">−$2.09 partner</span></td>
+            <td class="sec">−0.000 bps <span class="native">still-traded −3.28 bps · median −2.07 bps · 738 moved</span></td>
+            <td class="sec">0.4% <span class="native">854 won · bid 16.5%</span></td>
+            <td class="sec">+$63</td>
+            <td class="sec">−$32</td>
+            <td class="sec">9%</td>
+          </tr>
+          <tr>
+            <td>polygon <span class="chip">POL</span></td>
+            <td class="num-neg">−$8.02 <span class="native">−110.9522 POL</span></td>
+            <td class="num-neg">−$0.04 <span class="native">−0.6029 POL</span></td>
+            <td>0.016% <span class="native">2 orders · −$8.02 surplus</span></td>
+            <td class="sec">−$0.04 <span class="native">$0 partner</span></td>
+            <td class="sec">−0.000 bps <span class="native">still-traded −0.30 bps · median −0.35 bps · 10 moved</span></td>
+            <td class="sec">0.1% <span class="native">11 won · bid 0.9%</span></td>
+            <td class="sec">+$0.01</td>
+            <td class="sec">−$8.02</td>
+            <td class="sec">100% ⚠</td>
+          </tr>
+          <tr>
+            <td>base <span class="chip">ETH</span></td>
+            <td class="num-neg">−$5.51 <span class="native">−0.0031 ETH</span></td>
+            <td class="num-pos">+$1.83 <span class="native">+0.0011 ETH · 1 auctions unpriced</span></td>
+            <td>0.009% <span class="native">7 orders · −$0.08 surplus</span></td>
+            <td class="sec">+$1.99 <span class="native">−$0.16 partner</span></td>
+            <td class="sec">−0.000 bps <span class="native">still-traded −0.50 bps · median −0.12 bps · 19 moved</span></td>
+            <td class="sec">0.0% <span class="native">29 won · bid 5.8%</span></td>
+            <td class="sec">+$0.26</td>
+            <td class="sec">−$5.51</td>
+            <td class="sec">57% ⚠</td>
+          </tr>
+          <tr>
+            <td>plasma <span class="chip">XPL</span></td>
+            <td class="num-neg">−$0.12 <span class="native">−1.2318 XPL</span></td>
+            <td class="num-neg">−$0.12 <span class="native">−1.2321 XPL</span></td>
+            <td>0% <span class="native">0 orders · $0 surplus</span></td>
+            <td class="sec">−$0.12 <span class="native">$0 partner</span></td>
+            <td class="sec">−0.007 bps <span class="native">still-traded −0.04 bps · median −0.00 bps · 192 moved</span></td>
+            <td class="sec">35.4% <span class="native">225 won · bid 48.7%</span></td>
+            <td class="sec">+$15</td>
+            <td class="sec">−$0.12</td>
+            <td class="sec">38% ⚠</td>
+          </tr>
+          <tr>
+            <td>ink <span class="chip">ETH</span></td>
+            <td class="">$0 <span class="native">0.0000 ETH</span></td>
+            <td class="">$0 <span class="native">0.0000 ETH</span></td>
+            <td>0% <span class="native">0 orders · $0 surplus</span></td>
+            <td class="sec">$0 <span class="native">$0 partner</span></td>
+            <td class="sec">0.000 bps <span class="native">still-traded — · median — · 0 moved</span></td>
+            <td class="sec">0.0% <span class="native">0 won · bid 8.6%</span></td>
+            <td class="sec">$0</td>
+            <td class="sec">$0</td>
+            <td class="sec">—</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="footnote">“Δprotocol and partner fees” is the whole fee the winning
+    solutions charged, the partners’ share included, with the auctions whose fees could
+    not be priced noted beneath; “Δprotocol fee” is what the protocol keeps, with the
+    partners’ share beside it. Both are summed over every order either side traded, so an
+    order that stops trading contributes its whole fee. “Won” is the solver’s share of
+    analysed auctions, with its bid rate beneath. “Δprice, all traded volume” spreads the moved-order Δsurplus over the
+    window’s whole executed fill-or-kill volume; its sub-line is the conditional
+    reading — the change on just the still-traded orders whose price moved, with the
+    median moved order and the moved count. “Orders no longer executed” divides the orders only the
+    solver executed by every user-order execution the chain’s recorded winners traded
+    that month (partially fillable included; an order counts once per auction it
+    executes in — see caveats), with the executions and the surplus they carried
+    beneath. “Δrewards (capped)” is the payout-scale estimate.
+    “Δsurplus (assume-settled)” is the everything-lands-in-time scenario. “Largest auction share” is the whale check — ⚠
+    marks headlines that are mostly one trade. Price-suspect auctions (0–1.6% per
+    chain) and auctions with unrecoverable JIT order data (up to 2.3% on arbitrum) are
+    excluded from every figure and enumerated in the report files.</p>
+  </section>
+
+
+  <section>
+    <h2>What the fee columns measure</h2>
+    <p>The competition ranks solutions on score, which is user surplus plus protocol fees,
+    so a solver’s value has a fee component as well as a surplus one. The fee columns are
+    recomputed from each auction’s recorded fee policies and reproduce the protocol’s own
+    recorded score exactly on the solutions where both are available.</p>
+    <p><strong>“Protocol fee” is used here in the budget sense: what the protocol keeps.</strong>
+    The analytics database and the protocol’s own code use the same words for the gross
+    amount including the partners’ share, so the two figures are labelled separately —
+    <strong>Δprotocol and partner fees</strong> for the gross, <strong>Δprotocol fee</strong>
+    for the remainder. On mainnet the partners take the larger half of the gross.</p>
+    <p>The partners’ share of the <em>change</em> ranges from about 0% on xdai and plasma to
+    74% on polygon. Partner fees are charged on volume, so they are unaffected when a rival
+    wins the same order at a worse price and are lost only when the order does not trade;
+    their share of the change therefore reflects how much of a solver’s value is coverage
+    rather than price.</p>
+  </section>
+
+  <section>
+    <h2>Reading each solver</h2>
+    <h3>Rizzolver</h3>
+    <p>July’s number one on all four of its chains, on surplus and on fee alike. The
+    mainnet figure (−$184k surplus, −$118k protocol fee) is broad-based: thousands of auctions move, the largest is 4% of the total, and the
+    price deterioration is as wide as the volume — 2.5 bps on the ≈ $530M that moved,
+    0.63 bps averaged over everything. 17% of its surplus total is coverage (orders nobody
+    else executed); the other 83% is the sturdier claim — orders a rival would still have
+    filled, at a worse price. Its fee is priced the same way, and the partners’ share of
+    it is 12%. Quote arbitrum carefully: 31% of its −$5.3k is one auction.</p>
+    <h3>Baseline</h3>
+    <p>Modest in dollars everywhere despite huge win shares on the long-tail chains —
+    those chains simply carry little surplus, and on the crowded chains the next bidder
+    reproduces its trades almost exactly. 64% of its surplus is coverage, and that is
+    where the service story lives: one in seven of xdai’s and plasma’s executed
+    orders would simply not have traded. Those orders carry little fee, which is why its
+    fee figure (≈ $365) is 9% of its surplus figure rather than the ~55% the other two
+    return.</p>
+    <h3>ExtQuasimodo</h3>
+    <p>Material only on Gnosis, where it accounts for $714 of surplus and $449 of
+    protocol fee. On plasma it wins 35% of auctions with a negative own net reward — competitive pressure whose removal would raise rivals’ payouts — but at
+    plasma’s scale that is ≈ $15/month.</p>
+  </section>
+
+  <section>
+    <h2>Caveats — the numbers don’t travel without these</h2>
+    <ol class="caveats">
+      <li><strong>No behavioural response.</strong> Rivals’ bids are held fixed; nobody re-quotes
+        or re-routes because a competitor vanished. This matters most exactly where the findings
+        are largest — a 41% win share disappearing would surely attract entry, and nothing here
+        models that. The competition’s cap on solutions per solver is also applied before winners
+        are picked, so a rival solution suppressed by that cap cannot step in either.</li>
+      <li><strong>Settlement scenario.</strong> Winning an auction does not guarantee the batch
+        lands on-chain, so the counterfactual must assume something about settlement — the two
+        Δsurplus columns above are the two readings. The gap between them is genuine uncertainty
+        about whether reverted batches would have landed — widest on polygon ($1,013 vs $1,506).</li>
+      <li><strong>USD is display-only.</strong> Converted per auction from the auction’s own
+        stablecoin native prices; nothing on the valuation or reward path consumes a USD number.
+        Native amounts remain the exact figures.</li>
+      <li><strong>Two reward figures exist.</strong> The table shows the capped estimate (the
+        payout-scale answer, with replacements inheriting the displaced slot’s cap). Uncapped
+        accounting figures, and Δsurplus net of capped Δrewards, are in the full comparison
+        output.</li>
+      <li><strong>Exclusions are named, not silent.</strong> Price-suspect auctions and
+        missing-JIT-data auctions are excluded from every statistic and enumerated in the report
+        files; cap-orphan auctions drop only from the capped aggregate.</li>
+      <li><strong>Quote rewards are out of scope</strong> — no data on counterfactual quoting.</li>
+      <li><strong>Whale-shaped rows are flagged.</strong> ExtQuasimodo on avalanche (71%) and
+        polygon (100%), Rizzolver on arbitrum (31%), Baseline on ink (100%): those headlines are
+        one or few auctions; per-auction inspection is part of reading any row.</li>
+      <li><strong>Fees are exact where they are priced, and the exceptions are
+        counted.</strong> Protocol fees are recomputed from the recorded fee policies and
+        reproduce the protocol’s own score exactly. A fee cannot be computed when a
+        solution the real competition filtered out wins the counterfactual, because
+        policies are only recorded for solutions that were kept; those auctions drop from
+        both sides of the fee comparison and are counted in the table (0–59 per row, under
+        0.3% everywhere). Nothing is read as a fee of zero.</li>
+      <li><strong>“Protocol fee” here excludes the partners’ share.</strong> The database
+        and the protocol’s own code use “protocol fee” for the gross amount; this page
+        uses it for what the protocol keeps, and labels the gross figure “protocol and
+        partner fees”. Reading the gross number as protocol revenue overstates it — by
+        about a factor of two on mainnet, and by more on polygon, where partners take 91%
+        of the fee level.</li>
+      <li><strong>Fee figures are gross revenue.</strong> The protocol also pays rewards,
+        which often move the other way; the two are reported side by side and not netted,
+        since the fee side is exact while the capped reward side is an estimate.</li>
+      <li><strong>“Orders no longer executed” is a share of everything the chain
+        executed.</strong> The column divides the orders only the solver executed by every user-order
+        execution the chain’s recorded winners traded that month, partially fillable
+        orders included; an order counts once per auction it executes in, so a partially
+        fillable order weighs as often as it trades. The narrower per-auction reading —
+        relative only to auctions the solver bid in — lives in the report files; it
+        overstates chain-level dependence for a selective bidder and is not shown
+        here.</li>
+      <li><strong>Δprice comes in two conditionings, labelled.</strong> The headline figure
+        answers “when a price moves, by how much” — over fill-or-kill user orders trading on
+        both sides whose surplus moved; the “overall” figure spreads the same Δsurplus over all
+        executed fill-or-kill volume, counting unmoved orders as zero price change. The two
+        differ by up to two orders of magnitude and neither substitutes for the other. Rows with
+        few moved orders (linea’s 96 bps is 9 orders) are anecdotes, not run rates; the
+        moved-order count is printed with every figure.</li>
+    </ol>
+    <p class="footnote">Method: full re-arbitration per auction (fairness filter included) on
+    recorded scores; executed amounts from proposed executions; “executed” means settled in time.
+    Protocol fees recomputed from the recorded fee policies, validated against the recorded
+    score and against the accounting model’s own partner/protocol split. Reports: 46 files,
+    format 6 — regenerated 2026-08-29 with the fee columns; every figure carried over from
+    the 2026-08-17 run reproduces it exactly. Produced by <code>loo analyse</code> /
+    <code>loo compare</code>.</p>
+  </section>
+</main>

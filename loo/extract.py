@@ -18,6 +18,15 @@ from decimal import Decimal
 from statistics import median
 
 from .db import Connection, Row, as_int, chunked, fetch
+from .fees import (
+    EMPTY_FEE_CONTEXT,
+    FeeContext,
+    FeeError,
+    Policy,
+    PolicyKind,
+    Quote,
+    quote_fee,
+)
 from .primitives import order_owner, usd_per_native, usd_reference_tokens
 from .rewards import SolverReward, Win
 from .valuation import Order
@@ -127,6 +136,10 @@ class AuctionBundle:
     block_deadline: int = 0
     """The auction's deadline block. Rewards are converted native -> COW at the
     conversion rate of the accounting period this block falls in."""
+    fee_context: FeeContext = EMPTY_FEE_CONTEXT
+    """Protocol-fee inputs. `EMPTY_FEE_CONTEXT` when `load_auctions` was asked not to
+    fetch them, in which case every fee reads as unrecorded and the fee deltas are
+    reported as unavailable rather than as zero."""
 
 
 WINDOW_SQL = """
@@ -203,6 +216,48 @@ with traded as (
 select ap.auction_id, encode(ap.token, 'hex') as token, ap.price
 from dbt.stg_backend_data__auction_prices ap
 join traded t on t.auction_id = ap.auction_id and t.token = ap.token
+"""
+
+FEE_POLICIES_SQL = """
+select
+    auction_id,
+    encode(order_uid, 'hex') as order_uid,
+    kind::text                as kind,
+    surplus_factor,
+    surplus_max_volume_factor,
+    volume_factor,
+    price_improvement_factor,
+    price_improvement_max_volume_factor
+from dbt.stg_backend_data__fee_policies
+where auction_id = any(%(ids)s)
+order by auction_id, order_uid, application_order
+"""
+
+# The partner count is a property of the order's app data, not of any settlement, so it
+# is available for orders that never traded. Only non-zero counts are returned; the
+# default is zero and the join would otherwise repeat every order in the window.
+PARTNER_COUNTS_SQL = """
+select
+    encode(o.uid, 'hex')                        as order_uid,
+    array_length(ad.partner_fee_recipients, 1)  as partner_count
+from dbt.stg_backend_data__orders o
+join dbt.stg_backend_data__app_data ad on ad.contract_app_data = o.app_data
+where o.uid = any(%(uids)s)
+  and array_length(ad.partner_fee_recipients, 1) > 0
+"""
+
+# One row per order, with no auction dimension. Only `priceimprovement` policies consult
+# it, so the caller restricts the uid list to those orders.
+QUOTES_SQL = """
+select
+    encode(order_uid, 'hex') as order_uid,
+    sell_amount,
+    buy_amount,
+    gas_amount,
+    gas_price,
+    sell_token_price
+from dbt.stg_backend_data__order_quotes
+where order_uid = any(%(uids)s)
 """
 
 REFERENCE_SCORES_SQL = """
@@ -363,11 +418,16 @@ def load_auctions(
     auction_ids: Sequence[int],
     chunk_size: int = CHUNK_SIZE,
     missing_data: list[int] | None = None,
+    with_fees: bool = True,
 ) -> Iterator[AuctionBundle]:
     """Yield one `AuctionBundle` per auction, in the order given.
 
     Queries are batched over chunks of auction ids; auctions with no recorded solutions
     are skipped silently, since they carry no bids to arbitrate.
+
+    `with_fees` adds three queries per chunk — policies, partner counts and quotes — and
+    is what makes the protocol-fee deltas available. Turning it off leaves every fee
+    unrecorded, so those deltas report as unavailable rather than as zero.
 
     `missing_data` selects the policy for auctions where a traded order is in neither
     order table (D17): when given, the whole auction is skipped and its id appended —
@@ -386,6 +446,11 @@ def load_auctions(
         execution_rows = fetch(conn, EXECUTIONS_SQL, params)
         price_rows = fetch(conn, PRICES_SQL, params)
         reference_rows = fetch(conn, REFERENCE_SCORES_SQL, params)
+        fee_contexts = (
+            _load_fee_contexts(conn, ids, execution_rows, solution_rows)
+            if with_fees
+            else {}
+        )
 
         prices: dict[int, dict[str, int]] = {}
         for row in price_rows:
@@ -436,7 +501,96 @@ def load_auctions(
                 bids=bids,
                 reference_scores=references.get(auction_id, {}),
                 block_deadline=as_int(context["block_deadline"]),
+                fee_context=fee_contexts.get(auction_id, EMPTY_FEE_CONTEXT),
             )
+
+
+def _load_fee_contexts(
+    conn: Connection, ids: list[int], execution_rows: list[Row], solution_rows: list[Row]
+) -> dict[int, FeeContext]:
+    """Build one `FeeContext` per auction in the chunk.
+
+    The coverage set is derived from data already in hand rather than re-queried: an
+    auction order's policies are recorded iff it appears in a solution that was not
+    filtered out, and a JIT order never has policies at all, so its fee is a known zero.
+    Anything else is genuinely unrecorded and is reported rather than read as zero.
+    """
+    kept: dict[int, set[str]] = {}
+    filtered_out = {
+        (row["auction_id"], row["uid"]): bool(row["filtered_out"]) for row in solution_rows
+    }
+    for row in execution_rows:
+        key = (row["auction_id"], row["solution_uid"])
+        if not filtered_out.get(key, True):
+            kept.setdefault(row["auction_id"], set()).add(row["order_uid"])
+
+    known: dict[int, set[str]] = {}
+    for row in execution_rows:
+        auction_id, uid = row["auction_id"], row["order_uid"]
+        if not row["in_auction"] or uid in kept.get(auction_id, ()):
+            known.setdefault(auction_id, set()).add(uid)
+
+    # `FEE_POLICIES_SQL` orders by `application_order`, so appending preserves the
+    # application sequence, which `policy_fees` then walks in reverse.
+    collected: dict[int, dict[str, list[Policy]]] = {}
+    needs_quote: set[str] = set()
+    for row in fetch(conn, FEE_POLICIES_SQL, {"ids": ids}):
+        kind: PolicyKind = row["kind"]
+        by_order = collected.setdefault(row["auction_id"], {})
+        by_order.setdefault(row["order_uid"], []).append(
+            Policy(
+                kind=kind,
+                surplus_factor=row["surplus_factor"],
+                surplus_max_volume_factor=row["surplus_max_volume_factor"],
+                volume_factor=row["volume_factor"],
+                price_improvement_factor=row["price_improvement_factor"],
+                price_improvement_max_volume_factor=row[
+                    "price_improvement_max_volume_factor"
+                ],
+            )
+        )
+        if kind == "priceimprovement":
+            needs_quote.add(row["order_uid"])
+
+    policies = {
+        auction_id: {uid: tuple(items) for uid, items in by_order.items()}
+        for auction_id, by_order in collected.items()
+    }
+
+    traded = sorted({row["order_uid"] for row in execution_rows})
+    partner_counts: dict[str, int] = {}
+    for chunk in chunked(traded, 5000):
+        uids = [bytes.fromhex(uid) for uid in chunk]
+        for row in fetch(conn, PARTNER_COUNTS_SQL, {"uids": uids}):
+            partner_counts[row["order_uid"]] = int(row["partner_count"])
+
+    quotes: dict[str, Quote] = {}
+    for chunk in chunked(sorted(needs_quote), 5000):
+        uids = [bytes.fromhex(uid) for uid in chunk]
+        for row in fetch(conn, QUOTES_SQL, {"uids": uids}):
+            try:
+                fee = quote_fee(
+                    row["gas_amount"], row["gas_price"], row["sell_token_price"]
+                )
+            except FeeError:
+                # A quote we cannot evaluate is not a quote: leaving it out makes the
+                # affected orders report unknown fees, which is the honest reading.
+                continue
+            quotes[row["order_uid"]] = Quote(
+                sell_amount=as_int(row["sell_amount"]),
+                buy_amount=as_int(row["buy_amount"]),
+                fee=fee,
+            )
+
+    return {
+        auction_id: FeeContext(
+            policies=policies.get(auction_id, {}),
+            quotes=quotes,
+            partner_counts=partner_counts,
+            known=frozenset(known.get(auction_id, ())),
+        )
+        for auction_id in ids
+    }
 
 
 def _build_bid(row: Row, execution_rows: list[Row], jit_owners: frozenset[str]) -> Bid:

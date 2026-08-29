@@ -57,9 +57,26 @@ def canned_db(monkeypatch: pytest.MonkeyPatch) -> None:
         extract.EXECUTIONS_SQL: [execution(GOOD), execution(BAD, missing=True)],
         extract.PRICES_SQL: [],
         extract.REFERENCE_SCORES_SQL: [],
+        extract.FEE_POLICIES_SQL: [
+            {
+                "auction_id": GOOD,
+                "order_uid": "ab" * 56,
+                "kind": "volume",
+                "surplus_factor": None,
+                "surplus_max_volume_factor": None,
+                "volume_factor": 0.001,
+                "price_improvement_factor": None,
+                "price_improvement_max_volume_factor": None,
+            }
+        ],
+        extract.PARTNER_COUNTS_SQL: [],
+        extract.QUOTES_SQL: [],
     }
 
     def fake_fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
+        # The uid-keyed queries carry no auction_id to filter on.
+        if "uids" in params:
+            return data[sql]
         ids = set(params["ids"])
         return [row for row in data[sql] if row["auction_id"] in ids]
 
@@ -81,6 +98,43 @@ class TestMissingOrderPolicy:
         # the surviving auction is complete, not partially built
         assert len(bundles[0].bids) == 1
         assert len(bundles[0].bids[0].orders) == 1
+
+
+class TestFeeContext:
+    """`load_auctions` derives fee coverage from the solutions it already has: an
+    auction order's policies are recorded iff it appears in a solution that was not
+    filtered out."""
+
+    def test_order_of_a_kept_solution_is_covered(self, canned_db: None):
+        bundle = next(iter(extract.load_auctions(CONN, [GOOD])))
+        context = bundle.fee_context
+        assert context.known == frozenset({"ab" * 56})
+        assert len(context.policies["ab" * 56]) == 1
+        assert context.policies["ab" * 56][0].volume_factor == 0.001
+
+    def test_with_fees_off_leaves_every_fee_unrecorded(self, canned_db: None):
+        bundle = next(iter(extract.load_auctions(CONN, [GOOD], with_fees=False)))
+        assert bundle.fee_context is extract.EMPTY_FEE_CONTEXT
+        assert bundle.fee_context.known == frozenset()
+
+    def test_filtered_out_only_order_is_not_covered(
+        self, canned_db: None, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The whole gap: an order seen only by a filtered-out solution has no recorded
+        policies, and "no rows" must not be read as "no fees"."""
+        original = extract.fetch
+
+        def fetch_with_filtered_solution(
+            conn: Connection, sql: str, params: Any = None
+        ) -> list[Row]:
+            rows = original(conn, sql, params)
+            if sql is extract.SOLUTIONS_SQL:
+                return [{**row, "filtered_out": True} for row in rows]
+            return rows
+
+        monkeypatch.setattr(extract, "fetch", fetch_with_filtered_solution)
+        bundle = next(iter(extract.load_auctions(CONN, [GOOD])))
+        assert bundle.fee_context.known == frozenset()
 
 
 class TestConversionRates:

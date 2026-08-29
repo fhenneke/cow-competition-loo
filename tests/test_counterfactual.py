@@ -17,6 +17,7 @@ import pytest
 
 from loo.counterfactual import (
     Analysis,
+    AuctionCounterfactual,
     MissingSettlementError,
     OrderDiff,
     OrderOutcome,
@@ -110,7 +111,10 @@ def bundle(bids: list[Bid]) -> AuctionBundle:
 
 
 def valued(
-    entry_bid: Bid, surplus: dict[str, int], volumes: dict[str, int] | None = None
+    entry_bid: Bid,
+    surplus: dict[str, int],
+    volumes: dict[str, int] | None = None,
+    fees_unknown: frozenset[str] = frozenset(),
 ) -> ValuedBid:
     """A `ValuedBid` carrying exactly the per-order surplus the test wants."""
     return ValuedBid(
@@ -123,6 +127,7 @@ def valued(
             winner_pairs=frozenset({A}),
             order_uids=frozenset(o.uid for o in entry_bid.orders),
             order_volume_native=volumes or {},
+            fees_unknown=fees_unknown,
         ),
     )
 
@@ -454,6 +459,134 @@ class TestDiffOutcomes:
         assert (diff.volume_base, diff.volume_loo) == (1000, None)
 
 
+class TestFeeDeltas:
+    """The protocol-fee side of a counterfactual (M13).
+
+    Deltas are counterfactual minus actual like every other one here, so a **negative**
+    `delta_protocol_fees` means the protocol collects less without the solver.
+    """
+
+    def outcome(
+        self,
+        surplus: int | None,
+        fee: int | None,
+        partner: int | None = 0,
+        *,
+        executed: bool = True,
+        fees_known: bool = True,
+    ) -> OrderOutcome:
+        return OrderOutcome(
+            executed=executed,
+            surplus_native=surplus,
+            contributes=True,
+            solver="a",
+            fee_native=fee,
+            partner_fee_native=partner,
+            fees_known=fees_known,
+        )
+
+    def auction(self, diffs: tuple[OrderDiff, ...]) -> AuctionCounterfactual:
+        return AuctionCounterfactual(
+            auction_id=1, n_solutions=2, solver_present=True, order_diffs=diffs
+        )
+
+    def test_fee_lost_with_the_solver_gone(self):
+        (diff,) = diff_outcomes(
+            {"o1": self.outcome(100, fee=30, partner=10)},
+            {"o1": self.outcome(60, fee=18, partner=6)},
+        )
+        assert diff.delta_protocol_and_partner_fee == -12
+        assert diff.delta_partner_fee == -4
+        assert diff.delta_protocol_fee == -8
+
+    def test_an_order_that_stops_trading_loses_its_whole_fee(self):
+        (diff,) = diff_outcomes({"o1": self.outcome(100, fee=30, partner=10)}, {})
+        assert diff.fee_loo is None
+        assert diff.delta_protocol_and_partner_fee == -30
+        assert diff.delta_protocol_fee == -20
+
+    def test_auction_sums_split_partner_from_dao(self):
+        result = self.auction(
+            diff_outcomes(
+                {"o1": self.outcome(100, fee=30, partner=10)},
+                {"o1": self.outcome(60, fee=18, partner=6)},
+            )
+        )
+        assert result.protocol_and_partner_fees_base == 30
+        assert result.partner_fees_base == 10
+        assert result.protocol_fees_base == 20
+        assert result.delta_protocol_fees == -8
+        assert result.fees_complete
+
+    def test_an_unpriced_order_makes_the_auction_incomplete(self):
+        result = self.auction(
+            diff_outcomes(
+                {"o1": self.outcome(100, fee=None, partner=None, fees_known=False)},
+                {"o1": self.outcome(60, fee=18, partner=6)},
+            )
+        )
+        assert not result.fees_complete
+
+    def test_an_unexecuted_order_is_priced_at_zero_not_unknown(self):
+        """An order that did not trade pays nothing, so an unrecorded policy list must
+        not take the whole auction out of the fee sums.
+
+        Goes through `side_outcomes` because that is where the distinction is drawn: the
+        valuation reports the order as unpriced either way, and only the settlement
+        outcome decides whether that matters.
+        """
+        unpriced = valued(
+            bid(0, "a", 100, [sell_order("o1")], is_winner=True),
+            {"o1": 100},
+            fees_unknown=frozenset({"o1"}),
+        )
+        failed = side_outcomes(
+            [unpriced],
+            outcome_rule="inherited",
+            settled={0: NOT_SETTLED},
+            recorded_winner_uids=frozenset({0}),
+        )
+        assert failed.orders["o1"].executed is False
+        assert failed.orders["o1"].fees_known is True
+
+        landed = side_outcomes(
+            [unpriced],
+            outcome_rule="assume-settled",
+            settled={},
+            recorded_winner_uids=frozenset({0}),
+        )
+        assert landed.orders["o1"].executed is True
+        assert landed.orders["o1"].fees_known is False
+
+    def test_incomplete_auctions_are_counted_not_summed(self):
+        """Both sides drop together, so the window sum stays like-for-like."""
+        analysis = Analysis()
+        analysis.add(
+            self.auction(
+                diff_outcomes(
+                    {"o1": self.outcome(100, fee=None, partner=None, fees_known=False)},
+                    {"o1": self.outcome(60, fee=18, partner=6)},
+                )
+            )
+        )
+        assert analysis.auctions_fees_incomplete == 1
+        assert analysis.auctions_fees_counted == 0
+        assert analysis.delta_protocol_fees == 0
+
+        analysis.add(
+            self.auction(
+                diff_outcomes(
+                    {"o1": self.outcome(100, fee=30, partner=10)},
+                    {"o1": self.outcome(60, fee=18, partner=6)},
+                )
+            )
+        )
+        assert analysis.auctions_fees_counted == 1
+        assert analysis.delta_protocol_fees == -8
+        assert analysis.delta_partner_fees == -4
+        assert analysis.delta_protocol_and_partner_fees == -12
+
+
 class TestRecordedExecutedVolume:
     """The denominator of "averaged over all traded volume": what the recorded winners
     executed, computed through `analyse_auction` whether or not the solver bid."""
@@ -773,8 +906,6 @@ class TestAnalysis:
         return OrderDiff(**defaults)
 
     def test_jit_orders_are_counted_apart_from_user_orders(self):
-        from loo.counterfactual import AuctionCounterfactual
-
         analysis = Analysis()
         analysis.add(
             AuctionCounterfactual(

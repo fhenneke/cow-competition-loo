@@ -2,7 +2,7 @@
 
 Counterfactual analysis of the CoW Protocol solver competition: remove one solver —
 or several at once — from past auctions, re-run winner selection, and measure the
-impact on user surplus, solver rewards and order coverage.
+impact on user surplus, protocol fee revenue, solver rewards and order coverage.
 
 ## Setup
 
@@ -24,8 +24,9 @@ minutes.
 
 **Signs:** every delta is **counterfactual − actual** (without-solver minus
 with-solver), so the numbers read directly as what the removal scenario changes:
-negative Δsurplus means users would have received less, positive Δrewards means the
-protocol would have paid more. The tables state this convention with the numbers.
+negative Δsurplus means users would have received less, negative Δprotocol fee means the
+protocol would have collected less, and positive Δrewards means it would have paid
+more. The tables state this convention with the numbers.
 
 **1. The counterfactual**, one invocation. `--solver` and `--outcome-rule` are both
 repeatable and everything shares one extraction pass — extraction is nearly all of the
@@ -141,6 +142,46 @@ amounts are always the **proposed** ones — a batch that lands executes its pro
 exactly, to the atom, so the only on-chain input the pipeline has is the settlement
 status — and "settled" means landed **in time**, so the real surplus of late batches is
 reported as `of which merely late` rather than absorbed.
+
+#### Protocol fees
+
+`analyse` reports the fee the winning solutions charged on each side, split into the
+partners' share and the protocol's own revenue:
+
+| row | meaning |
+| --- | --- |
+| **Δprotocol and partner fees** | the gross amount the mechanism charges |
+| Δpartner fee | passed straight through to the app that declared it |
+| **Δprotocol fee** | what the protocol keeps |
+
+Over 2026-08-01..04 on mainnet partner fees were the larger half of the gross — 33.9 ETH
+partner against 30.8 ETH protocol — so reading the gross figure as protocol revenue
+roughly doubles it.
+
+**The split is not a fixed fraction, so all three rows are reported.** A partner fee is a
+volume policy, so it survives a rival winning the same order and is lost only when the
+order stops trading. The partners' share of the *delta* therefore tracks how much of a
+removal's cost is coverage rather than price, and it ranges from ~0% (Baseline on xdai
+and plasma, July 2026) to 74% (Baseline on polygon).
+
+**A naming warning.** The analytics DB and `arbitrator.rs` both use "protocol fee" for
+the *gross* amount, and spell the net one `protocol_fee_without_partner_fee_native`.
+This tool follows budget usage instead: "protocol fee" is what the protocol keeps, and
+the gross quantity is named for what it contains. `loo/fees.py` carries the mapping.
+
+Δprotocol fee is the direct value of a solver *to the protocol*, where Δsurplus is its
+value to users. It is **gross** revenue, so it belongs beside Δrewards rather than
+instead of it:
+the protocol also pays for the competition, and the two usually move in opposite
+directions. They are deliberately not netted into one number — fees are exact and
+uncapped rewards are not the payout, and combining them would hide that.
+
+Fees come from `stg_backend_data__fee_policies`, which covers every auction order of
+every non-filtered-out solution, so they are recomputable for essentially every solution
+the counterfactual prices. An auction where some executed order's policies are
+unrecorded is dropped from **both** sides of the fee sum and counted separately, so the
+delta stays like-for-like; that needs a solution the recorded competition filtered out to
+win the counterfactual, and runs at a fraction of a percent of auctions.
 
 #### Rewards
 
