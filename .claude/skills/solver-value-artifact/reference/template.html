@@ -1,0 +1,386 @@
+<title>PLACEHOLDER — solvers and window</title>
+<style>
+  :root {
+    --bg: #F6F7F9;
+    --surface: #FFFFFF;
+    --ink: #1B2431;
+    --muted: #5C6675;
+    --line: #E3E7ED;
+    --accent: #2B5FBF;
+    --neg: #B0364A;
+    --warn-bg: #FBF4E4;
+    --warn-ink: #8A5F1C;
+    --chip-bg: #EBF0F9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12161D;
+      --surface: #1A2029;
+      --ink: #E6EAF0;
+      --muted: #98A2B0;
+      --line: #2A323E;
+      --accent: #82A9EE;
+      --neg: #E58B9B;
+      --warn-bg: #2B2416;
+      --warn-ink: #D9B36A;
+      --chip-bg: #232C3D;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12161D;
+    --surface: #1A2029;
+    --ink: #E6EAF0;
+    --muted: #98A2B0;
+    --line: #2A323E;
+    --accent: #82A9EE;
+    --neg: #E58B9B;
+    --warn-bg: #2B2416;
+    --warn-ink: #D9B36A;
+    --chip-bg: #232C3D;
+  }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    margin: 0;
+    padding: 3rem 1.25rem 5rem;
+  }
+  main { max-width: 64rem; margin: 0 auto; }
+  h1, h2, h3 {
+    font-family: "Iowan Old Style", "Palatino Nova", Palatino, "Book Antiqua", Georgia, serif;
+    line-height: 1.2;
+    text-wrap: balance;
+    margin: 0;
+  }
+  h1 { font-size: 2rem; font-weight: 600; }
+  h2 { font-size: 1.4rem; font-weight: 600; margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.1rem; font-weight: 600; margin-top: 1.8rem; }
+  p, li { max-width: 70ch; }
+  .eyebrow {
+    font-size: 0.75rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+    margin-bottom: 0.6rem;
+  }
+  .subtitle { color: var(--muted); margin-top: 0.7rem; }
+  .lead { font-size: 1.05rem; }
+  section > p, section > ul { margin: 0.9rem 0; }
+  ul { padding-left: 1.2rem; }
+  li { margin: 0.45rem 0; }
+  strong { font-weight: 650; }
+  .tablewrap {
+    overflow-x: auto;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    margin: 1.4rem 0 0.4rem;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 0.86rem; }
+  th, td { padding: 0.55rem 0.8rem; text-align: right; white-space: nowrap; }
+  th {
+    font-size: 0.72rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+    border-bottom: 1px solid var(--line);
+    vertical-align: bottom;
+    /* Values stay on one line; the labels wrap, so a long column name does not
+       set the column's width. */
+    white-space: normal;
+    max-width: 9rem;
+  }
+  td { border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  /* Each chain is two rows: the values, then their detail in smaller print beneath.
+     Only the detail row carries the rule, so the pair reads as one entry. */
+  tr.main td { border-bottom: none; padding-bottom: 0.1rem; }
+  tr.detail td {
+    color: var(--muted);
+    font-size: 0.76rem;
+    line-height: 1.45;
+    padding-top: 0;
+    padding-bottom: 0.7rem;
+    /* Detail blocks are unequal in length; top alignment keeps each one under the
+       value it qualifies instead of centring it against the tallest cell. */
+    vertical-align: top;
+  }
+  td.chain { vertical-align: top; padding-top: 0.6rem; border-bottom: 1px solid var(--line); }
+  tr.main td:not(.chain) { padding-top: 0.6rem; }
+  /* Scoped to the chain cell by class, not by position: it spans both rows, so the
+     first `td` of a detail row is the Δsurplus detail and must stay right-aligned. */
+  th:first-child, td.chain { text-align: left; }
+  td.group {
+    text-align: left;
+    font-family: "Iowan Old Style", "Palatino Nova", Palatino, Georgia, serif;
+    font-weight: 600;
+    font-size: 0.95rem;
+    background: var(--chip-bg);
+  }
+  /* Accounting convention, not a verdict: negative deltas red, positive deltas plain
+     ink, no green. A positive delta means the removal would have improved things — a
+     rarity to notice, not a result to celebrate — and a good/bad palette would put a
+     judgement on a page that does not make one. Emphasis on the focus values comes from
+     weight, so it lands the same whatever the sign. */
+  tr.main td:not(.chain):not(.sec) { font-weight: 600; }
+  td.num-neg { color: var(--neg); }
+  td.num-pos { color: var(--ink); }
+  .native { color: var(--muted); font-size: 0.78rem; }
+  .chip {
+    display: inline-block;
+    background: var(--chip-bg);
+    color: var(--accent);
+    border-radius: 3px;
+    padding: 0.05rem 0.4rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+  }
+  .footnote, figcaption { color: var(--muted); font-size: 0.82rem; max-width: 75ch; }
+  .callout {
+    background: var(--warn-bg);
+    color: var(--warn-ink);
+    border-radius: 6px;
+    padding: 0.8rem 1rem;
+    font-size: 0.9rem;
+    max-width: 72ch;
+    margin: 1.2rem 0;
+  }
+  .callout strong { color: inherit; }
+  ol.caveats { padding-left: 1.3rem; }
+  ol.caveats li { margin: 0.7rem 0; max-width: 75ch; }
+  code {
+    font: 0.85em ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    background: var(--chip-bg);
+    padding: 0.08em 0.35em;
+    border-radius: 3px;
+  }
+  th.sec, td.sec { color: var(--muted); font-weight: 400; }
+  td.sec .native { color: var(--muted); }
+  .sign-note {
+    border-left: 3px solid var(--accent);
+    padding: 0.2rem 0 0.2rem 1rem;
+    color: var(--muted);
+    font-size: 0.92rem;
+    max-width: 70ch;
+    margin: 1.4rem 0;
+  }
+</style>
+
+
+<!--
+  House template for leave-one-out solver-value artifacts.
+
+  Two tiers only, and the tier is carried by the `sec` class:
+    - focus  (no class)  — Δsurplus, Δprice, Δfees, coverage. Weight 600.
+    - muted  (class="sec") — win share, largest-auction share. Nothing else earns a
+      column; the rest of the run lives in the reports and is named in the footnote.
+
+  Colour follows the accounting convention: `num-neg` is red, `num-pos` is plain ink,
+  and there is no green. A zero and a share (which has no sign) take no class but keep
+  the weight. Muted cells stay muted whatever their sign.
+
+  The outcome rule is never a column header — the sign note states how settlement is
+  handled, and the settlement caveat carries the assume-settled comparison.
+
+  Fill every PLACEHOLDER. Delete nothing structural: a section that has nothing to say
+  still gets its heading and one sentence saying the run produced nothing there.
+-->
+<main>
+
+  <header>
+    <div class="eyebrow">Leave-one-out solver analysis · CoW Protocol</div>
+    <h1>PLACEHOLDER solvers removed: PLACEHOLDER window</h1>
+    <p class="subtitle"><strong>Window: PLACEHOLDER start → PLACEHOLDER end</strong>,
+    every auction in it re-arbitrated with one solver removed, on every chain that solver
+    bid on — PLACEHOLDER chains per solver, for PLACEHOLDER solver-chain combinations.
+    Every figure in the table is a total over this window, not a rate.</p>
+  </header>
+
+  <div class="sign-note">
+    <strong>What was measured:</strong> each auction’s winner selection is re-run on the
+    recorded bids with one solver’s bids removed, and the outcome is compared with what
+    actually happened. <strong>Signs:</strong> every delta is counterfactual − actual —
+    negative Δsurplus means users would have received less without the solver, and
+    negative Δfees means the protocol would have collected less.
+    <strong>Settlement:</strong> a replacement winner inherits the on-chain outcome of the
+    recorded winner whose token pairs it claims, so a batch that really reverted stays
+    reverted whoever wins it. Settlement therefore cancels out of Δsurplus and what the
+    figures measure is the competition’s decision, not its execution.
+    <strong>USD figures</strong> are display-only conversions at each auction’s own
+    stablecoin-implied rate, on every chain.
+  </div>
+
+  <section>
+    <h2>Summary</h2>
+    <ul class="lead">
+      <li>PLACEHOLDER — one bullet per solver: Δsurplus, Δfee, Δprice and coverage share,
+        with the chains covered. Magnitudes and rank only.</li>
+      <li>PLACEHOLDER — cross-cutting facts worth one line each, if the run has any.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>The window, one row per solver-chain</h2>
+    <p>The four left columns are the measures this page reports: <strong>Δsurplus</strong>
+    in USD with the native amount beneath; <strong>Δprice</strong>, the same surplus
+    change spread over all volume the chain traded, with the still-traded conditional
+    reading beneath; <strong>Δprotocol and partner fees</strong>, the gross the mechanism
+    charges, split into the protocol’s and the partners’ shares beneath; and the
+    <strong>share of all executed orders</strong> that would not have traded. The two
+    muted columns to the right carry supporting detail. Definitions are in the footnote,
+    limits in the caveats.</p>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Chain</th>
+            <th>Δsurplus</th>
+            <th>Δprice, all traded volume</th>
+            <th>Δprotocol and partner fees</th>
+            <th>Orders no longer executed, share of all</th>
+            <th class="sec">Won</th>
+            <th class="sec">Largest auction share</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td class="group" colspan="7">PLACEHOLDER solver — Δsurplus, Δprotocol fee, chain count</td></tr>
+          <tr class="main">
+            <td class="chain" rowspan="2">PLACEHOLDER chain <span class="chip">NATIVE</span></td>
+            <td class="num-neg">−$0</td>
+            <td class="num-neg">−0.000 bps</td>
+            <td class="num-neg">−$0</td>
+            <td>0.0%</td>
+            <td class="sec">0.0%</td>
+            <td class="sec">0%</td>
+          </tr>
+          <tr class="detail">
+            <td>−0.0000 NATIVE</td>
+            <td>still-traded −0.00 bps<br>median −0.00 bps<br>0 moved</td>
+            <td>−0.0000 NATIVE<br>protocol −$0<br>partner −$0<br>N auctions unpriced</td>
+            <td>0 orders<br>−$0 surplus</td>
+            <td>0 won<br>bid 0.0%</td>
+            <td></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="footnote">“Δsurplus” is the change in user surplus, summed over the window. “Δprice, all traded volume” spreads the moved-order Δsurplus over the window’s
+    whole executed fill-or-kill volume, so unmoved orders count as zero; its sub-line gives
+    the conditional reading — the change on just the still-traded orders whose price moved,
+    with the median moved order and the moved count. “Δprotocol and partner fees” is the
+    whole fee the winning solutions charged, split beneath into what the protocol keeps and
+    what passes to partners, with the auctions whose fees could not be priced noted at the
+    end; both are summed over every order either side traded, so an order that stops trading
+    contributes its whole fee. “Orders no longer executed” divides the orders only the
+    solver executed by every user-order execution the chain’s recorded winners traded in the
+    window, partially fillable included; an order counts once per auction it executes in.
+    “Won” is the solver’s share of analysed auctions, with its bid rate beneath. “Largest
+    auction share” is a concentration check on the Δsurplus column and on nothing else: the
+    single largest auction’s |Δsurplus| as a share of the row’s total, over the auctions
+    where surplus moved at all — read the caveat before quoting a row above 30%.
+    Price-suspect auctions and auctions with unrecoverable JIT order data are excluded from every figure and enumerated in the report
+    files (PLACEHOLDER counts). Solver rewards move under these scenarios too and are reported in the comparison
+    output; they are not shown here.</p>
+  </section>
+
+  <section>
+    <h2>Protocol fee and partner fee</h2>
+    <p>The competition ranks solutions on score, which is user surplus plus protocol
+    fees, so a removal changes fee revenue as well as surplus. The fee figures are
+    recomputed from each auction’s recorded fee policies and reproduce the protocol’s own
+    recorded score exactly on the solutions where both are available.</p>
+    <p><strong>“Protocol fee” is used here in the budget sense: what the protocol
+    keeps.</strong> The analytics database and the protocol’s own code use the same words
+    for the gross amount including the partners’ share, so the two are labelled
+    separately — <strong>Δprotocol and partner fees</strong> for the gross,
+    <strong>Δprotocol fee</strong> for the remainder.</p>
+    <p>The partners’ share of the <em>change</em> ranges from PLACEHOLDER to PLACEHOLDER
+    across these chains. Partner fees are charged on volume, so they are
+    unaffected when a rival wins the same order at a worse price and are lost only when
+    the order does not trade. The partners’ share of a fee delta therefore reads out how
+    much of the delta is coverage rather than price. It is not the partners’ share of the
+    fee <em>level</em>, which is larger.</p>
+  </section>
+
+  <section>
+    <h2>Reading each solver</h2>
+    <h3>PLACEHOLDER solver</h3>
+    <p>PLACEHOLDER — three to five sentences: where the figure sits, how it splits between
+    coverage and price, the partners' share of its fee delta, and which rows are
+    concentrated in few auctions.</p>
+  </section>
+
+  <section>
+    <h2>Caveats</h2>
+    <ol class="caveats">
+      <li><strong>No behavioural response.</strong> Rivals’ bids are held fixed; nobody
+        re-quotes or re-routes because a competitor is absent. This matters most where the
+        figures are largest — a 41% win share disappearing would attract entry, and
+        nothing here models that. The per-solver cap on solutions is applied before winners
+        are picked, so a solution suppressed by the cap cannot step in either.</li>
+      <li><strong>Settlement is inherited, and that is an assumption.</strong> Winning an
+        auction does not guarantee the batch lands on-chain, and a winner that never won
+        for real never settled either, so the counterfactual has to decide what a
+        replacement’s orders do. It gives the replacement the recorded winner’s outcome,
+        which is the only choice grounded in the record. The alternative — assuming
+        everything lands in time on both sides — is computed alongside and moves the
+        figures in both directions: PLACEHOLDER — quote the rows that move most, in each
+        direction. Those figures are in the comparison output.</li>
+      <li><strong>USD is display-only.</strong> Converted per auction from the auction’s
+        own stablecoin-implied native prices; nothing on the valuation or reward path
+        consumes a USD number. Native amounts are the exact figures.</li>
+      <li><strong>“Protocol fee” here excludes the partners’ share.</strong> The database
+        and the protocol’s own code use “protocol fee” for the gross amount; this page uses
+        it for what the protocol keeps and names the gross figure “protocol and partner
+        fees”. Reading the gross number as protocol revenue overstates it by whatever the
+        partners take: PLACEHOLDER — the smallest and largest partner shares in the
+        run.</li>
+      <li><strong>Fee figures are gross revenue.</strong> The protocol also pays rewards
+        for the competition, and the reward change usually runs opposite to the fee change.
+        The fee figures here are therefore not the net budget effect of a removal.</li>
+      <li><strong>Fees are exact where they are priced, and the exceptions are
+        counted.</strong> A fee cannot be computed when a solution the real competition
+        filtered out wins the counterfactual, because policies are only recorded for
+        solutions that were kept. Those auctions drop from both sides of the fee comparison
+        and are counted in the table (PLACEHOLDER per row). Nothing is read
+        as a fee of zero.</li>
+      <li><strong>“Orders no longer executed” is a share of everything the chain
+        executed.</strong> The narrower per-auction reading — relative only to auctions the
+        solver bid in — is in the report files; it overstates chain-level dependence for a
+        selective bidder and is not shown here.</li>
+      <li><strong>Δprice comes in two conditionings, labelled.</strong> The headline
+        spreads the moved-order Δsurplus over all executed fill-or-kill volume; the
+        sub-line is the change on just the still-traded orders that moved. The two differ
+        by up to two orders of magnitude and neither substitutes for the other. Rows with
+        few moved orders are anecdotes rather than run rates — PLACEHOLDER, name the
+        thinnest row — and the moved count is printed with every
+        figure. Partially fillable orders are excluded from both, since their two sides can
+        execute different amounts.</li>
+      <li><strong>What “largest auction share” does and does not tell you.</strong> It is
+        the concentration of the <em>Δsurplus</em> column only — the biggest single
+        auction’s |Δsurplus| over the row’s signed total, across the auctions where surplus
+        moved. It says nothing about the fee, coverage or price columns, which concentrate
+        differently, and a row whose deltas offset can exceed 100%. It is a prompt to open
+        the auction, not a discount factor: a 100% row is one real auction, not a wrong
+        number. What it tracks is <strong>how few auctions moved, not chain size.</strong>
+        PLACEHOLDER — recompute for this run: the correlation of the share with the log of
+        the moved-auction count against the log of the row’s size, the large-chain and
+        small-chain averages, and a counterexample in each direction. Any solver thin on a busy chain gets a concentrated row there.</li>
+      <li><strong>Concentrated rows, listed.</strong> PLACEHOLDER — every row at 30% or
+        more, by solver, with its share.</li>
+      <li><strong>Exclusions are named, not silent.</strong> Price-suspect and missing-JIT
+        auctions are excluded from every statistic and enumerated in the report files.</li>
+      <li><strong>Quote rewards are out of scope</strong> — the analysis has no data on
+        counterfactual quoting.</li>
+    </ol>
+    <p class="footnote">Method: full re-arbitration per auction (fairness filter included)
+    on recorded scores; executed amounts from proposed executions; “executed” means settled
+    in time. Protocol fees recomputed from the recorded fee policies, validated against the
+    recorded score and against the accounting model’s own partner/protocol split. Reports:
+    PLACEHOLDER N files, format PLACEHOLDER, generated PLACEHOLDER. Produced by <code>loo analyse</code> / <code>loo compare</code>.</p>
+  </section>
+
+</main>

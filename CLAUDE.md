@@ -10,6 +10,10 @@ on user surplus, solver rewards, and order coverage.
 - **[docs/winner-selection.md](docs/winner-selection.md)** — the algorithm, Rust source
   map, score/surplus formulas.
 - **[docs/rewards.md](docs/rewards.md)** — reward and cap formulas.
+- **[solver-value-artifact skill](.claude/skills/solver-value-artifact/SKILL.md)** —
+  writing a run up as a published artifact: which four measures lead, what stays
+  visually quiet, and the neutral register the pages are written in. Read it before
+  drafting any results page.
 
 Keep the split: `PLAN.md` is the concrete work, `docs/` is durable context. When you learn
 something reusable about the data or the protocol, it goes in `docs/`.
