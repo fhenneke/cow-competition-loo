@@ -1,0 +1,292 @@
+<title>Mainnet Solver Value, July 2026</title>
+<style>
+  :root {
+    --bg: #F6F7F9;
+    --surface: #FFFFFF;
+    --ink: #1B2431;
+    --muted: #5C6675;
+    --line: #E3E7ED;
+    --accent: #2B5FBF;
+    --neg: #B0364A;
+    --pos: #2C7A4B;
+    --warn-bg: #FBF4E4;
+    --warn-ink: #8A5F1C;
+    --chip-bg: #EBF0F9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12161D;
+      --surface: #1A2029;
+      --ink: #E6EAF0;
+      --muted: #98A2B0;
+      --line: #2A323E;
+      --accent: #82A9EE;
+      --neg: #E58B9B;
+      --pos: #7BC898;
+      --warn-bg: #2B2416;
+      --warn-ink: #D9B36A;
+      --chip-bg: #232C3D;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12161D;
+    --surface: #1A2029;
+    --ink: #E6EAF0;
+    --muted: #98A2B0;
+    --line: #2A323E;
+    --accent: #82A9EE;
+    --neg: #E58B9B;
+    --pos: #7BC898;
+    --warn-bg: #2B2416;
+    --warn-ink: #D9B36A;
+    --chip-bg: #232C3D;
+  }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    margin: 0;
+    padding: 3rem 1.25rem 5rem;
+  }
+  main { max-width: 64rem; margin: 0 auto; }
+  h1, h2, h3 {
+    font-family: "Iowan Old Style", "Palatino Nova", Palatino, "Book Antiqua", Georgia, serif;
+    line-height: 1.2;
+    text-wrap: balance;
+    margin: 0;
+  }
+  h1 { font-size: 2rem; font-weight: 600; }
+  h2 { font-size: 1.4rem; font-weight: 600; margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.1rem; font-weight: 600; margin-top: 1.8rem; }
+  p, li { max-width: 70ch; }
+  .eyebrow {
+    font-size: 0.75rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+    margin-bottom: 0.6rem;
+  }
+  .subtitle { color: var(--muted); margin-top: 0.7rem; }
+  .lead { font-size: 1.05rem; }
+  section > p, section > ul { margin: 0.9rem 0; }
+  ul { padding-left: 1.2rem; }
+  li { margin: 0.45rem 0; }
+  strong { font-weight: 650; }
+  .tablewrap {
+    overflow-x: auto;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    margin: 1.4rem 0 0.4rem;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 0.86rem; }
+  th, td { padding: 0.55rem 0.8rem; text-align: right; white-space: nowrap; }
+  th {
+    font-size: 0.72rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+    border-bottom: 1px solid var(--line);
+    vertical-align: bottom;
+  }
+  td { border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  th:first-child, td:first-child { text-align: left; }
+  td.group {
+    text-align: left;
+    font-family: "Iowan Old Style", "Palatino Nova", Palatino, Georgia, serif;
+    font-weight: 600;
+    font-size: 0.95rem;
+    background: var(--chip-bg);
+  }
+  td.num-neg { color: var(--neg); }
+  td.num-pos { color: var(--pos); }
+  .native { color: var(--muted); font-size: 0.78rem; }
+  .chip {
+    display: inline-block;
+    background: var(--chip-bg);
+    color: var(--accent);
+    border-radius: 3px;
+    padding: 0.05rem 0.4rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+  }
+  .footnote, figcaption { color: var(--muted); font-size: 0.82rem; max-width: 75ch; }
+  .callout {
+    background: var(--warn-bg);
+    color: var(--warn-ink);
+    border-radius: 6px;
+    padding: 0.8rem 1rem;
+    font-size: 0.9rem;
+    max-width: 72ch;
+    margin: 1.2rem 0;
+  }
+  .callout strong { color: inherit; }
+  ol.caveats { padding-left: 1.3rem; }
+  ol.caveats li { margin: 0.7rem 0; max-width: 75ch; }
+  code {
+    font: 0.85em ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    background: var(--chip-bg);
+    padding: 0.08em 0.35em;
+    border-radius: 3px;
+  }
+  th.sec, td.sec { color: var(--muted); font-weight: 400; }
+  td.sec .native { color: var(--muted); }
+  .sign-note {
+    border-left: 3px solid var(--accent);
+    padding: 0.2rem 0 0.2rem 1rem;
+    color: var(--muted);
+    font-size: 0.92rem;
+    max-width: 70ch;
+    margin: 1.4rem 0;
+  }
+</style>
+<main>
+<p class="eyebrow">Leave-one-out &middot; mainnet &middot; July 2026</p>
+<h1>What each mainnet solver was worth in July 2026</h1>
+<p class="subtitle lead">Every solver that bid on mainnet in July 2026, removed from the
+auctions it entered while the rest of the field is held fixed, and the competition re-run.
+26 solvers, 83,621 auctions analysed.</p>
+
+<div class="sign-note">Every delta is <strong>counterfactual minus actual</strong>. A
+negative &Delta;surplus means users would have received <em>less</em> without that solver;
+a positive &Delta;rewards means the protocol would have paid <em>more</em>. Turning a delta
+into a claim about a solver's worth is left to the reader.</div>
+
+<section>
+<h2>The month, one row per solver</h2>
+<p>Ordered by &Delta;surplus. Dollar figures convert each auction at its own
+stablecoin-implied rate; the window median was $1,856.46 per ETH.</p>
+<div class="tablewrap">
+<table>
+<thead><tr>
+<th>Solver</th>
+<th>&Delta;surplus</th>
+<th>&Delta;fees, gross</th>
+<th class="sec">of which</th>
+<th>Orders no longer executed</th>
+<th>Won</th>
+<th>&Delta;rewards, capped</th>
+</tr></thead>
+<tbody>
+<tr><td>Rizzolver</td><td class="num-neg">-$184,151.95<br><span class="native">-101.8030 ETH</span><br><span class="native">-0.634 bps of all volume</span></td><td class="num-neg">-$134,559.16<br><span class="native">-73.8181 ETH</span></td><td class="sec">-$118,357.82 DAO<br><span class="native">-$16,201.33 partner</span></td><td>1,687<br><span class="native">1.64% of all</span></td><td>8,619<br><span class="native">bid 35%</span></td><td class="num-neg">-$59,505.64<br><span class="native">-32.7713 ETH</span></td></tr>
+<tr><td>Quasi</td><td class="num-neg">-$29,527.85<br><span class="native">-18.4030 ETH</span><br><span class="native">-0.009 bps of all volume</span></td><td class="num-neg">-$34,301.65<br><span class="native">-21.4098 ETH</span></td><td class="sec">-$34,076.23 DAO<br><span class="native">-$225.42 partner</span></td><td>3,420<br><span class="native">3.31% of all</span></td><td>8,733<br><span class="native">bid 66%</span></td><td class="num-pos">+$2,797.10<br><span class="native">+1.5456 ETH</span></td></tr>
+<tr><td>Fractal</td><td class="num-neg">-$29,998.30<br><span class="native">-17.2845 ETH</span><br><span class="native">-0.041 bps of all volume</span></td><td class="num-neg">-$32,850.22<br><span class="native">-19.6137 ETH</span></td><td class="sec">-$32,565.24 DAO<br><span class="native">-$284.98 partner</span></td><td>5,741<br><span class="native">5.56% of all</span></td><td>10,309<br><span class="native">bid 66%</span></td><td class="num-pos">+$1,673.55<br><span class="native">+0.9800 ETH</span></td></tr>
+<tr><td>Tsolver</td><td class="num-neg">-$22,153.75<br><span class="native">-12.1031 ETH</span><br><span class="native">-0.016 bps of all volume</span></td><td class="num-neg">-$10,314.74<br><span class="native">-5.5684 ETH</span></td><td class="sec">-$9,253.74 DAO<br><span class="native">-$1,061.00 partner</span></td><td>1,255<br><span class="native">1.22% of all</span></td><td>5,773<br><span class="native">bid 59%</span></td><td class="num-pos">+$3,733.01<br><span class="native">+1.9888 ETH</span></td></tr>
+<tr><td>Sector</td><td class="num-neg">-$17,887.18<br><span class="native">-9.8009 ETH</span><br><span class="native">-0.047 bps of all volume</span></td><td class="num-neg">-$12,777.27<br><span class="native">-6.9645 ETH</span></td><td class="sec">-$12,566.72 DAO<br><span class="native">-$210.55 partner</span></td><td>1,403<br><span class="native">1.36% of all</span></td><td>7,345<br><span class="native">bid 59%</span></td><td class="num-pos">+$9,544.30<br><span class="native">+5.1861 ETH</span></td></tr>
+<tr><td>Kipseli</td><td class="num-neg">-$10,149.98<br><span class="native">-5.5340 ETH</span><br><span class="native">-0.017 bps of all volume</span></td><td class="num-neg">-$7,512.18<br><span class="native">-4.0818 ETH</span></td><td class="sec">-$6,705.81 DAO<br><span class="native">-$806.37 partner</span></td><td>1,842<br><span class="native">1.79% of all</span></td><td>11,557<br><span class="native">bid 54%</span></td><td class="num-pos">+$1,479.75<br><span class="native">+0.8269 ETH</span></td></tr>
+<tr><td>Portus</td><td class="num-neg">-$5,982.99<br><span class="native">-3.3968 ETH</span><br><span class="native">-0.008 bps of all volume</span></td><td class="num-neg">-$3,870.75<br><span class="native">-2.1572 ETH</span></td><td class="sec">-$3,809.90 DAO<br><span class="native">-$60.85 partner</span></td><td>1,926<br><span class="native">1.87% of all</span></td><td>3,235<br><span class="native">bid 66%</span></td><td class="num-pos">+$1,121.97<br><span class="native">+0.6137 ETH</span></td></tr>
+<tr><td>Barter</td><td class="num-neg">-$6,291.98<br><span class="native">-3.3533 ETH</span><br><span class="native">-0.008 bps of all volume</span></td><td class="num-neg">-$1,368.74<br><span class="native">-0.7481 ETH</span></td><td class="sec">-$1,284.15 DAO<br><span class="native">-$84.58 partner</span></td><td>970<br><span class="native">0.94% of all</span></td><td>8,032<br><span class="native">bid 44%</span></td><td class="num-pos">+$519.14<br><span class="native">+0.2816 ETH</span></td></tr>
+<tr><td>Helixbox</td><td class="num-neg">-$6,089.87<br><span class="native">-3.3514 ETH</span><br><span class="native">-0.010 bps of all volume</span></td><td class="num-neg">-$717.53<br><span class="native">-0.3870 ETH</span></td><td class="sec">-$630.52 DAO<br><span class="native">-$87.01 partner</span></td><td>2,032<br><span class="native">1.97% of all</span></td><td>7,790<br><span class="native">bid 60%</span></td><td class="num-pos">+$165.43<br><span class="native">+0.0911 ETH</span></td></tr>
+<tr><td>Curve</td><td class="num-neg">-$5,273.00<br><span class="native">-2.8499 ETH</span><br><span class="native">-0.016 bps of all volume</span></td><td class="num-neg">-$2,894.59<br><span class="native">-1.5760 ETH</span></td><td class="sec">-$2,802.08 DAO<br><span class="native">-$92.51 partner</span></td><td>82<br><span class="native">0.08% of all</span></td><td>1,580<br><span class="native">bid 13%</span></td><td class="num-neg">-$1,299.69<br><span class="native">-0.7065 ETH</span></td></tr>
+<tr><td>BitgetWallet</td><td class="num-neg">-$4,501.61<br><span class="native">-2.4262 ETH</span><br><span class="native">-0.010 bps of all volume</span></td><td class="num-neg">-$3,304.49<br><span class="native">-1.7776 ETH</span></td><td class="sec">-$2,766.08 DAO<br><span class="native">-$538.41 partner</span></td><td>867<br><span class="native">0.84% of all</span></td><td>3,673<br><span class="native">bid 65%</span></td><td class="num-pos">+$1,482.66<br><span class="native">+0.8223 ETH</span></td></tr>
+<tr><td>Wraxyn</td><td class="num-neg">-$2,874.48<br><span class="native">-1.5548 ETH</span><br><span class="native">-0.012 bps of all volume</span></td><td class="num-neg">-$1,861.34<br><span class="native">-0.9911 ETH</span></td><td class="sec">-$1,856.81 DAO<br><span class="native">-$4.53 partner</span></td><td>528<br><span class="native">0.51% of all</span></td><td>1,508<br><span class="native">bid 40%</span></td><td class="num-pos">+$1,710.26<br><span class="native">+0.9371 ETH</span></td></tr>
+<tr><td>Arc</td><td class="num-neg">-$2,245.27<br><span class="native">-1.2370 ETH</span><br><span class="native">-0.007 bps of all volume</span></td><td class="num-neg">-$634.85<br><span class="native">-0.3422 ETH</span></td><td class="sec">-$589.11 DAO<br><span class="native">-$45.74 partner</span></td><td>206<br><span class="native">0.20% of all</span></td><td>4,846<br><span class="native">bid 60%</span></td><td class="num-pos">+$1,018.04<br><span class="native">+0.5579 ETH</span></td></tr>
+<tr><td>Baseline</td><td class="num-neg">-$1,549.07<br><span class="native">-0.8755 ETH</span><br><span class="native">-0.004 bps of all volume</span></td><td class="num-neg">-$202.43<br><span class="native">-0.1096 ETH</span></td><td class="sec">-$192.95 DAO<br><span class="native">-$9.48 partner</span></td><td>355<br><span class="native">0.34% of all</span></td><td>8,262<br><span class="native">bid 36%</span></td><td class="num-pos">+$383.28<br><span class="native">+0.2112 ETH</span></td></tr>
+<tr><td>BRRRolver</td><td class="num-neg">-$1,565.77<br><span class="native">-0.8378 ETH</span><br><span class="native">-0.004 bps of all volume</span></td><td class="num-neg">-$686.94<br><span class="native">-0.3649 ETH</span></td><td class="sec">-$646.28 DAO<br><span class="native">-$40.66 partner</span></td><td>276<br><span class="native">0.27% of all</span></td><td>7,871<br><span class="native">bid 53%</span></td><td class="num-pos">+$795.65<br><span class="native">+0.4300 ETH</span></td></tr>
+<tr><td>TrustedVolumes</td><td class="num-neg">-$1,162.60<br><span class="native">-0.6371 ETH</span><br><span class="native">-0.004 bps of all volume</span></td><td class="num-neg">-$1,106.81<br><span class="native">-0.5931 ETH</span></td><td class="sec">-$1,052.07 DAO<br><span class="native">-$54.74 partner</span></td><td>298<br><span class="native">0.29% of all</span></td><td>3,877<br><span class="native">bid 23%</span></td><td class="num-pos">+$128.27<br><span class="native">+0.0726 ETH</span></td></tr>
+<tr><td>Horadrim</td><td class="num-neg">-$835.70<br><span class="native">-0.4639 ETH</span><br><span class="native">-0.003 bps of all volume</span></td><td class="num-neg">-$967.97<br><span class="native">-0.5365 ETH</span></td><td class="sec">-$787.89 DAO<br><span class="native">-$180.08 partner</span></td><td>508<br><span class="native">0.49% of all</span></td><td>2,325<br><span class="native">bid 48%</span></td><td class="num-pos">+$2,207.87<br><span class="native">+1.2159 ETH</span></td></tr>
+<tr><td>Flowdesk</td><td class="num-neg">-$864.18<br><span class="native">-0.4536 ETH</span><br><span class="native">-0.001 bps of all volume</span></td><td class="num-neg">-$130.13<br><span class="native">-0.0700 ETH</span></td><td class="sec">-$120.47 DAO<br><span class="native">-$9.66 partner</span></td><td>10<br><span class="native">0.01% of all</span></td><td>168<br><span class="native">bid 1%</span></td><td class="num-pos">+$372.10<br><span class="native">+0.1998 ETH</span></td></tr>
+<tr><td>Rosato</td><td class="num-neg">-$586.88<br><span class="native">-0.3280 ETH</span><br><span class="native">-0.003 bps of all volume</span></td><td class="num-neg">-$172.30<br><span class="native">-0.0933 ETH</span></td><td class="sec">-$167.88 DAO<br><span class="native">-$4.42 partner</span></td><td>47<br><span class="native">0.05% of all</span></td><td>757<br><span class="native">bid 11%</span></td><td class="num-pos">+$103.01<br><span class="native">+0.0568 ETH</span></td></tr>
+<tr><td>OKX</td><td class="num-neg">-$554.94<br><span class="native">-0.3127 ETH</span><br><span class="native">-0.002 bps of all volume</span></td><td class="num-neg">-$28.87<br><span class="native">-0.0163 ETH</span></td><td class="sec">-$23.27 DAO<br><span class="native">-$5.59 partner</span></td><td>77<br><span class="native">0.07% of all</span></td><td>557<br><span class="native">bid 24%</span></td><td class="num-pos">+$136.11<br><span class="native">+0.0755 ETH</span></td></tr>
+<tr><td>AlgoLabs</td><td class="num-neg">-$133.13<br><span class="native">-0.0723 ETH</span><br><span class="native">-0.000 bps of all volume</span></td><td class="num-neg">-$57.97<br><span class="native">-0.0313 ETH</span></td><td class="sec">-$57.90 DAO<br><span class="native">-$0.06 partner</span></td><td>24<br><span class="native">0.02% of all</span></td><td>538<br><span class="native">bid 7%</span></td><td class="num-pos">+$301.26<br><span class="native">+0.1620 ETH</span></td></tr>
+<tr><td>Arctic</td><td class="num-neg">-$90.96<br><span class="native">-0.0503 ETH</span><br><span class="native">-0.000 bps of all volume</span></td><td class="num-neg">-$82.56<br><span class="native">-0.0455 ETH</span></td><td class="sec">-$82.56 DAO<br><span class="native">-$0.0029 partner</span></td><td>0<br><span class="native">0.00% of all</span></td><td>16<br><span class="native">bid 6%</span></td><td class="num-pos">+$162.62<br><span class="native">+0.0926 ETH</span></td></tr>
+<tr><td>NativeFi</td><td class="num-neg">-$84.98<br><span class="native">-0.0474 ETH</span><br><span class="native">-0.000 bps of all volume</span></td><td class="num-neg">-$71.09<br><span class="native">-0.0390 ETH</span></td><td class="sec">-$63.23 DAO<br><span class="native">-$7.85 partner</span></td><td>29<br><span class="native">0.03% of all</span></td><td>417<br><span class="native">bid 6%</span></td><td class="num-pos">+$394.73<br><span class="native">+0.2152 ETH</span></td></tr>
+<tr><td>Gnosis_BalancerSOR</td><td class="num-neg">-$10.88<br><span class="native">-0.0058 ETH</span><br><span class="native">-0.000 bps of all volume</span></td><td class="num-neg">-$4.81<br><span class="native">-0.0025 ETH</span></td><td class="sec">-$4.81 DAO<br><span class="native">+$0.0015 partner</span></td><td>2<br><span class="native">0.00% of all</span></td><td>112<br><span class="native">bid 12%</span></td><td class="num-pos">+$11.99<br><span class="native">+0.0065 ETH</span></td></tr>
+<tr><td>Odos</td><td class="">$0.00<br><span class="native">0.0000 ETH</span><br><span class="native">0.000 bps of all volume</span></td><td class="">$0.00<br><span class="native">0.0000 ETH</span></td><td class="sec">$0.00 DAO<br><span class="native">$0.00 partner</span></td><td>0<br><span class="native">0.00% of all</span></td><td>0<br><span class="native">bid 0%</span></td><td class="">$0.00<br><span class="native">0.0000 ETH</span></td></tr>
+<tr><td>26a6fdc066…</td><td class="num-pos">+$0.64<br><span class="native">+0.0003 ETH</span><br><span class="native">-0.000 bps of all volume</span></td><td class="num-neg">-$2.14<br><span class="native">-0.0011 ETH</span></td><td class="sec">-$2.14 DAO<br><span class="native">$0.00 partner</span></td><td>4<br><span class="native">0.00% of all</span></td><td>10<br><span class="native">bid 0%</span></td><td class="num-pos">+$0.92<br><span class="native">+0.0005 ETH</span></td></tr>
+
+
+<tr><td><strong>26 scenarios</strong></td><td class="num-neg">-$334,566.67<br><span class="native">-187.1819 ETH</span></td><td class="num-neg">-$250,481.52<br><span class="native">-141.3386 ETH</span></td><td class="sec">-$230,465.69 DAO<br><span class="native">-$20,015.83 partner</span></td><td>23,589<br><span class="native">22.86% of all</span></td><td class="sec">—</td><td class="sec">-$30,562.30<br><span class="native">-16.9084 ETH</span></td></tr>
+</tbody>
+</table>
+</div>
+<p class="footnote"><strong>Column totals are sums over 26 independent single-solver
+scenarios, not the effect of removing all 26 at once.</strong> With several solvers gone
+the remainder would replace one another, which is a different and much larger question.</p>
+</section>
+
+<section>
+<h2>What the columns measure</h2>
+<ul>
+<li><strong>&Delta;surplus</strong> — the change in user surplus over every order either
+side's winners traded, so an order that stops trading contributes its whole surplus rather
+than dropping out of the comparison. The relative figure beneath spreads the moved-order
+surplus across the window's entire executed fill-or-kill volume, which is the average
+traded unit's price change; unmoved orders and orders that stop trading count as zero
+there, since their loss is the coverage column instead.</li>
+<li><strong>&Delta;fees, gross</strong> — the whole protocol fee the mechanism charges,
+partner share included. This is what the DB calls <code>protocol_fee_native</code>.</li>
+<li><strong>of which</strong> — the same delta split into what the DAO keeps and what is
+passed on to partners. The split is positional, not by policy kind: the trailing policies
+in application order are the partners'. Partner fees are the larger half of the fee
+<em>level</em> but a much smaller share of its movement, because they are volume policies
+and so track whether an order fills at all rather than the price it gets.</li>
+<li><strong>Orders no longer executed</strong> — user-order executions that trade with the
+solver and not without it, against the 103,176 executions the month's recorded winners
+performed. Counted per auction-order execution, so a partially fillable order weighs as
+often as it trades.</li>
+<li><strong>Won</strong> — the recorded competition's own count, with the share of analysed
+auctions the solver bid in beneath it.</li>
+<li><strong>&Delta;rewards, capped</strong> — the payout-scale reward change, with each
+reward clamped into the recorded caps. A replacement winner inherits the cap of the slot it
+displaces.</li>
+</ul>
+</section>
+
+<section>
+<h2>How the competition is reproduced</h2>
+<p>The counterfactual is a full re-arbitration, not merely a re-pick of winners: removing a
+solver can lower a per-token-pair baseline, which un-filters solutions that were unfair only
+because the removed solver set that baseline high.</p>
+<p>The fairness filter compares solutions per token pair, and that split of a solution's
+score is recorded nowhere. It is recomputed from the protocol's own fee policies and
+anchored on each solution's recorded score. Where a pair's fees are unrecorded its user
+surplus stands in as a lower bound, so a missing fee can only make the filter stricter than
+the protocol was, never looser.</p>
+<p>Replaying this month against the recorded competition reproduces it exactly: winners,
+filtered-out set and reference scores all 84,767 of 84,767, with 0 of 38,404 multi-pair
+filter decisions differing and 0 of 946,995 solutions whose recomputed fees contradict the
+recorded score. Across the 26 removals, 217 of 539,972 filter verdicts rested on a
+lower-bound guess, and in 76 auctions such a guess could have changed who wins — against
+1,507 auctions where a removal genuinely un-filtered a solution.</p>
+</section>
+
+<section>
+<h2>Caveats &mdash; the numbers don't travel without these</h2>
+<ol class="caveats">
+<li><strong>No behavioural response.</strong> The remaining solvers' bids are held fixed,
+so nothing here says how they would bid if a competitor actually left. The cap of three
+solutions per solver is applied before winners are picked, so a rival solution suppressed
+by that cap cannot step in either.</li>
+<li><strong>Settlement risk is assumed, not observed.</strong> These figures use the
+<em>inherited</em> rule: a replacement winner takes the recorded outcome of the token pairs
+it claims, so a batch that really reverted stays reverted whoever wins it. The
+everything-lands-in-time reading was not run for this month, and the choice is first-order
+— on the calibration window 14.9% of winners never settled in time and they carried 50.2%
+of winning score.</li>
+<li><strong>Rewards are an estimate at payout scale.</strong> A replacement winner inherits
+the reward cap of the slot it displaces. The uncapped figures are the mechanism's exact
+accounting but are not what is paid, so they are not shown.</li>
+<li><strong>1,146 auctions are excluded</strong> for a native price that fails a two-sided
+sanity check, and <strong>720 more</strong> because a traded order appears in neither order
+table. Both exclusions apply identically to every solver.</li>
+<li><strong>Fee deltas drop an auction from both sides</strong> when an executed order's fee
+policies are unrecorded — 445 auction-scenarios across the run, 0.06%. Surplus, coverage
+and reward columns are unaffected.</li>
+<li><strong>Dollar figures are display conversions.</strong> Each auction converts at the
+rate implied by its own stablecoin prices, and they inherit every caveat of the ETH figure
+they restate.</li>
+<li><strong>Relative price change over small samples is not stable.</strong> A solver with
+few moved orders can show a large figure drawn from a handful of auctions.</li>
+<li><strong>Quote rewards are excluded.</strong> There is no data on counterfactual
+quoting.</li>
+</ol>
+</section>
+
+<p class="footnote">Generated from 26 <code>analyse</code> reports over
+<code>2026-07-01 .. 2026-08-01</code>, mainnet, score mode, inherited outcome rule.</p>
+</main>

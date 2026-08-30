@@ -44,11 +44,19 @@ WEI = Decimal(10) ** 18
 HEADLINE_RULE = "inherited"
 ALTERNATIVE_RULES = ("assume-settled",)
 
-REPORT_FORMAT = 6
+REPORT_FORMAT = 8
 """Version marker of the `analyse --out` payload, required by `load_report`. Bumped
 when the shape changes, so a stale file fails with "re-run analyse" instead of a
-KeyError deep inside a comparison. Format 6 added the protocol-fee deltas — total,
-partner share and the DAO's own revenue (M13). Format 5 added the window's executed order count
+KeyError deep inside a comparison. Format 8 added
+`auctions_filter_guess_could_matter` — whether a guessed filter verdict could have moved
+an auction's winners, the counterfactual's one filter number with no ground truth behind
+it. Format 7 moved the fairness filter onto per-pair
+**scores** (M14) — a behaviour change rather than a new key, and the reason the marker
+moved: a format-6 report was filtered on user surplus, so tabulating it beside a
+format-7 one would compare two different mechanisms. It also carries the filter's own
+exactness (`multi_pair_solutions`, `multi_pair_filter_proxied`). Format 6 added the
+protocol-fee deltas — total, partner share and the DAO's own revenue (M13). Format 5
+added the window's executed order count
 including partially fillable orders — the denominator of the coverage share (D24).
 Format 4 added the window's recorded executed volume — the denominator of "averaged
 over all traded volume". Format 3 added per-order volumes and `partially_fillable`
@@ -81,10 +89,14 @@ CAVEATS = (
     "assumes every winner lands in time. The choice is first-order: on the mainnet "
     "calibration window, 14.9% of winners never settled in time and they carried "
     "50.2% of winning score.",
-    "Filter proxy: the competition's fairness filter is re-run on per-token-pair user "
-    "surplus, because per-pair scores are not recorded. Measured against the recorded "
-    "filter this changes 7 decisions in 7,745 auctions "
-    "(docs/winner-selection.md#the-filter-runs-on-surplus).",
+    "Filter: the competition's fairness filter is re-run on per-token-pair scores, "
+    "recomputed from the recorded fee policies and anchored on each solution's recorded "
+    "score. Baselines are exact by construction; a pair whose own fees are unrecorded "
+    "falls back to user surplus, which is a lower bound on its score, so the filter can "
+    "only ever be stricter than the protocol was. The table reports how often that "
+    "fallback actually decided something. On the mainnet calibration window the filter "
+    "reproduces the recorded competition exactly "
+    "(docs/winner-selection.md#the-filter-runs-on-score).",
     "Quote rewards are excluded: no data on counterfactual quoting.",
     "Two reward figures: uncapped is the mechanism's exact accounting but not what is "
     "paid out; capped is at payout scale but an estimate (a replacement winner "
@@ -174,6 +186,15 @@ class Report:
     auctions_winner_set_changed: int
     auctions_filter_relaxed: int
     auctions_newly_kept_won: int
+    multi_pair_solutions: int
+    multi_pair_filter_proxied: int
+    """The fairness filter's exactness, over the auctions actually arbitrated — the ones
+    the solver bid in, not the whole window. Multi-pair solutions the filter judged, and
+    how many of those rested on the surplus fallback rather than on a recorded score or a
+    surplus that cleared its baseline outright."""
+    auctions_filter_guess_could_matter: int
+    """Of those auctions, how many where flipping the guesses would move the winners.
+    The number to read: a guess on a solution that loses either way costs nothing."""
     delta_surplus: int
     delta_protocol_and_partner_fees: int
     delta_partner_fees: int
@@ -447,6 +468,11 @@ def load_report(path: str) -> Report:
         auctions_winner_set_changed=payload["auctions_winner_set_changed"],
         auctions_filter_relaxed=payload["auctions_filter_relaxed"],
         auctions_newly_kept_won=payload["auctions_newly_kept_won"],
+        multi_pair_solutions=payload["multi_pair_solutions"],
+        multi_pair_filter_proxied=payload["multi_pair_filter_proxied"],
+        auctions_filter_guess_could_matter=payload[
+            "auctions_filter_guess_could_matter"
+        ],
         delta_surplus=payload["delta_surplus"],
         delta_rewards=payload["delta_rewards"] if uncapped else None,
         delta_rewards_capped=(
@@ -773,6 +799,7 @@ def comparison(
     net = row("net change (Δsurplus − capped Δrewards)")
     affected = row("auctions where anything moved")
     relaxed = row("fairness filter relaxed")
+    filter_exact = row("  filter verdicts resting on surplus, in those auctions")
 
     for window in windows:
         report = window.headline
@@ -916,6 +943,17 @@ def comparison(
         relaxed.append(
             f"{report.auctions_filter_relaxed} "
             f"(newly kept won {report.auctions_newly_kept_won})"
+        )
+        filter_exact.append(
+            # In surplus mode every solution is on the surplus scale by design, so the
+            # count would read as a total failure of a thing that was never attempted.
+            "n/a (surplus mode)"
+            if report.mode != "score"
+            else f"{report.multi_pair_filter_proxied:,} of "
+            f"{report.multi_pair_solutions:,} "
+            f"({pct(report.multi_pair_filter_proxied, report.multi_pair_solutions)}), "
+            f"could have moved winners in "
+            f"{report.auctions_filter_guess_could_matter:,}"
         )
 
         warnings.extend(_report_warnings(window, usd))

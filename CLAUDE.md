@@ -67,7 +67,15 @@ Both are read-only references here. Do not modify them.
     order — not by policy kind. `n` is `array_length(app_data.partner_fee_recipients, 1)`;
     the `partner_fee_item_count` column that looks made for this is NULL in all 888,760
     rows ([rule](docs/analytics-db.md#partner-fees-are-the-trailing-policies-and-they-are-most-of-the-total)).
-12. `stg_backend_data__jit_orders` only records JIT orders of **settled** batches, so an
+12. The DB's `protocol_fee_native` / `partner_fee_native` are computed with a **corrected**
+    price feed (`stg_auction_prices_corrections`, overlaid in
+    `int_backend_data__price_data`); the score the competition was decided on is not. So
+    never diff our native fees against the mart's — diff the **atoms**, which is what the
+    M13 cross-check does. The table is tiny (20 rows, all after auction 13639326) and
+    every auction in it is independently caught by `price_imbalanced`, so it changes no
+    number reported so far
+    ([detail](docs/analytics-db.md#the-accounting-path-corrects-these-prices-the-scoring-path-must-not)).
+13. `stg_backend_data__jit_orders` only records JIT orders of **settled** batches, so an
     unsettled solution's JIT orders are in neither order table and its auction cannot be
     arbitrated faithfully. `analyse`/`validate` exclude such auctions transparently
     (~0.8% of a month, D17); a crash on `MissingOrderError` means a caller bypassed the

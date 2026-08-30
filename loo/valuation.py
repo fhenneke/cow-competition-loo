@@ -6,9 +6,10 @@ two are exactly additive, `surplus_native + fee_native == compute_order_score(or
 
 Solution *totals* still come from `proposed_solutions.score` rather than from
 `surplus + fees`: the recorded score needs no reconstruction, and the fee path has a
-narrow coverage gap the score does not (M13). The fairness filter still compares
-per-pair **surplus** — putting it on the score scale is the open proposal in
-../PROPOSAL-fee-aware-scoring.md, not something this module does yet.
+narrow coverage gap the score does not. What the fee decomposition *does* buy is the
+per-pair **score** split the fairness filter compares — `pair_score_split`, M14. Where
+that split cannot be determined the filter falls back to per-pair surplus, which is what
+it compared everywhere before.
 
 Integer arithmetic throughout, except where `fees.py` reproduces the Rust's own `f64`
 detours.
@@ -18,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 from .fees import EMPTY_FEE_CONTEXT, FeeContext, FeeError, order_fees
 from .primitives import Pair, as_erc20, ceil_div, price_in_eth
@@ -189,6 +190,14 @@ class SolutionValuation:
     order_partner_fee_native: dict[str, int] = field(default_factory=dict[str, int])
     """The partners' share of `order_fee_native`. What the DAO keeps is the difference,
     which is non-negative because the native conversion is monotone."""
+    pair_fee_native: dict[Pair, int] = field(default_factory=dict[Pair, int])
+    """Native protocol fee per **raw** directed token pair, over the contributing orders
+    whose fee could be computed. `pair_surplus + pair_fee_native` is the pair's score —
+    on the pairs not in `pairs_fees_unknown`."""
+    pairs_fees_unknown: frozenset[Pair] = frozenset()
+    """Pairs carrying at least one contributing order with an unrecorded fee, so
+    `pair_fee_native` is short for them by an unknown amount. Derived from
+    `fees_unknown`; kept separately because the filter works per pair, not per order."""
     fees_unknown: frozenset[str] = frozenset()
     """Contributing orders whose fee could not be computed — their policies are not
     recorded for this auction. Every order of a solution the arbitrator *kept* is
@@ -246,6 +255,8 @@ def value_solution(
     volumes: dict[str, int] = {}
     fee_native: dict[str, int] = {}
     partner_fee_native: dict[str, int] = {}
+    pair_fee_native: dict[Pair, int] = {}
+    pairs_fees_unknown: set[Pair] = set()
     fees_unknown: set[str] = set()
     winner_pairs: set[Pair] = set()
     uids: set[str] = set()
@@ -274,6 +285,7 @@ def value_solution(
             split = None
         if split is None:
             fees_unknown.add(order.uid)
+            pairs_fees_unknown.add(pair)
         else:
             # Each share is converted as a *difference of conversions* rather than on
             # its own, so the decomposition is exactly additive:
@@ -291,6 +303,7 @@ def value_solution(
             )
             fee_native[order.uid] = score_native - surplus_native
             partner_fee_native[order.uid] = score_native - surplus_native - protocol_native
+            pair_fee_native[pair] = pair_fee_native.get(pair, 0) + fee_native[order.uid]
 
     return SolutionValuation(
         pair_surplus=pair_surplus,
@@ -301,8 +314,92 @@ def value_solution(
         order_volume_native=volumes,
         order_fee_native=fee_native,
         order_partner_fee_native=partner_fee_native,
+        pair_fee_native=pair_fee_native,
+        pairs_fees_unknown=frozenset(pairs_fees_unknown),
         fees_unknown=frozenset(fees_unknown),
     )
+
+
+class PairScores(NamedTuple):
+    """The outcome of splitting one solution's score across its pairs."""
+
+    pairs: dict[Pair, int]
+    """Score per pair, for the pairs where it is known. Possibly empty, possibly partial."""
+    anchor_failed: bool
+    """The recomputation contradicted the recorded score, so nothing was trusted. A
+    different thing entirely from a pair's policies being unrecorded, and reported
+    separately: this one says the fee path is wrong here, and if it ever becomes common on
+    some chain it must not read as that chain having thin fee coverage."""
+
+
+def pair_score_split(valuation: SolutionValuation, db_score: int) -> PairScores:
+    """The solution's score per directed token pair, for the pairs where it is known.
+
+    This is the quantity the fairness filter compares (`score_by_token_pair`,
+    `arbitrator.rs:176`), and the one thing the DB does not record: scores are stored per
+    solution. Recomputing protocol fees supplies it — a pair's score is its user surplus
+    plus the fees of the orders on it — and the recorded score anchors it, so what comes
+    back is never a reconstruction floating free of the record.
+
+    The result is **partial by design**. The fairness test is a conjunction of independent
+    per-pair comparisons, so a pair needs an exact score only if it has a baseline to
+    clear; knowing three pairs out of four is worth exactly as much as knowing four when
+    the fourth has no baseline. Returning what is known, pair by pair, lets the filter
+    decide each comparison as well as it can (`winner_selection.is_fair`) instead of
+    discarding a decidable solution because some unrelated pair is dark.
+
+    How each pair lands, in order of how much it leans on the recomputation:
+
+    1. **One pair in the solution.** The whole score sits on it. Exact from the record
+       alone, no fee needed. (Baselines do not come through here — they read `total`
+       directly, `winner_selection.compute_baseline_scores` — so this case only keeps the
+       `sum(pairs) == db_score` invariant true for every solution.)
+    2. **A priced pair.** `surplus + fee`, both of which are the protocol's own
+       per-order quantities. Where *every* pair is priced the sum must return the
+       recorded score to the wei; it does for every solution the arbitrator kept, whose
+       orders' policies are all recorded by construction (M12/M13).
+    3. **The last unpriced pair.** With exactly one pair dark the residual
+       `db_score - sum(priced pairs)` is its score exactly.
+
+    Every branch is checked against the record, and every check fails the same way — an
+    `anchor_failed` result with no pairs at all, because a solution whose arithmetic
+    contradicts its recorded score has no trustworthy pair in it. Protocol fees are
+    non-negative, so each check is some form of "the parts cannot exceed the whole, and no
+    part can fall below its own surplus".
+    """
+    pairs = valuation.pair_surplus
+    if len(pairs) <= 1:
+        # Cheap, but not free: a single pair whose surplus already exceeds the recorded
+        # score means our contributing-order set disagrees with the autopilot's, and this
+        # is the one branch with an invariant to check rather than an arithmetic one.
+        if any(surplus > db_score for surplus in pairs.values()):
+            return PairScores({}, anchor_failed=True)
+        return PairScores({pair: db_score for pair in pairs}, anchor_failed=False)
+
+    unknown = valuation.pairs_fees_unknown
+    priced = {
+        pair: surplus + valuation.pair_fee_native.get(pair, 0)
+        for pair, surplus in pairs.items()
+        if pair not in unknown
+    }
+    priced_total = sum(priced.values())
+
+    if not unknown:
+        if priced_total != db_score:
+            return PairScores({}, anchor_failed=True)
+        return PairScores(priced, anchor_failed=False)
+
+    # Fees are non-negative, so the priced pairs plus the dark pairs' own surplus cannot
+    # exceed the recorded total. This is the residual bound with every dark pair held at
+    # its floor, and it is the only check available once more than one pair is dark.
+    dark_floor = sum(pairs[pair] for pair in unknown)
+    if priced_total + dark_floor > db_score:
+        return PairScores({}, anchor_failed=True)
+    if len(unknown) > 1:
+        return PairScores(priced, anchor_failed=False)
+
+    (pair,) = unknown
+    return PairScores({**priced, pair: db_score - priced_total}, anchor_failed=False)
 
 
 def solution_total(valuation: SolutionValuation, mode: Mode, db_score: int | None = None) -> int:
@@ -312,11 +409,8 @@ def solution_total(valuation: SolutionValuation, mode: Mode, db_score: int | Non
     without having to be recomputed. Surplus mode sums the surplus decomposition instead,
     answering the user-value question self-consistently.
 
-    The per-pair values the fairness filter compares are always `valuation.pair_surplus`,
-    in both modes — see docs/winner-selection.md on why the filter is evaluated in surplus
-    terms rather than trying to reconstruct a per-pair score split that is not recorded
-    anywhere. So in score mode a solution's total and the sum of its pair values
-    deliberately differ.
+    The per-pair values the fairness filter compares are `pair_score_split` in score
+    mode and `valuation.pair_surplus` in surplus mode — see `build_solutions`.
     """
     if mode == "surplus":
         return valuation.total
@@ -367,6 +461,16 @@ def build_solutions(
             failures[bid.uid] = str(error)
             continue
 
+        # Surplus mode deliberately gets no score split: its whole point is to answer
+        # the user-value question in one currency, and a filter comparing scores inside
+        # a surplus ranking would be neither of the two answers. An empty map leaves
+        # every pair on the surplus scale, which is that answer.
+        scores = (
+            pair_score_split(valuation, bid.score)
+            if mode == "score"
+            else PairScores({}, anchor_failed=False)
+        )
+
         valued.append(
             ValuedBid(
                 bid=bid,
@@ -375,6 +479,8 @@ def build_solutions(
                     solution_uid=bid.uid,
                     total=total,
                     pair_values=dict(valuation.pair_surplus),
+                    pair_scores=scores.pairs,
+                    score_anchor_failed=scores.anchor_failed,
                     order_uids=valuation.order_uids,
                     winner_pairs=valuation.winner_pairs,
                 ),

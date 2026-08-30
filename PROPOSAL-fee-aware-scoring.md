@@ -1,6 +1,35 @@
 # Proposal — score the fairness filter on score, not surplus
 
-Status: proposal, measured but not implemented. Branch `claude/analytics-scoring-fees-63852c`.
+Status: **implemented**. The fee computation landed as M13 (`loo/fees.py`) and the filter
+itself as M14 — see [PLAN.md §15](PLAN.md#15-m14--fee-aware-scoring--done) for what was
+built and [docs/winner-selection.md](docs/winner-selection.md#the-filter-runs-on-score) for
+the current behaviour. This document is kept as the evidence and the argument behind that
+decision; where it says "would" or "should", read it as the case that was made.
+
+Measured outcome, on the same three-day window as every other gate: filter decisions
+differing from the recorded competition went from **7 to 0** of 5,211 multi-pair solutions,
+and differing winner sets from **5 to 0**. The whole competition — winners, filtered-out
+set, reference scores — now reproduces at 7745/7745 with no observed approximation. The
+surplus fallback of §6 step 5 survives at 3 solutions (0.058%), none of which decided
+anything wrongly.
+
+Three things the implementation did differently from the sketch below:
+
+- The split is **anchored on the recorded score** — a recomputation that does not sum back
+  to it is refused rather than used.
+- The residual rule is applied to **single-pair solutions first**, which makes every
+  *baseline* exact without any fee at all.
+- Step 5's fallback is **per pair, not per solution**, and it is not a second scale at
+  all. §6 says "the filter compares `pair_score` when every pair of the solution *and*
+  every relevant baseline is exact", which is too strong twice over. Baselines are never
+  inexact — a single-pair solution's whole `total` sits on its one pair, so no fee is
+  involved in computing one. And surplus is a *lower bound* on a dark pair's score, not a
+  different currency: clearing the baseline on surplus alone proves the pair fair, so a
+  dark pair only ever makes the filter stricter. Implementing §6 as written left one filter
+  difference in place (auction 13492893, whose one baseline-bearing pair *was* priced);
+  the per-pair rule removed it. The |U| ≥ 2 case of §3 therefore matters far less than this
+  document assumed — dark pairs are only a problem when they carry a baseline their surplus
+  cannot clear, which is 3 solutions in three days.
 
 ## The claim
 
@@ -274,6 +303,10 @@ score reproduction.
 since 2026-04-14. Not a concern for this proposal.)
 
 ## 8. Open questions
+
+(As of implementation: the first two are unchanged and still worth checking per window;
+the third is done — [analytics-db.md](docs/analytics-db.md#fee-policies-cover-every-order-of-every-kept-solution)
+carries the storage rule.)
 
 - **Non-mainnet networks** — the storage rule is protocol-level so it should hold
   everywhere, but the coverage *rate* depends on how much gets filtered out and has only

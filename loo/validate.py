@@ -13,6 +13,10 @@ anything upstream is wrong, and once from the ranking the DB itself recorded —
 winner flags and `uid` ordering all taken as given. The second isolates
 `compute_reference_scores` from the filter and the pick, so a reference-score
 disagreement can be attributed rather than merely observed.
+
+The filtered-out set is the one comparison with an approximation left in it, and only
+where a solution's per-pair score split could not be determined — `filter_scale` says
+which, and `Summary.fallback_rate` how often.
 """
 
 from __future__ import annotations
@@ -31,10 +35,12 @@ from .valuation import (
     order_surplus,
 )
 from .winner_selection import (
+    FilterScale,
     Ranking,
     Solution,
     arbitrate,
     compute_reference_scores,
+    filter_guess_could_matter,
     pick_winners,
 )
 
@@ -59,9 +65,15 @@ def filter_bracket(
       split fits, and setting the failing pair's `v_i = u_i` is a filtering one.
 
     The baselines passed here must be the **score** baselines from `score_baselines`, not
-    whatever the configured proxy fed the filter. They are exact — only single-pair
+    whatever the configured filter fed itself. They are exact — only single-pair
     solutions set a baseline, and for those the pair's value is the recorded score — which
     is what makes the verdict a statement about the protocol rather than about our model.
+
+    Note the bracket still brackets: it uses only surplus as a *lower bound* on each
+    pair's score, so it stays a valid statement about the DB even now that the filter
+    itself usually knows the exact split. Where the filter has that split the bracket is
+    strictly weaker than what we know, which is why `filter_cause` consults the scale
+    first.
     """
     surplus = valuation.pair_surplus
     if len(surplus) <= 1:
@@ -90,6 +102,14 @@ class SolutionCheck:
     pair_surplus: dict[Pair, int] = field(default_factory=dict[Pair, int])
     bracket: str = "must_keep"
     """`filter_bracket` verdict — what any valid per-pair score split would force."""
+    filter_scale: FilterScale = "surplus"
+    """How our filter reached its verdict: `score` when every pair either had a recorded
+    score or cleared its baseline on surplus alone (a proof either way), `surplus` when
+    some pair had neither and the verdict is a guess."""
+    score_anchor_failed: bool = False
+    """The recomputed fees contradicted the recorded score, so the per-pair split was
+    discarded (`valuation.pair_score_split`). Should be zero; a non-zero count means the
+    fee path is wrong, not that fee coverage is thin."""
 
     @property
     def winner_differs(self) -> bool:
@@ -103,23 +123,29 @@ class SolutionCheck:
     def filter_cause(self) -> str | None:
         """Why our filter decision differs from the DB's.
 
-        Where the bracket is `undetermined` the true per-pair split decides the filter and
-        we cannot know it, so a difference is the deliberate surplus-proxy approximation
-        (D2): `proxy`.
+        On the **score** scale there is nothing left to excuse a difference. Every pair
+        was decided by a proof — a recorded score against a recorded baseline, or a
+        surplus that cleared its baseline without needing the fee at all — so the verdict
+        is the one the autopilot's own inputs force. A difference means our split, our
+        baselines or our pair extraction is wrong: `bug`.
 
-        Where the bracket is decisive it binds the DB, which filtered on the true split.
-        It does not bind us: we filter on surplus, and surplus baselines sit at or below
-        the score baselines the protocol used, so keeping a solution the score filter drops
-        is expected. That one direction is `model`.
+        On the **surplus** fallback the old reading still holds. Where the bracket is
+        `undetermined` the true split decides and we do not have it, so the difference is
+        the approximation itself: `proxy`. Where the bracket is decisive it binds the DB,
+        which filtered on the true split, but binds us only one way — surplus baselines
+        sit at or below score baselines, so keeping a solution the score filter drops is
+        expected, and that direction is `model`.
 
-        The reverse is impossible. `must_keep` means every pair's surplus already clears its
-        *score* baseline, which is at least its surplus baseline, so our filter keeps it
-        too — dropping it anyway means our baselines or valuation are wrong. Likewise a DB
-        decision contradicting a decisive bracket cannot come from any valid split. Both
-        are `bug`.
+        The reverse is impossible on either scale. `must_keep` means every pair's surplus
+        already clears its *score* baseline, which is at least its surplus baseline, so
+        our filter keeps it too; dropping it anyway means our baselines or valuation are
+        wrong. Likewise a DB decision contradicting a decisive bracket cannot come from
+        any valid split. Both are `bug`.
         """
         if not self.filter_differs:
             return None
+        if self.filter_scale == "score":
+            return "bug"
         if self.bracket == "undetermined":
             return "proxy"
         if self.db_filtered and not self.our_filtered and self.bracket == "must_filter":
@@ -137,8 +163,12 @@ class AuctionReport:
     reference_observed: dict[str, int] = field(default_factory=dict[str, int])
     reference_db: dict[str, int] = field(default_factory=dict[str, int])
     baselines: dict[Pair, int] = field(default_factory=dict[Pair, int])
-    """Exact score baselines from `score_baselines`, used by the bracket. Not necessarily
-    what the configured filter compared against."""
+    """Exact score baselines — in score mode `arbitrate`'s own, which the filter compared
+    against. Used by the bracket."""
+    guess_could_matter: bool = False
+    """Could this auction's guessed filter verdicts have changed who wins? False is a
+    proof of harmlessness (`winner_selection.filter_guess_could_matter`). Distinct from
+    the guesses themselves: most sit on solutions that lose either way."""
     observed_pick_uids: frozenset[int] = frozenset()
     """Winners obtained by re-picking on the DB's own kept set — see `observed_pick`."""
     db_winner_uids: frozenset[int] = frozenset()
@@ -197,8 +227,9 @@ class AuctionReport:
 
         Returns `None` when every difference has a named, verified cause, and otherwise
         names what is still unaccounted for. Accepted causes are `proxy` (the unknowable
-        per-pair split behind the surplus proxy, D2) and `model` (a surplus-based filter deliberately
-        answering a different question); a `bug` is not.
+        per-pair split behind the surplus fallback, D2) and `model` (a surplus-based filter
+        deliberately answering a different question); a `bug` is not. Both are confined to
+        the fallback — a difference on the score scale is never accepted.
 
         The two "observed" checks are what make this a real gate rather than a
         restatement: they re-run the pick and the reference scores against the DB's own
@@ -246,10 +277,16 @@ class AuctionReport:
 def score_baselines(valued: Iterable[ValuedBid]) -> dict[Pair, int]:
     """Exact per-pair baselines: the best recorded score among single-pair solutions.
 
-    Deliberately *not* the surplus baselines the filter itself compares against. Step 3 only
-    ever considers solutions touching exactly one pair, and for those the pair's value *is*
-    the solution's recorded score — so these are the baselines the protocol used.
-    `filter_bracket` needs them to say anything about the DB rather than about our model.
+    Step 3 only ever considers solutions touching exactly one pair, and for those the
+    pair's value *is* the solution's recorded score — so these are the baselines the
+    protocol used. `filter_bracket` needs them to say anything about the DB rather than
+    about our model.
+
+    In **score** mode `arbitrate` has already computed exactly this — `total` is the
+    recorded score there, so `compute_baseline_scores` and this function are the same
+    function — and `check_auction` reads the ranking rather than calling this, so the two
+    cannot drift. It exists for surplus mode, where the ranking's baselines are surplus
+    but the DB still filtered on score, and the bracket would otherwise lose its meaning.
     """
     baselines: dict[Pair, int] = {}
     for entry in valued:
@@ -322,7 +359,11 @@ def check_auction(
     )
     solutions = [v.solution for v in valued]
     ranking = arbitrate(solutions, max_winners)
-    exact_baselines = score_baselines(valued)
+    # In score mode these *are* the ranking's baselines (see `score_baselines`), so read
+    # them rather than deriving a second copy that could drift from the one the filter used.
+    exact_baselines = (
+        ranking.baselines if mode == "score" else score_baselines(valued)
+    )
 
     our_filtered = {s.solution_uid for s in ranking.filtered_out}
     # A solution we failed to value never reaches the ranking, so it shows up as
@@ -337,6 +378,7 @@ def check_auction(
         ),
         reference_db=dict(bundle.reference_scores),
         baselines=exact_baselines,
+        guess_could_matter=filter_guess_could_matter(ranking, max_winners),
         observed_pick_uids=observed_pick(bundle, solutions, max_winners),
         db_winner_uids=frozenset(b.uid for b in bundle.bids if b.is_winner),
     )
@@ -364,6 +406,8 @@ def check_auction(
                 pair_values=dict(entry.solution.pair_values) if entry else {},
                 pair_surplus=dict(entry.valuation.pair_surplus) if entry else {},
                 bracket=bracket,
+                filter_scale="surplus" if bid.uid in ranking.proxied_uids else "score",
+                score_anchor_failed=bool(entry and entry.solution.score_anchor_failed),
             )
         )
 
@@ -387,6 +431,20 @@ class Summary:
     filter entirely, so only multi-pair solutions can differ — which is what makes them
     the right denominator. Split by `filter_causes` into unknowable (`proxy`), deliberate
     (`model`) and defective (`bug`)."""
+    multi_pair_filter_scales: dict[str, int] = field(default_factory=dict[str, int])
+    """How each multi-pair solution's verdict was reached: by proof on every pair
+    (`score`), or resting on the `surplus` fallback for at least one. The fallback share
+    is the residual approximation in the pipeline, and the only place `proxy` and `model`
+    differences can still arise."""
+    auctions_guess_could_matter: int = 0
+    """Auctions where a guessed filter verdict could have moved the winners. The count
+    that matters: a guess on a solution that loses either way costs nothing, and most do.
+    In `validate` the recorded outcome settles it anyway — this is the number the
+    counterfactual has no ground truth for, measured here on the same data."""
+    score_anchor_failures: int = 0
+    """Solutions whose recomputed fees contradicted the recorded score. Expected to be
+    zero; counted apart from the fallback so a broken fee path cannot be mistaken for
+    thin fee coverage."""
     valuation_failures: int = 0
     bracket_counts: dict[str, int] = field(default_factory=dict[str, int])
     filter_causes: dict[str, int] = field(default_factory=dict[str, int])
@@ -396,10 +454,24 @@ class Summary:
     criterion is that this list is empty."""
 
     @property
-    def proxy_error_rate(self) -> float:
+    def filter_mismatch_rate(self) -> float:
+        """Share of filtered solutions we decide differently from the DB.
+
+        Named for what it measures: before M14 every such difference was the surplus
+        proxy's doing and it was called `proxy_error_rate`, but a difference can now also
+        be a `bug` on the score scale, which has nothing to do with the fallback. The
+        fallback's own share is `fallback_rate`.
+        """
         if not self.multi_pair_solutions:
             return 0.0
         return self.multi_pair_filter_mismatch / self.multi_pair_solutions
+
+    @property
+    def fallback_rate(self) -> float:
+        """Share of filtered solutions whose verdict rested on the surplus fallback."""
+        if not self.multi_pair_solutions:
+            return 0.0
+        return self.multi_pair_filter_scales.get("surplus", 0) / self.multi_pair_solutions
 
     def add(self, report: AuctionReport) -> None:
         self.auctions += 1
@@ -410,12 +482,17 @@ class Summary:
         self.auctions_reference_match_recomputed += report.reference_matches_recomputed
         self.auctions_reference_match_observed += report.reference_matches_observed
         self.auctions_pick_match_observed += report.pick_matches_observed
+        self.auctions_guess_could_matter += report.guess_could_matter
 
         for check in report.checks:
-            if check.n_pairs > 1:
+            self.score_anchor_failures += check.score_anchor_failed
+            if check.n_pairs > 1 and check.total:
                 self.multi_pair_solutions += 1
                 self.bracket_counts[check.bracket] = (
                     self.bracket_counts.get(check.bracket, 0) + 1
+                )
+                self.multi_pair_filter_scales[check.filter_scale] = (
+                    self.multi_pair_filter_scales.get(check.filter_scale, 0) + 1
                 )
                 if check.filter_differs:
                     self.multi_pair_filter_mismatch += 1

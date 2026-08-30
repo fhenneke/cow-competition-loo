@@ -135,6 +135,9 @@ def payload(
         "auctions_winner_set_changed": 9,
         "auctions_filter_relaxed": 2,
         "auctions_newly_kept_won": 2,
+        "multi_pair_solutions": 400,
+        "multi_pair_filter_proxied": 4,
+        "auctions_filter_guess_could_matter": 0,
         "delta_surplus": sum(m["delta_surplus"] for m in changed),
         "delta_protocol_and_partner_fees": -5 * ONE,
         "delta_partner_fees": -2 * ONE,
@@ -737,6 +740,20 @@ class TestComparison:
         assert any("--include-price-suspects" in w for w in table.warnings)
         assert any("window-median rate" in w for w in table.warnings)
 
+    def test_surplus_mode_reports_no_filter_scale(self, tmp_path: Path):
+        """Surplus mode puts every solution on the surplus scale deliberately, so the
+        count would read as a total failure of something never attempted."""
+        data = payload(
+            mode="surplus", capped_estimate=False, cow=None, changed=[move(1, ONE)]
+        )
+        report = load_report(write_report(tmp_path, "s.json", data))
+        table = comparison(group_reports([report]))
+
+        rows = dict(table.rows)
+        assert rows["  filter verdicts resting on surplus, in those auctions"][0] == (
+            "n/a (surplus mode)"
+        )
+
     def test_surplus_mode_has_no_reward_rows(self, tmp_path: Path):
         data = payload(
             mode="surplus",
@@ -956,7 +973,7 @@ def test_caveats_cover_the_plan_list():
     all, so their disappearance should fail loudly here."""
     assert len(CAVEATS) == 10
     themes = (
-        "behavioural", "Settlement", "proxy", "Quote", "reward", "Price",
+        "behavioural", "Settlement", "Filter", "Quote", "reward", "Price",
         "neither order table", "two denominators", "relative price", "USD",
     )
     for theme, caveat in zip(themes, CAVEATS, strict=True):

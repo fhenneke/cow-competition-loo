@@ -80,15 +80,18 @@ def check(**kwargs: Any) -> SolutionCheck:
         our_filtered=False,
         partially_fillable=False,
         bracket="undetermined",
+        filter_scale="surplus",
     )
     defaults.update(kwargs)
     return SolutionCheck(**defaults)
 
 
 class TestFilterCause:
-    """A decisive bracket binds the DB, which filtered on the true split. It binds us only
-    in one direction, because we filter on surplus and surplus baselines sit at or below
-    the score baselines the protocol used."""
+    """Every cause below is about the **surplus fallback**. A decisive bracket binds the
+    DB, which filtered on the true split, and binds the fallback only in one direction,
+    because surplus baselines sit at or below the score baselines the protocol used.
+    Where the filter has the exact score split there is no fallback and no excuse — see
+    `TestFilterCauseOnScore`."""
 
     def test_no_difference_has_no_cause(self):
         assert check().filter_cause is None
@@ -127,6 +130,32 @@ class TestFilterCause:
             ).filter_cause
             == "bug"
         )
+
+
+class TestFilterCauseOnScore:
+    """On the score scale both sides of the comparison are the protocol's own: the
+    solution's exact per-pair split against baselines that are recorded scores. The
+    bracket is then strictly weaker than what we know, so it cannot excuse anything."""
+
+    def test_no_difference_still_has_no_cause(self):
+        assert check(filter_scale="score").filter_cause is None
+
+    def test_any_difference_is_a_bug_whatever_the_bracket(self):
+        for bracket in ("undetermined", "must_keep", "must_filter"):
+            assert (
+                check(
+                    db_filtered=True, our_filtered=False, filter_scale="score",
+                    bracket=bracket,
+                ).filter_cause
+                == "bug"
+            )
+            assert (
+                check(
+                    db_filtered=False, our_filtered=True, filter_scale="score",
+                    bracket=bracket,
+                ).filter_cause
+                == "bug"
+            )
 
 
 def bid(uid: int, solver: str, score: int, is_winner: bool, filtered_out: bool) -> Bid:

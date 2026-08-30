@@ -354,6 +354,33 @@ where auction_id = any(%(ids)s)
 # in practice this collapses to one address; when it does not, all of them are the same
 # competitor and all must go — `compute_reference_scores` removes *all* of a solver's
 # solutions, so splitting a rotation across two "solvers" would give wrong reference scores.
+# Every competitor that bid in the window, as a `--solver` argument would name it: the
+# catalogue name where there is one, the bare address otherwise. Grouping by *name* rather
+# than address is the point — one competitor can hold several addresses through key
+# rotations and they have to be removed together (D9), which is exactly what
+# `resolve_solver` does with a name. Uncatalogued addresses have no name to group by
+# (`dune_data__cow_protocol__solvers` calls them all "Uncatalogued"), so each is its own
+# competitor, named by its address.
+ALL_SOLVERS_SQL = """
+with window_auctions as (
+    select distinct auction_id
+    from dbt.pre_stg__orders_per_auction_with_at_least_one_bid
+    where block_deadline between
+          (select min(block_number) from dbt.stg_rpc_data__block_timestamp where time >= %(start)s)
+      and (select max(block_number) from dbt.stg_rpc_data__block_timestamp where time <  %(end)s)
+),
+bidders as (
+    select distinct ps.solver
+    from dbt.stg_backend_data__proposed_solutions ps
+    join window_auctions w on w.auction_id = ps.auction_id
+)
+select distinct coalesce(s.name, encode(b.solver, 'hex')) as label
+from bidders b
+left join dbt.dune_data__cow_protocol__solvers s
+       on s.address = b.solver and s.name <> 'Uncatalogued'
+order by label
+"""
+
 SOLVER_SQL = """
 with window_auctions as (
     select distinct auction_id
@@ -836,6 +863,21 @@ def solver_matches(conn: Connection, solver: str, start: str, end: str) -> list[
     """Catalogue entries matching `solver`, with how much each one bid in the window."""
     rows = fetch(conn, SOLVER_SQL, {"solver": solver, "start": start, "end": end})
     return [SolverMatch(**row) for row in rows]
+
+
+def all_solvers(conn: Connection, start: str, end: str) -> list[str]:
+    """Every competitor that bid in `[start, end)`, named as `--solver` would name it.
+
+    One entry per catalogue name — so a solver's rotated addresses stay together, which
+    is what `resolve_solver` will do with the name anyway — and one per uncatalogued
+    address, which has no name to group by.
+
+    Deliberately derived from the window rather than from the catalogue: a run should
+    cover the solvers that actually competed, not every solver ever registered, and an
+    entry that bid nowhere would fail resolution.
+    """
+    rows = fetch(conn, ALL_SOLVERS_SQL, {"start": start, "end": end})
+    return [row["label"] for row in rows]
 
 
 def resolve_solver(

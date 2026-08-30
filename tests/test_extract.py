@@ -137,6 +137,39 @@ class TestFeeContext:
         assert bundle.fee_context.known == frozenset()
 
 
+class TestAllSolvers:
+    """`--all-solvers` derives the scenario list from the window (D26)."""
+
+    def test_names_group_addresses_and_uncatalogued_stay_addresses(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The query does the grouping, so the test pins the contract at the seam: one
+        label per competitor, and every label is something `resolve_solver` accepts."""
+        rows = [{"label": "Baseline"}, {"label": "Fractal"}, {"label": "26a6fdc0" * 5}]
+
+        def fake_fetch(_conn: Connection, sql: str, _params: Any = None) -> list[Row]:
+            assert sql is extract.ALL_SOLVERS_SQL
+            return rows
+
+        monkeypatch.setattr(extract, "fetch", fake_fetch)
+        conn = cast("Connection", None)
+
+        assert extract.all_solvers(conn, "2026-07-01", "2026-08-01") == [
+            "Baseline",
+            "Fractal",
+            "26a6fdc0" * 5,
+        ]
+
+    def test_an_empty_window_yields_no_scenarios(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fake_fetch(_conn: Connection, _sql: str, _params: Any = None) -> list[Row]:
+            return []
+
+        monkeypatch.setattr(extract, "fetch", fake_fetch)
+        assert extract.all_solvers(cast("Connection", None), "a", "b") == []
+
+
 class TestConversionRates:
     """`load_conversion_rates` must query per accounting period, never per block: the
     table behind it is one row per block with no index, and a large-array block probe

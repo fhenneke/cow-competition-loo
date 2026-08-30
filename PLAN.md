@@ -31,7 +31,7 @@ stays in the sections and docs each row links to; the milestone sections cite th
 | | decision | chosen over | lives in | to revise |
 | --- | --- | --- | --- | --- |
 | D1 | Rank solutions on the **recorded score**; surplus mode is a separate, self-consistent answer to the user-value question, not an approximation of the competition ([§2](#2-two-valuations-deliberately-separate)) | recomputing scores — impossible, fee policies only exist for executed orders | `valuation.solution_total` | `--mode surplus` exists |
-| D2 | The fairness filter compares per-pair **user surplus on both sides**, in both modes ([§2](#2-two-valuations-deliberately-separate), [measured](docs/winner-selection.md#the-filter-runs-on-surplus)) | `scaled` / `raw` score-scale splits — built, measured 30× worse, removed | `build_solutions` filling `Solution.pair_values` from `pair_surplus` | feed a different per-pair decomposition; the measured cost of this one is the proxy error rate ([§4.1](#41-m1-result)) |
+| D2 | The fairness filter compares per-pair **scores** against per-pair score baselines — **one** currency. Baselines are exact by construction (a single-pair solution's whole `total`); where a pair's own score is unrecorded its user **surplus** stands in as a *lower bound*, so the comparison can prove fairness but never fabricate it, and a dark pair can only make the filter stricter than the protocol was. Decides 0.058% of multi-pair solutions by guess ([§2](#2-two-valuations-deliberately-separate), [§15](#15-m14--fee-aware-scoring--done), [measured](docs/winner-selection.md#the-filter-runs-on-score)) | surplus on both sides everywhere, M1–M13's rule — 7 filter errors against 0, and biased toward *keeping* because it deflated the baseline to surplus too; two baseline maps with a per-solution choice between them — built first in M14, both more complex and wrong, since a dark pair with no baseline decides nothing and must not blind the pairs beside it ([the auction that showed it](docs/winner-selection.md#one-dark-pair-must-not-blind-the-pairs-beside-it)); `scaled` / `raw` splits — built in M1, 30× worse still (they treat a fee-free value as exact against a fee-bearing baseline) | `valuation.pair_score_split`, `winner_selection.compute_baseline_scores` / `filter_comparisons` | feed a different per-pair decomposition; the cost of the fallback is `Ranking.proxied_uids`, which `validate` and `analyse` both report |
 | D3 | The LOO ranking is a **full re-arbitration** — steps 3–6, so removing a solver can lower a baseline and un-filter solutions ([§5](#5-m2--loo-ranking-and-surplus-deltas--done)) | re-picking on the recorded kept set, as reference scores do — would have missed all 14 un-filter wins | `counterfactual.leave_one_out` | — |
 | D4 | A winner's settlement attaches to the **slot**, not the solver: a replacement inherits the recorded outcome of the token pairs it claims ([§5](#5-m2--loo-ranking-and-surplus-deltas--done)). `assume-settled` (everything lands in time) is the one alternative scenario kept | `observed` (settlement attached to the solution) — carried through M3 as a "lower bound", **removed in the M4 review**: charging the baseline for real reverts while crediting every replacement is not a counterfactual anyone would defend, and calling it a bound kept inviting it to be quoted ([§7.1](#71-m4-result)) | `counterfactual.OUTCOME_RULE`, `side_outcomes` | `--outcome-rule` exists |
 | D5 | "Executed" means **`is_settled_in_time`** on both the surplus and the reward side; a late batch counts as a failure and its real surplus is reported, not absorbed ([why](docs/analytics-db.md#settled-and-settled_in_time-come-apart-and-which-one-you-want-depends)) | `tx_hash is not null` — what users actually received | `extract.Settlement.counts_as_executed` | flip that one property |
@@ -54,6 +54,7 @@ stays in the sections and docs each row links to; the milestone sections cite th
 | D22 | **Outcome rules share the one extraction pass**, like solvers (D18): `analyse_window` takes `outcome_rules` and arbitrates each bundle once per (solver, rule) as it streams past; `--outcome-rule` is repeatable with a `{rule}` placeholder in `--out` ([§10](#10-m8--sweep-efficiency--done)) | one rule per invocation (M6's shape) — extraction is rule-independent and nearly all the cost, so a two-rule sweep did exactly twice the DB work for milliseconds of avoided arbitration | `run.analyse_window`, `cli.run_analyse` | — |
 | D23 | The **overall average price change** spreads the moved-order Δsurplus over the window's whole executed fill-or-kill volume: the **recorded** winners' received legs under the outcome rule, summed over every clean analysed auction, solver present or not (D10's denominator logic) ([§11](#11-m9--overall-average-price-change--done)) | deriving the denominator from our re-arbitrated baseline — would force full arbitration of every absent-solver auction (most of a window) to compute a denominator that differs from the record in 5 of 7,745 validation auctions; leaving the question to the conditional figure alone — "when a price moves" and "the average traded unit" are both fair readings and conflating them invites misquotation | `counterfactual.recorded_executed_volume`, `Analysis.window_volume_base`, `aggregate.Report.overall_bps` | — |
 | D24 | The coverage count gets a **window-level second reading**: only-with executions over every user-order execution the recorded winners traded in the window, **partially fillable included** — both sides counted per auction-order execution — with a distinct-order decomposition beneath it whose share exists for the fill-or-kill part only ([§12](#12-m10--coverage-share-of-all-traded-orders--done)) | quoting "of N compared" alone — it is relative to the solver's own auctions and overstates window-level dependence for a selective bidder (measured 35.2% vs under 1% for a solver bidding in 5.7% of auctions); a fill-or-kill-only share reusing D23's count — built first to avoid a format bump, revised in review: partially fillable orders dominate coverage exactly where coverage matters (xdai July: 5,316 of 5,698 distinct only-with orders) and the extraction already sees every execution, so the fuller denominator was judged worth format 5 and a sweep re-run; a distinct-order share for partially fillable orders — no window-wide distinct count exists and one would understate them exactly where they trade most | `counterfactual.recorded_executed_volume`, `Analysis.window_order_executions_base`, `aggregate.Report.coverage_share`, `coverage_share_fok` | — |
+| D26 | `--all-solvers` derives the scenario list from the **window**: one per catalogue name (rotated addresses together, D9) and one per uncatalogued address. A solver left with no analysed auction is then **reported and skipped**, not fatal — nobody named it, so there is no misreading to guard against, unlike D25's named groups ([§15](#15-m14--fee-aware-scoring--done)) | naming every solver by hand — a 26-entry command line that goes stale as solvers come and go, and the reason the July run had to be assembled from an ad-hoc catalogue query first; defaulting to all solvers with no flag — silently expensive, and `--solver` typos would stop failing fast | `extract.all_solvers`, `cli.resolve_scenarios` | — |
 | D25 | A comma-separated `--solver` entry is a **removal group**: one counterfactual with every member absent at once, whose deltas describe the joint scenario and are **never attributed to individual members** ([§13](#13-m11--joint-removal-of-multiple-solvers--done)) | summing single-solver runs — wrong in both directions, removed solvers stop replacing each other; per-member attribution (Shapley-style) — needs 2^n scenario runs and answers a different question; rejecting overlapping scenarios (the pre-M11 shared-address rule) — would forbid exactly the single-vs-joint comparison the feature exists for, so only *identical* address sets are rejected as duplicates | `run.analyse_window` (group resolution), `counterfactual.leave_one_out` (already set-based), `run.absent_members` + `Analysis.addresses_seen` (a member absent from every analysed auction fails the run rather than padding the label) | the reader combines scenarios; to attribute, run the subsets as separate groups |
 
 ## 2. Two valuations, deliberately separate
@@ -68,21 +69,26 @@ So the pipeline carries both, and `arbitrate` takes them as inputs rather than d
 | Input to `arbitrate` | score mode (default) | surplus mode |
 | --- | --- | --- |
 | solution total (steps 2, 5, 6) | `proposed_solutions.score` | Σ per-order surplus in native |
-| per-pair decomposition (steps 3, 4) | per-pair surplus, used as a proxy | same |
+| per-pair decomposition (step 4, left side) | per-pair score, recomputed and anchored on the recorded score; per-pair surplus as a lower bound where it is unrecorded | per-pair surplus |
+| per-pair baseline (step 3) | the best single-pair solution's recorded score | the best single-pair solution's surplus |
 
-Both sides of the step-4 comparison use surplus, baselines included — a batch's surplus on a
-pair against the best surplus any single-pair solution reached on that pair. Nothing is
-invented and the units match. Two score-scale alternatives were measured and are 30× further
-from the recorded filter, so they were dropped rather than kept as options
-([numbers](docs/winner-selection.md#the-filter-runs-on-surplus)).
+Step 4 has one currency. The baseline side is never approximated — a single-pair solution
+puts its whole `total` on its one pair — so only the left side can be dark, and there
+surplus is a *lower bound* rather than a different scale: clearing the baseline on surplus
+alone proves the pair fair, and failing it is the only guess the filter ever makes. M1's
+`scaled` and `raw` attempts landed 30× worse than plain surplus precisely because they
+treated a fee-free value as *exact* against a fee-bearing baseline
+([numbers](docs/winner-selection.md#the-filter-runs-on-score)).
 
 - **Score mode is the default** and is what reward numbers and "who would have won" must
-  use. Scores come straight from the DB, so no protocol-fee reimplementation is needed.
-- **Surplus mode** answers "how much user value did `X` add" self-consistently, and is the
-  fallback if the per-pair proxy turns out to distort the filter.
-- The per-pair decomposition is the one thing not available from the DB — scores are stored
-  per solution, not per token pair. Surplus is the proxy in both modes. Quantify the damage
-  in M1 step 5 rather than assuming it away.
+  use. Solution totals come straight from the DB; only the per-pair *split* is recomputed,
+  and only for the filter.
+- **Surplus mode** answers "how much user value did `X` add" self-consistently. It gets no
+  score split deliberately — a filter comparing scores inside a surplus ranking would be
+  neither of the two answers.
+- The per-pair decomposition is the one thing the DB does not store: scores are recorded
+  per solution, not per token pair. M1 through M13 stood in user surplus for it and
+  measured the damage; M14 recomputes it instead ([§15](#15-m14--fee-aware-scoring--done)).
 
 ## 3. Deliverables
 
@@ -204,6 +210,10 @@ checks hold the DB's own filter decisions fixed and re-run a single step, so no
 approximation is in their path — both are exact, which clears steps 5 and 6 outright and
 localises every remaining difference to step 4.
 
+(M14 has since recomputed that split rather than proxying it, taking the filter
+differences from 7 to 0 — [§15](#15-m14--fee-aware-scoring--done). What follows is the
+historical record of the proxy this milestone measured.)
+
 For step 4, the true per-pair split is unknown but constrained: each pair's score is at
 least its user surplus (fees are non-negative) and the splits sum to the recorded score,
 so a split the recorded filter could have *kept* exists iff
@@ -213,7 +223,7 @@ dropped a batch the surplus filter keeps, always on a partially fillable order. 
 them keeping is provably infeasible, so they are the deliberate consequence of filtering
 on surplus (`model`); the other 5 fall in the undetermined 5% where the split genuinely
 decides (`proxy`). Full numbers in
-[docs/winner-selection.md](docs/winner-selection.md#the-filter-runs-on-surplus).
+[docs/winner-selection.md](docs/winner-selection.md#the-filter-runs-on-score).
 
 Expected explanation (a), partial fills, turned out **not** to contribute: with exact
 integer ceiling division the surplus formulas reproduce the dbt model on every order up to
@@ -600,7 +610,8 @@ State these caveats with the results:
    14.9% of winners never settled and they hold 50.2% of winning score, so this is a
    first-order caveat, not a footnote — the `inherited`-to-`assume-settled` gap is real
    uncertainty about whether those batches would ever have landed.
-3. **Filter proxy** — the measured per-pair surplus proxy error from M1 step 5.
+3. **Filter** — per-pair scores, recomputed; the fallback rate and its measured error
+   ([§15](#15-m14--fee-aware-scoring--done)).
 4. **Quote rewards excluded** — no data on counterfactual quoting.
 5. **Two reward figures, not one** (D11). Uncapped is the mechanism's exact accounting
    but three orders of magnitude from payouts (−410 ETH uncapped vs 0.75 ETH paid over
@@ -1111,3 +1122,387 @@ which of the two effects a solver's value actually consists of.
 Out of scope, deliberately: netting fees against rewards into a single "solver profit"
 figure. The two have different confidence (fees are exact, uncapped rewards are not the
 payout) and combining them would hide that.
+
+## 15. M14 — fee-aware scoring — **done**
+
+The fairness filter is the one step of the mechanism this pipeline had never run on the
+protocol's own quantity. Steps 2, 5 and 6 use `proposed_solutions.score` directly; step 4
+compares solutions **per token pair**, and that split is not recorded anywhere, so M1
+stood user surplus in for it on both sides and measured the cost. M13 made the split
+computable — protocol fees are recoverable for essentially every solution — so this
+milestone stops proxying and computes it.
+
+### The split is anchored on the recorded score, and it is partial
+
+`valuation.pair_score_split` never returns a number that does not add up against
+`proposed_solutions.score`, and it returns **the pairs it knows** rather than
+all-or-nothing:
+
+1. **One pair in the solution** — the whole score sits on it. Exact from the record alone.
+2. **A priced pair** — `surplus + fee`. Where *every* pair is priced the sum must return
+   the recorded score to the wei.
+3. **The last unpriced pair** — with exactly one pair dark the residual closes it exactly.
+   With two or more dark, they stay absent and the priced pairs still come back.
+
+Every branch is checked against the record, and a failed check discards the solution's
+whole split with `anchor_failed` set rather than trusting part of it. That flag is counted
+apart from the fallback, so a fee path that breaks on some future chain reads as "the fee
+path is wrong" rather than as that chain having thin fee coverage.
+
+### One currency, and surplus as a lower bound
+
+The filter compares one quantity against one set of baselines. Two facts make that
+possible, and both were got wrong in the first cut of this milestone before being fixed in
+review:
+
+**Baselines are never missing.** Only single-pair solutions set one, and such a solution
+puts its whole value on its one pair — so the baseline is its recorded `total`, with no
+decomposition and no fee involved. That is what the Rust does too. The right-hand side of
+every comparison is therefore exact by construction; only the left can be dark.
+
+**Surplus is a lower bound, not a second currency.** Protocol fees are non-negative, so a
+dark pair's score is at least its surplus. `surplus >= baseline` proves the pair fair
+without any fee; `surplus < baseline` is the only guess the filter ever makes, and it drops
+the solution. So a dark pair can only make the filter **stricter** than the protocol was,
+never looser — the opposite of the pre-M14 rule, whose 7 differences were all false keeps
+because it deflated the baseline to surplus as well.
+
+The first cut instead carried two baseline maps and chose between them *per solution*.
+That is both more machinery and wrong: `is_fair` is a conjunction of independent per-pair
+comparisons, so a pair needs an exact score only when it has a baseline it cannot clear on
+surplus alone. Requiring the whole solution's split discarded decidable solutions — auction
+13492893 is the worked example, and was the last remaining filter difference until the rule
+was fixed
+([the numbers](docs/winner-selection.md#one-dark-pair-must-not-blind-the-pairs-beside-it)).
+
+### Result
+
+Same window as every other gate — 7,745 mainnet auctions, 98,669 solutions,
+2026-08-01..04:
+
+| | M1–M13 (surplus) | M14 (score) |
+| --- | --- | --- |
+| filter decisions differing from the DB | 7 / 5,211 | **0 / 5,211** |
+| auctions with a matching `filtered_out` set | 7,738 / 7,745 | **7,745 / 7,745** |
+| auctions with a matching winner set | 7,740 / 7,745 | **7,745 / 7,745** |
+| verdicts resting on a guess | 5,211 (all) | **3 (0.058%)** |
+| auctions where a guess could have moved the winners | not measured | **1** |
+| solutions whose fees contradict the record | not detectable | **0** |
+
+**The competition now reproduces end to end with no observed approximation.** Both
+end-to-end lines join the two "observed" checks at 7745/7745, which had been exact since
+M1 because they hold the DB's own filter decisions fixed. Step 4 was the only step whose
+inputs the DB does not record, and it is the one this milestone closed.
+
+That is a statement about this window, not a theorem. Three solutions were still decided by
+the fallback and none of them happened to be decided wrongly; another window can differ.
+`validate` treats a difference with no fallback in it as a `bug` — every pair was then
+decided by a proof — and keeps `proxy` / `model` for the ones that rested on a guess.
+
+### The guesses that could have mattered are counted, not just the guesses
+
+A raw count of guesses overstates the uncertainty, because most sit on solutions that lose
+either way. `winner_selection.filter_guess_could_matter` restores every guessed verdict at
+once and re-picks: **`False` is a proof** that no subset of the guesses could move the
+winners, since a solution that fails to win when all are restored was blocked by a winner
+present in every scenario.
+
+This is the number the **counterfactual** needs and the only one it has. `validate` can
+check its answer against the record; a leave-one-out run cannot, because the auction it
+describes never happened. It bites hardest exactly where D3's full re-arbitration does its
+work: removing the solver that set a baseline lowers it, which is what un-filters
+solutions — and a dark pair that still fails the *lowered* baseline is one the real
+mechanism might have un-filtered while we keep it out, understating the removal. So
+`analyse` checks **both** sides and reports `auctions_filter_guess_could_matter` beside
+`auctions_filter_relaxed`: un-filterings found, against auctions where one could have been
+missed.
+
+Over the calibration window: 3 guesses, 1 auction where one could have moved the winners
+(13493777), and all three agree with the recorded competition. None is close — the failing
+pair falls short of its baseline by 6x, 253,000x and 91,000,000x
+([detail](docs/winner-selection.md#counting-the-guesses-that-could-have-mattered)). The
+check deliberately does not use that: "the fee would have to be absurd" is a judgement that
+holds until some chain's policies make it false, while a structural "the pick cannot move"
+is a proof that survives any window.
+
+Over July 2026 with every one of its 26 solvers removed in turn — 763,067 solver-auctions,
+539,972 multi-pair solutions judged — the counterfactual figure is **217 guesses in 76
+auctions where one could have moved the winners**, against **1,507 auctions where a
+removal genuinely un-filtered a solution**. The uncertainty runs at roughly 5% of the
+effect it perturbs, and is zero for every solver below ~5,000 auctions.
+
+### Verified over a month, not just the calibration window
+
+July 2026 mainnet (84,767 auctions analysed of 85,487, 946,995 solutions) reproduces the
+recorded competition **exactly on every check**: winners, filtered-out set and both
+reference-score comparisons all 84767/84767, 0 valuation failures, and 0 of 38,404
+multi-pair filter decisions differing. 31 verdicts (0.081%) rested on a guess, 13 of them
+in auctions where the guess could have moved the winners.
+
+The row that could not be tested before: **0 of 946,995 solutions have recomputed fees that
+contradict `proposed_solutions.score`**. `pair_score_split` refuses such a split rather than
+trusting it, and over a month that refusal never fires — so M13's fee port holds at 12x its
+calibration window rather than only on the window it was tuned against
+([table](docs/winner-selection.md#the-same-over-a-full-month)).
+
+Not covered: a guess moving a **reference score** without moving a winner. Reported as a
+known limit rather than measured.
+
+### What was built
+
+- `loo/fees.py` — a port of `protocol_fees` (`arbitrator.rs:260`): the three policy
+  kinds, reverse application order with prices re-adjusted between policies, the quote
+  fee as an exact floored rational, and `mul_f64` reproducing `checked_mul_f64`. Plus
+  `fee_split`, the trailing-`n` rule.
+- `loo/extract.py` — policies, partner counts and quotes per chunk, and the coverage set
+  derived from data already in hand: an order is covered iff it appears in a
+  non-filtered-out solution of that auction, or is a JIT order (never has policies, so
+  its fee is a known zero). `with_fees=False` turns the three queries off.
+- `loo/valuation.py` — per-order `order_fee_native` and `order_partner_fee_native`.
+- `loo/counterfactual.py` — the fee carried through `OrderOutcome` and `OrderDiff` to
+  `delta_protocol_fees` / `delta_partner_fees` / `delta_protocol_fees` per auction and per
+  window.
+- Report **format 6**. The table is ordered by what a reader should hit first:
+**Δsurplus, Δprotocol fee, orders no longer executed**, then the relative price change
+and Δpartner fee, then the rest. `Δprotocol fee` is the gross figure — what the mechanism
+charges — with the partner and protocol split one tier below it. The lost-order count is
+over **every execution the window traded**, not over the solver's own auctions: a
+selective bidder would otherwise look indispensable. The order is asserted in
+`tests/test_aggregate.py` rather than left to drift.
+
+### The decomposition is exactly additive
+
+Each share is converted to native as a *difference of conversions* rather than on its
+own:
+
+```
+fee_native = to_native(surplus + fee) - to_native(surplus)
+dao_native = to_native(surplus + dao) - to_native(surplus)
+```
+
+so `surplus_native + fee_native == compute_order_score(order)` to the wei, and
+`0 <= dao <= fee` follows from `to_native` being monotone. Converting the fee directly
+loses up to one surplus-token atom per order to the intermediate floor — ~5e8 wei on a
+six-decimal token, which showed up immediately as a constant per-order offset against the
+recorded score.
+
+### Validation
+
+Three independent checks, all exact:
+
+| check | result |
+| --- | --- |
+| `surplus + fees` vs `proposed_solutions.score`, through the real extraction path | **2,512 / 2,512** wei-exact (13509000–13509867) |
+| fee **atoms** and the partner split vs `int_backend_data__fees_per_trade` | **9,340 / 9,340** exact, both quantities (13480599–13500000) |
+| the standalone port vs the recorded score | 19,653 / 19,653 (M12, auctions 13505000–13509867) |
+
+The second is the one that matters for this milestone: it validates the trailing-`n`
+partner rule against a model derived from settlement data by a completely different
+route, on both the total and the split, with not one row differing in either quantity.
+`proposals/fee-aware-scoring/` carries the M12 scripts; this one is
+`tests/test_fees.py` plus the cross-check described above.
+
+### Cost
+
+The three extra queries add about **12%** to extraction — 27.5 → 30.9 ms/auction warm,
+measured over 238 auctions. They are indexed lookups (`fee_policies` is unique on
+`(auction_id, order_uid, application_order)`) and the quote query is restricted to orders
+that actually carry a price-improvement policy. `with_fees=False` turns them off for
+callers that do not need fees.
+
+### Coverage of the fee delta
+
+An auction's fee deltas are formed only when **every** executed contributing order on
+both sides could be priced; otherwise both sides drop together and the auction is counted
+in `auctions_fees_incomplete`, the same like-for-like discipline `auctions_capped_skipped`
+uses. The gap is one-sided and narrow — it needs a solution the recorded competition
+filtered out to win the counterfactual. Over 2026-08-01..04 it is **4 to 7 auctions per
+solver** (0.07–0.17%): 4 of 5,842 for Fractal, 6 of 4,839 for Sector, 7 of 4,117 for
+Barter.
+
+Note the "executed" in that rule: an order that did not trade pays nothing, so its fee is
+a known zero whatever its policies say, and only an *executed* order can be unpriced.
+Getting that wrong excluded auctions where a winner simply failed to settle.
+
+### The deltas run over the union of both sides, not the intersection
+
+`protocol_fees_base`/`_loo` sum over every order either side's winners traded, with the
+absent side reading 0, so an order that **stops being executed** contributes its whole
+fee to the delta rather than dropping out of the comparison. That is the same convention
+`delta_surplus` uses, and it is not a detail — decomposing Δprotocol fees for Sector over
+2026-08-01:
+
+| | Δprotocol fees | orders |
+| --- | --- | --- |
+| executed on both sides | −0.1266 ETH | 1,991 |
+| **executed only with the solver** | **−0.1380 ETH** | **58** |
+| executed only without | +0.0008 ETH | 2 |
+| total | −0.2637 ETH | |
+
+**More than half the fee delta comes from 58 orders that stop trading at all**, against
+1,991 that trade on both sides. A fee delta restricted to still-traded orders would miss
+the larger half, which is why `orders no longer executed` is a headline row beside the
+fee itself.
+
+### Reading the number
+
+`delta_protocol_fees` is **gross** revenue. The protocol also pays for the competition, so it
+belongs in the same sentence as `delta_rewards`. Over 2026-08-01..04 on mainnet, in ETH
+(deltas are counterfactual − actual, so negative means the protocol gets less without the
+solver):
+
+| removed | Δsurplus | Δprotocol fees | Δpartner fees | Δrewards | protocol fees with it |
+| --- | --- | --- | --- | --- | --- |
+| Fractal | −0.2631 | **−0.3757** | −0.0014 | +0.1784 | 8.3292 |
+| Sector | −1.3259 | **−1.1773** | −0.0079 | +3.0783 | 9.9366 |
+| Barter | −0.4740 | **−0.4659** | −0.0026 | −0.6055 | 6.0508 |
+
+The fee delta is the **same order as the surplus delta** and for Fractal 1.4x larger, so
+a solver's value to the protocol is not a small correction on its value to users. That is
+not an artefact of one solver: score is surplus plus fees, and 3.2% of bids are
+fee-dominated with a median score/surplus of 1.08
+([measured](docs/winner-selection.md#measured-divergence--surplus-is-not-a-stand-in-for-score)),
+so a mechanism that ranks on score is buying fee capture as much as user surplus. Until
+now the analysis could only see one of those.
+
+The reward column does not follow the fee column: removing Fractal or Sector makes the
+protocol pay *more* while collecting less, but removing Barter lowers both. Whether a
+solver is worth its rewards is therefore a genuinely per-solver question, which is the
+argument for reporting the three deltas side by side rather than reducing them.
+
+### How much of the fee delta is the partners' varies enormously by chain
+
+Partner fees are the larger half of the mainnet *level* — 33.9 ETH against 30.8 ETH over
+2026-08-01..04 — and on mainnet their *delta* is three orders of magnitude below the
+protocol's. It is tempting to conclude that partner fees carry the revenue and none of
+the sensitivity, and an earlier draft of this section said exactly that. **The July
+multi-chain run refutes it.** The partners' share of the fee delta, per solver-chain:
+
+| | partner share of Δ(protocol and partner) fees |
+| --- | --- |
+| Baseline on polygon | **74%** ($132 of $179) |
+| Rizzolver on base | 27% |
+| Rizzolver on mainnet | 12% |
+| Baseline on xdai, plasma | **~0%** |
+
+The mechanism survives and explains the spread. A partner fee is a **volume** policy
+(4,592 of 4,634 partner rows in the M1 window), so it depends only on whether the order
+filled, not on the price it got: it is untouched when a rival simply wins the same order,
+and lost entirely when the order stops trading. So the partner share of the delta tracks
+**how much of the removal's cost is coverage rather than price**. Mainnet removals are
+mostly price effects, so partner fees sit still; polygon's Baseline removal costs 5.2% of
+the chain's executions, so they go with the orders.
+
+The lesson for the report shape is unchanged — the split has to be shown, because neither
+half is a fixed fraction of the other — but the generalisation "partner fees do not move"
+is mainnet-only and should not be repeated.
+
+The mechanism is in the policy kinds: partner fees are essentially all volume policies
+(4,592 of 4,634 partner rows in the M1 window), so they track whether an order trades at
+all. The protocol's own fees are surplus and price-improvement policies, which track how
+*well* the order is filled. So on a chain where removal costs price, the movement is
+almost entirely the protocol's own revenue; on a chain where it costs coverage, the
+partners lose too. Lumping the two together both doubles the apparent level and hides
+which of the two effects a solver's value actually consists of.
+
+Out of scope, deliberately: netting fees against rewards into a single "solver profit"
+figure. The two have different confidence (fees are exact, uncapped rewards are not the
+payout) and combining them would hide that.
+
+## 15. M14 — fee-aware scoring — **done**
+
+The fairness filter is the one step of the mechanism this pipeline had never run on the
+protocol's own quantity. Steps 2, 5 and 6 use `proposed_solutions.score` directly; step 4
+compares solutions **per token pair**, and that split is not recorded anywhere, so M1
+stood user surplus in for it on both sides and measured the cost. M13 made the split
+computable — protocol fees are recoverable for essentially every solution — so this
+milestone stops proxying and computes it.
+
+### The split is anchored on the recorded score, and it is partial
+
+`valuation.pair_score_split` never returns a number that does not add up against
+`proposed_solutions.score`, and it returns **the pairs it knows** rather than
+all-or-nothing:
+
+1. **One pair in the solution** — the whole score sits on it. Exact from the record alone,
+   no fee needed.
+2. **A priced pair** — `surplus + fee`. Where *every* pair is priced the sum must return
+   the recorded score to the wei, or nothing from that solution is trusted.
+3. **The last unpriced pair** — with exactly one pair dark the residual closes it exactly.
+   With two or more dark, they stay absent and the priced pairs still come back.
+
+Case 1 is why the **baselines** are exact whatever happens elsewhere: only single-pair
+solutions set a baseline (step 3), so the right-hand side of every comparison is a recorded
+score. Case 2 covers every solution the arbitrator kept, by construction.
+
+The partiality is the load-bearing part, and the first cut of this milestone got it wrong.
+`is_fair` is a conjunction of **independent per-pair comparisons**, so a pair needs an
+exact score only when it has a baseline to clear. Requiring the whole solution's split
+before using score at all discards decidable solutions — auction 13492893 is the worked
+example, and it was the last remaining filter difference until the rule was fixed
+([the numbers](docs/winner-selection.md#the-split-is-partial-and-the-filter-is-per-pair)).
+Scales are never mixed *within* a comparison; across comparisons the mixture is harmless.
+
+### Result
+
+Same window as every other gate — 7,745 mainnet auctions, 98,669 solutions,
+2026-08-01..04:
+
+| | M1–M13 (surplus) | M14 (score) |
+| --- | --- | --- |
+| filter decisions differing from the DB | 7 / 5,211 | **0 / 5,211** |
+| auctions with a matching `filtered_out` set | 7,738 / 7,745 | **7,745 / 7,745** |
+| auctions with a matching winner set | 7,740 / 7,745 | **7,745 / 7,745** |
+| solutions with a binding comparison on the proxy | 5,211 (all) | **9 (0.17%)** |
+
+**The competition now reproduces end to end with no observed approximation.** Both
+end-to-end lines join the two "observed" checks at 7745/7745, which had been exact since
+M1 because they hold the DB's own filter decisions fixed. Step 4 was the only step whose
+inputs the DB does not record, and it is the one this milestone closed.
+
+That is a statement about this window, not a theorem. Nine solutions were still judged on
+the fallback and none of them happened to be decided by it; another window can differ.
+`validate` treats any score-scale disagreement as a `bug` — on that scale both sides of the
+comparison are the protocol's own quantities, so there is nothing left to excuse one — and
+keeps `proxy` / `model` for the fallback, where they remain the honest classification.
+
+### What was built
+
+- `loo/valuation.py` — `pair_score_split` returning `PairScores(pairs, anchor_failed)`,
+  plus `pair_fee_native` / `pairs_fees_unknown` on `SolutionValuation` so the split works
+  per pair rather than per order.
+- `loo/winner_selection.py` — `Solution.pair_scores` beside `pair_values`;
+  `compute_baseline_scores` reads `total` (the Rust's own rule) so baselines need no
+  decomposition; `filter_comparisons` yields one `PairComparison` per pair and `is_fair`
+  is `all(c.fair for c in ...)`, short-circuiting on the first failure. `Ranking` gains
+  `proxied_uids` — the solutions whose verdict rested on a guess — and `tested`, the
+  solutions the filter actually judged.
+- `loo/validate.py` — `SolutionCheck.filter_scale` and `score_anchor_failed`, a `bug`
+  verdict for a difference with no fallback in it, `Summary.fallback_rate`, and
+  `proxy_error_rate` renamed `filter_mismatch_rate` (a mismatch is no longer necessarily
+  the proxy's doing). The bracket now reads `ranking.baselines` in score mode instead of
+  deriving a second copy that could drift from what the filter used.
+- `loo/counterfactual.py` — `multi_pair_solutions` / `multi_pair_filter_proxied` per
+  auction and per window, both read off the ranking rather than re-derived, plus
+  `auctions_filter_guess_could_matter` over both sides of the comparison.
+- Report **format 8**. Format 7 was the behaviour change — a format-6 report was filtered
+  on surplus, and tabulating it beside a newer one would compare two different mechanisms
+  (D19's rule read strictly); format 8 added the guess-sensitivity count.
+
+### Cost
+
+None measurable. The fee data was already being extracted for M13, and the split is
+arithmetic over numbers the valuation had already computed; a 600-auction `analyse` and
+the 7,745-auction `validate` both run in the same time as before.
+
+### Out of scope
+
+- **Backfilling policies from other auctions.** Policies are byte-identical across
+  auctions for the same order (M12 measured 1,485 of 1,485), so the 3 fallback solutions
+  could mostly be closed by looking the order up in a neighbouring auction. At 0.058% of
+  multi-pair solutions and zero filter differences, that is machinery bought for nothing.
+  The fallback is measured and reported instead. Revisit if another window's fallback
+  actually decides something.
+- **Surplus mode.** It gets no score split by design; see §2.
+- **Solution totals.** Still `proposed_solutions.score`. There is no reason to recompute
+  what is recorded exactly, and the fee path has a coverage gap the score does not.

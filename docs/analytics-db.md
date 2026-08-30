@@ -160,6 +160,61 @@ Two lessons on detection:
 The check needs both tokens' prices, so `PRICES_SQL` loads sell tokens too even though
 the valuation itself converts through the buy token only.
 
+### The accounting path corrects these prices; the scoring path must not
+
+The payout side does **not** read `auction_prices` raw. `int_backend_data__price_data`
+overlays a curated table first:
+
+```sql
+coalesce(apc.price, ap.price) as price
+from auction_prices ap
+left join stg_auction_prices_corrections apc using (auction_id, token)
+```
+
+Everything downstream inherits it — `int_backend_data__fees_per_trade.fee_amount_native`
+is `protocol_fee_amounts[i] * pd.protocol_fee_token_native_price`, so the DB's own
+`protocol_fee_native` and `partner_fee_native` are **corrected** figures while the score
+the competition was decided on is not.
+
+So there really are two price feeds for the same fee, and using the wrong one here would
+be a defect in either direction:
+
+- **Scoring, filtering, winners.** Raw `auction_prices` is the only correct input: it is
+  what the autopilot ran on. Applying corrections would make the reproduction diverge from
+  the record on purpose.
+- **Quoting a fee in ETH.** The corrected price is the better number, since the raw one is
+  wrong by construction wherever a correction exists.
+
+The pipeline resolves this by never quoting the disputed cases: it scores on raw prices
+(right for the decision) and excludes price-suspect auctions from every statistic (right
+for the ETH figure), so it neither diverges from the record nor prints a fabricated amount.
+
+**Measured, whole table, 2026-08-30: 20 rows, 20 auctions, 2 tokens**, all mainnet/prod and
+all in auctions 13639326–13658320. The corrections are large — the raw price is 10x to 92x
+too high — and 19 of the 20 are one token across a run of consecutive auctions, the same
+shape as the 15,300x case above.
+
+**Every one of those 20 auctions is independently flagged by `price_imbalanced` and
+excluded** (verified: 20 caught, 0 missed, and in each the mispriced token is actually
+traded). Two mechanisms derived by different routes agree exactly on which auctions are
+untrustworthy, so the corrections table is redundant for this pipeline rather than a gap
+in it.
+
+Two caveats worth keeping:
+
+- The corrections table is **curated and retrospective** — it grows as people notice bad
+  prices, so a fresh window can contain a mispricing nobody has corrected yet.
+  `price_imbalanced` does not depend on that curation, which is why it is the primary
+  defence and not the fallback.
+- Both mechanisms only catch *gross* errors. The threshold is 2x and the observed
+  corrections are 10x+; a price wrong by 50% would pass both, and would move a fee delta
+  by 50% of that token's share of it.
+
+No correction row falls inside any window analysed so far — the M1 calibration window is
+13480599–13517908 and July 2026 is 13266727–13488348, both entirely below 13639326 — so
+the influence of the price-feed difference on every fee delta reported to date is
+**exactly zero**.
+
 ## No USD prices — stablecoin native prices imply the rate
 
 The analytics DB has **no USD price table** (checked: no `dbt` table matches

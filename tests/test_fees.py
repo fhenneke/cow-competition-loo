@@ -23,7 +23,13 @@ from loo.fees import (
     policy_fees,
     quote_fee,
 )
-from loo.valuation import ClearingPrices, Order, value_solution
+from loo.valuation import (
+    ClearingPrices,
+    Order,
+    build_solutions,
+    pair_score_split,
+    value_solution,
+)
 
 WETH = "c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
 USDC = "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
@@ -224,3 +230,100 @@ class TestValuationIntegration:
         assert not valuation.fees_complete
         assert valuation.fees_unknown == frozenset({UID})
         assert valuation.fee_native == 0  # nothing recorded, so nothing summed
+
+
+SECOND_UID = "f" * 112
+SECOND_ORDER = Order(
+    uid=SECOND_UID,
+    sell_token=WETH,
+    buy_token=USDC,
+    sell_amount=1000,
+    buy_amount=2000,
+    executed_sell=1000,
+    executed_buy=2100,
+    side="sell",
+)
+"""A second pair with no fee policies at all, so its score is its surplus."""
+
+PRICES = {"ee" * 20: 10**18, USDC: 10**18}
+ORDERS = [LIVE_ORDER, SECOND_ORDER]
+CONTRIBUTES = {UID: True, SECOND_UID: True}
+BOTH_KNOWN = frozenset({UID, SECOND_UID})
+
+
+class TestPairScoreSplitOnLiveFees:
+    """The split the fairness filter compares, on the real fee fixture.
+
+    A two-pair solution: the live order on USDC->ETH, and a fee-free order on WETH->USDC
+    so the score of that pair is exactly its surplus.
+    """
+
+    def context(self, *, known: frozenset[str]) -> FeeContext:
+        return FeeContext(
+            policies={UID: LIVE_POLICIES},
+            quotes={UID: LIVE_QUOTE},
+            partner_counts={UID: 1},
+            known=known,
+        )
+
+    def valuation(self, *, known: frozenset[str]):
+        return value_solution(
+            ORDERS, CONTRIBUTES, PRICES, WETH, self.context(known=known)
+        )
+
+    def test_the_split_is_surplus_plus_fee_per_pair(self) -> None:
+        valuation = self.valuation(known=BOTH_KNOWN)
+        live_pair, second_pair = (USDC, "ee" * 20), (WETH, USDC)
+        db_score = valuation.total + valuation.fee_native
+
+        split = pair_score_split(valuation, db_score).pairs
+
+        assert split == {
+            live_pair: valuation.pair_surplus[live_pair] + LIVE_TOTAL_FEE,
+            second_pair: valuation.pair_surplus[second_pair],
+        }
+        assert sum(split.values()) == db_score
+
+    def test_an_unrecorded_pair_is_closed_by_the_residual(self) -> None:
+        """The live order's policies unrecorded: its pair's score comes back from the
+        recorded total minus the pair that could be priced — the same number."""
+        complete = self.valuation(known=BOTH_KNOWN)
+        db_score = complete.total + complete.fee_native
+
+        partial = self.valuation(known=frozenset({SECOND_UID}))
+
+        assert partial.fees_unknown == frozenset({UID})
+        assert pair_score_split(partial, db_score) == pair_score_split(complete, db_score)
+        assert not pair_score_split(partial, db_score).anchor_failed
+
+    def test_score_mode_carries_the_split_and_surplus_mode_does_not(self) -> None:
+        """`build_solutions` wires it through only where score is the currency."""
+        from loo.extract import Bid
+
+        complete = self.valuation(known=BOTH_KNOWN)
+        bid = Bid(
+            auction_id=13509109,
+            uid=0,
+            solver="a" * 40,
+            score=complete.total + complete.fee_native,
+            is_winner=True,
+            filtered_out=False,
+            orders=tuple(ORDERS),
+            contributes=dict(CONTRIBUTES),
+        )
+
+        scored, _ = build_solutions(
+            [bid], PRICES, WETH, fee_context=self.context(known=BOTH_KNOWN)
+        )
+        surplus, _ = build_solutions(
+            [bid],
+            PRICES,
+            WETH,
+            mode="surplus",
+            fee_context=self.context(known=BOTH_KNOWN),
+        )
+
+        assert sum(scored[0].solution.pair_scores.values()) == bid.score
+        assert set(scored[0].solution.pair_scores) == set(scored[0].solution.pair_values)
+        # Surplus mode leaves every pair on the surplus scale, deliberately.
+        assert surplus[0].solution.pair_scores == {}

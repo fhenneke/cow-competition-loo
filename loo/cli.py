@@ -78,13 +78,24 @@ def main(argv: list[str] | None = None) -> int:
     analyse.add_argument(
         "--solver",
         action="append",
-        required=True,
         help=(
             "solver name (as in dune_data__cow_protocol__solvers) or submission "
             "address; a comma-separated list removes those solvers TOGETHER — one "
             "joint counterfactual with all of them absent, attributing nothing to "
             "individual members. Repeatable — every scenario shares one extraction "
             "pass, so analysing several costs barely more than one"
+        ),
+    )
+    analyse.add_argument(
+        "--all-solvers",
+        action="store_true",
+        help=(
+            "remove every solver that bid in the window, one at a time — one scenario "
+            "per catalogue name (rotated addresses together) and one per uncatalogued "
+            "address. Mutually exclusive with --solver, and needs a {solver} "
+            "placeholder in --out. Unlike --solver, a solver left with no analysed "
+            "auction is reported and skipped rather than failing the run: the list "
+            "came from the window, so nobody asked for that solver by name"
         ),
     )
     analyse.add_argument("--start", required=True, help="inclusive, e.g. 2026-08-01")
@@ -217,7 +228,8 @@ def run_validate(args: argparse.Namespace) -> int:
         print(f"\nfull report written to {args.out}", file=sys.stderr)
 
     # The gate is that every difference has a named cause, not that there are no
-    # differences: the per-pair surplus proxy is a known and accepted one.
+    # differences: the per-pair surplus fallback is a known and accepted one, and is the
+    # only place an accepted difference can now come from.
     return 0 if not summary.unexplained else 2
 
 
@@ -365,19 +377,49 @@ def report_path(template: str, solver: str, rule: str) -> str:
     return template.replace("{solver}", slug).replace("{rule}", rule)
 
 
+def resolve_scenarios(args: argparse.Namespace, conn: db.Connection) -> list[str] | None:
+    """The `--solver` scenarios, or every bidder in the window under `--all-solvers`.
+
+    Returns `None` after printing the reason when the two flags are combined, neither is
+    given, or the window has no bidders at all.
+    """
+    if args.all_solvers and args.solver:
+        print(
+            "ERROR: --all-solvers already covers every solver that bid; drop --solver "
+            "or drop --all-solvers.",
+            file=sys.stderr,
+        )
+        return None
+    if not args.all_solvers and not args.solver:
+        print(
+            "ERROR: name at least one --solver, or pass --all-solvers to remove every "
+            "solver that bid in the window one at a time.",
+            file=sys.stderr,
+        )
+        return None
+    if not args.all_solvers:
+        return list(args.solver)
+
+    solvers = extract.all_solvers(conn, args.start, args.end)
+    if not solvers:
+        print(
+            f"ERROR: no solver bid in [{args.start}, {args.end}) on {args.network}.",
+            file=sys.stderr,
+        )
+        return None
+    print(
+        f"--all-solvers: {len(solvers)} scenarios — {', '.join(solvers)}",
+        file=sys.stderr,
+    )
+    return solvers
+
+
 def run_analyse(args: argparse.Namespace) -> int:
     # argparse's `choices` already constrains the values; the cast restores the
     # literal type it erased.
     rules = cast(
         "list[counterfactual.OutcomeRule]", args.outcome_rules or ["inherited"]
     )
-    if len(args.solver) > 1 and args.out and "{solver}" not in args.out:
-        print(
-            "ERROR: --out needs a {solver} placeholder when several solvers are "
-            "analysed, or each report would overwrite the last",
-            file=sys.stderr,
-        )
-        return 4
     if len(rules) > 1 and args.out and "{rule}" not in args.out:
         print(
             "ERROR: --out needs a {rule} placeholder when several outcome rules are "
@@ -388,10 +430,22 @@ def run_analyse(args: argparse.Namespace) -> int:
 
     conn = db.connect(args.network)
     try:
+        # `--all-solvers` needs the DB to know the scenarios, so the `{solver}` check
+        # cannot happen with the other argument checks above.
+        solvers = resolve_scenarios(args, conn)
+        if solvers is None:
+            return 4
+        if len(solvers) > 1 and args.out and "{solver}" not in args.out:
+            print(
+                "ERROR: --out needs a {solver} placeholder when several solvers are "
+                "analysed, or each report would overwrite the last",
+                file=sys.stderr,
+            )
+            return 4
         try:
             window = run.analyse_window(
                 conn,
-                args.solver,
+                solvers,
                 args.start,
                 args.end,
                 network=args.network,
@@ -460,7 +514,17 @@ def run_analyse(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     if never_bid or reduced:
-        return 4
+        # Under `--all-solvers` the list came from the window, so nobody asked for the
+        # absent solver by name and there is no misreading to guard against: the run
+        # covers every solver that *could* be analysed, and says which could not.
+        if args.all_solvers:
+            print(
+                "(reported rather than fatal: --all-solvers derived the list from the "
+                "window, so an absent solver is an exclusion, not a bad argument)",
+                file=sys.stderr,
+            )
+        else:
+            return 4
 
     # A valuation failure means an auction could not be arbitrated at all, so its
     # contribution to every number above is silently missing. Validation measured zero
@@ -774,12 +838,30 @@ def report_summary(summary: validate.Summary, args: argparse.Namespace) -> None:
     print(
         f"\nfilter differs from DB:     "
         f"{summary.multi_pair_filter_mismatch}/{summary.multi_pair_solutions} "
-        f"multi-pair solutions ({summary.proxy_error_rate:.4%})"
+        f"multi-pair solutions ({summary.filter_mismatch_rate:.4%})"
     )
     print(
         "multi-pair bracket:         "
         + ", ".join(f"{k}={v}" for k, v in sorted(summary.bracket_counts.items()))
     )
+    print(
+        "filter verdict by:          "
+        + ", ".join(
+            f"{k}={v}" for k, v in sorted(summary.multi_pair_filter_scales.items())
+        )
+        + f"  (surplus fallback {summary.fallback_rate:.4%})"
+    )
+    print(
+        f"  of those, guesses that could have moved the winners: "
+        f"{summary.auctions_guess_could_matter} auctions"
+    )
+    if summary.score_anchor_failures:
+        # Never expected. Loud, because it means the fee port disagrees with the recorded
+        # score — a different problem from a policy simply not being recorded.
+        print(
+            f"SCORE ANCHOR FAILURES:      {summary.score_anchor_failures} solutions "
+            f"whose recomputed fees contradict proposed_solutions.score"
+        )
     if summary.filter_causes:
         print(
             "filter difference cause:    "
@@ -884,7 +966,11 @@ def write_json(
         "valuation_failures": summary.valuation_failures,
         "multi_pair_solutions": summary.multi_pair_solutions,
         "multi_pair_filter_mismatch": summary.multi_pair_filter_mismatch,
-        "proxy_error_rate": summary.proxy_error_rate,
+        "filter_mismatch_rate": summary.filter_mismatch_rate,
+        "multi_pair_filter_scales": summary.multi_pair_filter_scales,
+        "fallback_rate": summary.fallback_rate,
+        "score_anchor_failures": summary.score_anchor_failures,
+        "auctions_guess_could_matter": summary.auctions_guess_could_matter,
         "bracket_counts": summary.bracket_counts,
         "filter_causes": summary.filter_causes,
         "unexplained": summary.unexplained,

@@ -36,6 +36,7 @@ from .winner_selection import (
     arbitrate,
     compute_reference_outcomes,
     compute_reference_scores,
+    filter_guess_could_matter,
 )
 
 PRICE_IMBALANCE_THRESHOLD = 2
@@ -714,6 +715,22 @@ class AuctionCounterfactual:
     """Solutions whose sell-side and buy-side trade values disagree by more than
     `PRICE_IMBALANCE_THRESHOLD`, meaning a native price is probably wrong and every
     native-denominated number this auction contributes is fabricated with it."""
+    multi_pair_solutions: int = 0
+    """Solutions the fairness filter actually judged and that touch more than one directed
+    token pair — a single-pair solution is exempt, and a zero-value one is dropped before
+    the filter runs."""
+    multi_pair_filter_proxied: int = 0
+    """Of those, how many rested on the surplus fallback: some pair had no recorded score
+    *and* its surplus did not clear the baseline on its own. A pair whose surplus clears
+    the baseline is proved fair outright, fees or no fees, and is not counted. Zero in
+    surplus mode is not a claim of exactness: score is not the currency there."""
+    filter_guess_could_matter: bool = False
+    """Could a guessed verdict have changed the winners, on **either** side? False is a
+    proof that none could. Checked on both because the two sides have different baselines:
+    removing the solver that set one lowers it, and a dark pair that still fails the
+    lowered baseline is a solution the real mechanism might have un-filtered while we keep
+    it out — an understatement of the removal's impact that no recorded outcome can
+    catch."""
     block_deadline: int = 0
     """Deadline block, carried so Δrewards can be converted native -> COW at the
     auction's own accounting-period rate."""
@@ -956,7 +973,14 @@ def analyse_auction(
     by_uid = {v.bid.uid: v for v in valued}
 
     baseline = arbitrate(solutions, max_winners)
+    # Over the solutions the filter actually judged — zero-value ones are dropped before
+    # step 4 — and taken from the baseline side, whose baselines are the higher of the
+    # two, so the count never understates the approximation.
+    multi_pair = sum(1 for s in baseline.tested if len(s.pair_values) > 1)
     loo = leave_one_out(solutions, removed, max_winners)
+    guess_could_matter = filter_guess_could_matter(
+        baseline, max_winners
+    ) or filter_guess_could_matter(loo, max_winners)
     relaxed = un_filtered(baseline, loo, removed)
 
     # One inheritance source for both sides, so the settlement of a slot is a fact about
@@ -1070,6 +1094,9 @@ def analyse_auction(
         cap_double_inherited=cap_double_inherited,
         cap_orphans_loo=cap_orphans,
         price_suspect_uids=suspects,
+        multi_pair_solutions=multi_pair,
+        multi_pair_filter_proxied=len(baseline.proxied_uids),
+        filter_guess_could_matter=guess_could_matter,
         block_deadline=bundle.block_deadline,
         executed_volume_base=executed_volume,
         executed_orders_base=executed_orders,
@@ -1123,6 +1150,19 @@ class Analysis:
     two are comparable exactly when `auctions_skipped` is 0."""
     auctions_winner_set_changed: int = 0
     auctions_filter_relaxed: int = 0
+    multi_pair_solutions: int = 0
+    multi_pair_filter_proxied: int = 0
+    """The fairness filter's exactness, over the auctions actually arbitrated — i.e. the
+    ones a removed solver bid in (D10), not the whole window. How many multi-pair
+    solutions the filter judged, and how many of those rested on the surplus fallback
+    rather than on a recorded score or a surplus that cleared its baseline outright.
+    Score mode only — in surplus mode score is not the currency, so the second number
+    carries no information."""
+    auctions_filter_guess_could_matter: int = 0
+    """Auctions where a guessed verdict could have moved the winners on either side — the
+    counterfactual's residual filter uncertainty, and the one number here with no ground
+    truth behind it. Read beside `auctions_filter_relaxed`: that counts un-filterings
+    found, this counts auctions where one could have been missed."""
     auctions_newly_kept_won: int = 0
     auctions_baseline_differs_from_db: int = 0
 
@@ -1329,6 +1369,9 @@ class Analysis:
 
         self.auctions_with_solver += 1
         self.addresses_seen |= result.removed_present
+        self.multi_pair_solutions += result.multi_pair_solutions
+        self.multi_pair_filter_proxied += result.multi_pair_filter_proxied
+        self.auctions_filter_guess_could_matter += result.filter_guess_could_matter
         self.auctions_solver_won_baseline += result.solver_won_baseline
         self.auctions_winner_set_changed += result.winner_set_changed
         self.auctions_filter_relaxed += result.filter_relaxed

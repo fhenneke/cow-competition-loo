@@ -90,16 +90,37 @@ be repeated; the scenarios share one extraction pass and each gets its own repor
 a group member ends up bidding in none of the analysed auctions the run errors rather
 than passing a smaller group's numbers off under the full label.
 
+**`--all-solvers`** removes every solver that bid in the window, one at a time, without
+naming any of them:
+
+```bash
+uv run loo analyse --all-solvers --start 2026-07-01 --end 2026-08-01 --out "reports/{solver}.json"
+```
+
+The list comes from the window, not the catalogue: one scenario per catalogue name — with
+that name's rotated addresses removed together, as `--solver` would — and one per
+uncatalogued address, named by the address. It is mutually exclusive with `--solver` and
+needs the `{solver}` placeholder in `--out`.
+
+One semantic differs from `--solver`, deliberately. A named solver that ends up bidding in
+no analysed auction is an error, because its all-zero deltas would read as "removing this
+solver costs nothing". Under `--all-solvers` nobody named it — the price-suspect exclusion
+or `--limit` simply took it out — so it is reported and skipped, and the run still exits 0.
+
 | flag | |
 | --- | --- |
+| `--all-solvers` | one scenario per solver that bid in the window; excludes `--solver` |
 | `--outcome-rule` | `inherited` (default) or `assume-settled`, repeatable — all rules share the extraction pass; see below |
 | `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus |
 | `--limit N` | only the first N auctions — start here |
 | `--out report.json` | per-auction records, including both sides' reference scores and rewards; `{solver}` in the path becomes each solver's slug, `{rule}` the outcome rule |
 
 Exit code is 0 normally, 1 if the window has no auctions, 2 if any auction could not be
-valued, 4 if a `--solver` did not resolve (or the flags are inconsistent), 5 if the
-settlement source does not cover the window.
+valued, 4 if a `--solver` did not resolve (or the flags are inconsistent, or a named
+solver bid in no analysed auction), 5 if the settlement source does not cover the window.
+
+A month of mainnet with every solver removed in turn — 84,767 auctions, 26 scenarios —
+takes about 12 minutes, nearly all of it the single shared extraction pass.
 
 From Python, the same pipeline is one call — the CLI is a rendering around it:
 
@@ -299,34 +320,53 @@ empty window, 2 on a mismatch, 3 when the mart does not cover the window.
 
 ```
 === 7745 auctions, 98669 solutions ===
-winner set matches:         7740/7745
-filtered-out set matches:   7738/7745
-reference scores (ours):    7740/7745
+winner set matches:         7745/7745
+filtered-out set matches:   7745/7745
+reference scores (ours):    7745/7745
 reference scores (observed): 7745/7745
 pick on observed kept set:  7745/7745
 valuation failures:         0
 
-filter differs from DB:     7/5211 multi-pair solutions (0.1343%)
+filter differs from DB:     0/5211 multi-pair solutions (0.0000%)
 multi-pair bracket:         must_filter=4882, must_keep=66, undetermined=263
-filter difference cause:    model=2, proxy=5
+filter verdict by:          score=5208, surplus=3  (surplus fallback 0.0576%)
+  of those, guesses that could have moved the winners: 1 auctions
+
+no disagreements.
 
 every difference has a named cause — the validation gate is met.
 ```
 
-The two `observed` lines are the real checks. They hold the DB's own filter decisions fixed
-and re-run a single step of the algorithm — winner picking, then reference scores — so no
-approximation is in their path and both should be exact.
+The two `observed` lines hold the DB's own filter decisions fixed and re-run a single step
+of the algorithm — winner picking, then reference scores — so no approximation is in their
+path and both should always be exact.
 
-The other lines can differ from the DB, because the fairness filter compares solutions
-**per token pair** and the per-pair split of a solution's score is not stored anywhere. The
-filter compares user surplus on both sides instead. `bracket` bounds how much the unknown
-split could possibly matter, and `cause` classifies each difference:
+The other lines are the whole mechanism run end to end, and on this window they are exact
+too. They *can* differ, because the fairness filter compares solutions **per token pair**
+and that split of a solution's score is not stored anywhere. It is recomputed from the
+recorded fee policies and anchored on the recorded score. Baselines are never approximated
+— a single-pair solution's whole score sits on its one pair — so only the left side of a
+comparison can be missing, and there user surplus stands in as a *lower bound*: clearing
+the baseline on surplus alone proves the pair fair, and failing it is the only guess the
+filter makes. `filter verdict by` counts those guesses — 3 here, none of which changed a
+decision — and the line under it counts the auctions where one *could* have, by restoring
+every guess and re-picking the winners. A zero there is a proof that no guess mattered; in
+`analyse`, where there is no recorded outcome to compare against, it is the only handle on
+the filter's residual uncertainty. `bracket` bounds how much an unknown split could possibly matter, and `cause`
+classifies any difference:
 
-- `proxy` — the split genuinely decides it and cannot be known
-- `model` — provably a deliberate consequence of filtering on surplus rather than score
-- `bug` — no valid split explains it; the run exits 2
+- `proxy` — a guess, where the split genuinely decides and cannot be known
+- `model` — a guess, provably a deliberate consequence of comparing surplus
+- `bug` — no valid split explains it, **or** every pair was decided by a proof and it still
+  differs; the run exits 2
 
-See [PLAN.md §4.1](PLAN.md#41-m1-result) for the full argument.
+A `SCORE ANCHOR FAILURES` line appears only when the recomputed fees contradict a recorded
+score. It should never appear; it means the fee path is wrong, not that fee coverage is
+thin.
+
+See [PLAN.md §15](PLAN.md#15-m14--fee-aware-scoring--done) for the argument, and
+[§4.1](PLAN.md#41-m1-result) for what the filter looked like before the split was
+recomputed.
 
 ## Tests, lint, types
 

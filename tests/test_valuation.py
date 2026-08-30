@@ -15,6 +15,7 @@ from loo.valuation import (
     order_surplus,
     order_surplus_native,
     order_volume_native,
+    pair_score_split,
     solution_total,
     surplus_over,
     to_native,
@@ -233,6 +234,115 @@ class TestValueSolution:
         assert valuation.total == 100
         # Volumes track contributing orders exactly, like `order_surplus_native`.
         assert valuation.order_volume_native == {"a" * 112: 2100}
+
+
+class TestPairScoreSplit:
+    """The per-pair score split — the one quantity the DB does not record, and what the
+    fairness filter compares (PROPOSAL-fee-aware-scoring.md).
+
+    Deliberately **partial**: a pair the filter can decide must come back even when a
+    sibling pair is dark, since each pair's fairness test stands alone."""
+
+    def make(
+        self,
+        pair_surplus: dict[Pair, int],
+        pair_fee_native: dict[Pair, int] | None = None,
+        pairs_fees_unknown: frozenset[Pair] = frozenset(),
+    ) -> SolutionValuation:
+        return SolutionValuation(
+            pair_surplus=pair_surplus,
+            order_surplus_native={},
+            order_surplus_atoms={},
+            winner_pairs=frozenset(pair_surplus),
+            order_uids=frozenset(),
+            pair_fee_native=pair_fee_native or {},
+            pairs_fees_unknown=pairs_fees_unknown,
+        )
+
+    def test_a_single_pair_solution_takes_the_whole_recorded_score(self):
+        """No fee needs recomputing: the score is all on the one pair."""
+        valuation = self.make({(WETH, USDC): 60}, pairs_fees_unknown=frozenset({(WETH, USDC)}))
+        assert pair_score_split(valuation, 250).pairs == {(WETH, USDC): 250}
+
+    def test_a_single_pair_surplus_above_the_recorded_score_is_refused(self):
+        """Score is surplus plus a non-negative fee, so this cannot happen unless our
+        contributing-order set disagrees with the autopilot's. The one branch without
+        arithmetic to check still has an invariant to check."""
+        result = pair_score_split(self.make({(WETH, USDC): 300}), 250)
+        assert result.pairs == {}
+        assert result.anchor_failed
+
+    def test_no_contributing_pairs_yields_an_empty_split(self):
+        result = pair_score_split(self.make({}), 250)
+        assert result.pairs == {}
+        assert not result.anchor_failed
+
+    def test_every_pair_priced_is_surplus_plus_fee(self):
+        valuation = self.make(
+            {(WETH, USDC): 60, (DAI, USDC): 40},
+            pair_fee_native={(WETH, USDC): 100, (DAI, USDC): 50},
+        )
+        assert pair_score_split(valuation, 250).pairs == {
+            (WETH, USDC): 160,
+            (DAI, USDC): 90,
+        }
+
+    def test_a_sum_that_misses_the_recorded_score_is_refused(self):
+        """The recorded score anchors the split. A recomputation that does not add up to
+        it is wrong somewhere, so nothing from it is trusted."""
+        valuation = self.make(
+            {(WETH, USDC): 60, (DAI, USDC): 40},
+            pair_fee_native={(WETH, USDC): 100, (DAI, USDC): 50},
+        )
+        result = pair_score_split(valuation, 251)
+        assert result.pairs == {} and result.anchor_failed
+
+    def test_one_unpriced_pair_is_closed_by_the_residual(self):
+        """The 95.9% case among solutions with unrecorded fees — all of them filtered
+        out by the recorded competition."""
+        valuation = self.make(
+            {(WETH, USDC): 60, (DAI, USDC): 40},
+            pair_fee_native={(WETH, USDC): 100},
+            pairs_fees_unknown=frozenset({(DAI, USDC)}),
+        )
+        assert pair_score_split(valuation, 250).pairs == {
+            (WETH, USDC): 160,
+            (DAI, USDC): 90,
+        }
+
+    def test_two_unpriced_pairs_leave_only_those_pairs_dark(self):
+        """Two dark pairs cannot be told apart by the residual — but a *third*, priced
+        pair is unaffected and still comes back. This is what auction 13492893 needed:
+        its one pair with a baseline was priced, and the two dark ones had none."""
+        valuation = self.make(
+            {(WETH, USDC): 60, (DAI, USDC): 40, (USDC, WETH): 30},
+            pair_fee_native={(WETH, USDC): 100},
+            pairs_fees_unknown=frozenset({(DAI, USDC), (USDC, WETH)}),
+        )
+        assert pair_score_split(valuation, 500).pairs == {(WETH, USDC): 160}
+
+    def test_priced_pairs_exceeding_the_recorded_score_are_refused(self):
+        """The only anchor left once a pair is dark: fees are non-negative, so the
+        priced pairs alone cannot exceed the total."""
+        valuation = self.make(
+            {(WETH, USDC): 60, (DAI, USDC): 40, (USDC, WETH): 30},
+            pair_fee_native={(WETH, USDC): 100},
+            pairs_fees_unknown=frozenset({(DAI, USDC), (USDC, WETH)}),
+        )
+        result = pair_score_split(valuation, 150)
+        assert result.pairs == {} and result.anchor_failed
+
+    def test_a_residual_below_the_pairs_own_surplus_is_refused(self):
+        """The dark pair's floor is its own surplus, so `priced + floor > db_score`
+        contradicts fees being non-negative — and an input that wrong makes the priced
+        pairs no more trustworthy than the residual."""
+        valuation = self.make(
+            {(WETH, USDC): 60, (DAI, USDC): 40},
+            pair_fee_native={(WETH, USDC): 100},
+            pairs_fees_unknown=frozenset({(DAI, USDC)}),
+        )
+        result = pair_score_split(valuation, 180)
+        assert result.pairs == {} and result.anchor_failed
 
 
 class TestSolutionTotal:

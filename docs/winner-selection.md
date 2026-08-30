@@ -49,8 +49,9 @@ Given all bids for one auction:
 auction, **or** it is a JIT order whose owner is in
 `surplus_capturing_jit_order_owners`. In the autopilot the first test is "has an entry in
 the fee-policy map", which contains every auction order. In the DB the analogue is
-`competition_auctions.order_uids` — *not* the `fee_policies` table, which is only
-populated for executed orders.
+`competition_auctions.order_uids` — *not* the `fee_policies` table, whose own membership
+rule is a different one ([storage
+rule](analytics-db.md#fee-policies-cover-every-order-of-every-kept-solution)).
 
 ### Two asymmetries to preserve
 
@@ -95,49 +96,222 @@ Reproduced against three days of mainnet (2026-08-01 to 2026-08-04, 7,745 auctio
 | step 6 re-run on the recorded ranking vs. `reference_scores` | **7745 / 7745** |
 | per-order surplus vs. the dbt model | 93941 / 94565, all 624 differences exactly −1 (the model's rounding, [above](analytics-db.md#order_surplus_atoms_in_surplus_token-rounds)) |
 | solutions we could not value at all | **0** |
-| end-to-end winner set vs. `is_winner` | 7740 / 7745 |
-| end-to-end `filtered_out` | 7738 / 7745 |
+| end-to-end winner set vs. `is_winner` | **7745 / 7745** |
+| end-to-end `filtered_out` | **7745 / 7745** |
 
-The first two are the ones that matter: they hold the DB's own filter decisions fixed and
-re-run only the step under test, so no approximation is anywhere in their path — every
-quantity is either a recorded score or a token pair read off a trade. Both are exact.
+The first two hold the DB's own filter decisions fixed and re-run only the step under
+test, so no approximation is anywhere in their path — every quantity is either a recorded
+score or a token pair read off a trade.
 
-Every end-to-end difference therefore traces to step 4, the fairness filter, which is the
-one place the missing per-pair split enters.
+The last two are the whole mechanism run end to end, and since M14 they are exact as well:
+step 4 is the one step whose inputs the DB does not record, and recomputing the per-pair
+scores closed the last of it. **The competition reproduces with no observed
+approximation anywhere.**
 
-### The filter runs on surplus
+### The same, over a full month
+
+The three days above are the calibration window every milestone has used. July 2026 is the
+independent check, an order of magnitude larger and covering the whole month rather than a
+hand-picked stretch (2026-07-01..08-01, 85,487 auctions, 720 excluded for missing order
+data (0.84%, D17), **84,767 analysed, 946,995 solutions**):
+
+| check | result |
+| --- | --- |
+| winner set vs. `is_winner` | **84767 / 84767** |
+| `filtered_out` vs. the record | **84767 / 84767** |
+| reference scores, ours and observed | **84767 / 84767** each |
+| step 5 re-picked on the recorded kept set | **84767 / 84767** |
+| solutions we could not value at all | **0** |
+| filter decisions differing from the DB | **0 / 38,404** multi-pair solutions |
+| solutions whose recomputed fees contradict the recorded score | **0** of 946,995 |
+
+The last row is the one that was not previously testable. `pair_score_split` refuses a
+split whose parts do not add up against `proposed_solutions.score`, and over a month of
+data that refusal never fires — so the fee port of M13 holds at a scale 12x its calibration
+window, not merely on the window it was tuned against.
+
+Verdicts resting on a guess: **31 of 38,404 (0.081%)**, in 13 auctions where the guess
+could have moved the winners. Both rates are a shade higher than the three-day window's
+and the same order, so the calibration window was representative rather than lucky.
+
+### The filter runs on score
 
 Scores are stored per solution, so the per-pair split step 4 compares is not recorded
-anywhere. Something has to stand in for it. Two things narrow the problem first: the pair
-*set* is exact regardless, since it comes from the trades and not from any value, and only
-5.3% of solutions touch more than one pair (5,211 of 98,669) — single-pair solutions are
-exempt from the filter outright.
+anywhere. It is however **recomputable**, and since M14 it is recomputed rather than
+proxied. Score is user surplus plus protocol fees; `stg_backend_data__fee_policies`
+records the policies of every auction order of every non-filtered-out solution ([storage
+rule](analytics-db.md#fee-policies-cover-every-order-of-every-kept-solution)); and
+`loo/fees.py` reproduces `protocol_fees` to the wei. `valuation.pair_score_split` puts the
+two together, and **anchors the result on the recorded score** so the split is never a
+reconstruction floating free of the record:
 
-**Both sides of the comparison use native user surplus**: a batch's surplus on a pair
-against the best surplus any single-pair solution reached on that pair. Nothing is invented
-and the units match. Solution *totals* remain recorded scores, so ranking, winner picking
-and reference scores are unaffected — per-pair values feed the filter and nothing else, and
-in score mode a solution's total deliberately exceeds the sum of its pair values by its
-protocol fees.
+1. **One pair in the solution** — the whole score sits on it. Exact from the record alone,
+   no fee needed.
+2. **A priced pair** — `surplus + fee`, both the protocol's own per-order quantities.
+   Where *every* pair is priced the sum must return the recorded score to the wei, or
+   nothing from that solution is trusted.
+3. **The last unpriced pair** — with exactly one pair dark, the residual
+   `score − Σ(priced pairs)` is its score exactly.
 
-Two alternatives were built and measured before being removed, since the result is worth
-recording. Both tried to keep the comparison on the *score* scale: `scaled` split a batch's
-score across its pairs in proportion to surplus and left single-pair baselines at full
-score; `raw` put surplus on the left and full-score baselines on the right. Over the
-three-day window:
+Case 2 covers every solution the arbitrator kept, by construction — their orders' policies
+are all recorded. Every branch is checked against the record, and a check that fails
+discards the whole solution's split rather than trusting part of it: `PairScores.anchor_failed`
+says the fee path is wrong *here*, which `validate` counts separately so that a broken fee
+port on some new chain cannot be read as that chain having thin fee coverage.
+
+Baselines do not come through this function at all — see below.
+
+#### One currency, and surplus as a lower bound
+
+The filter compares **one** quantity against **one** set of baselines. It is tempting to
+think a pair whose score is unrecorded needs a second scale to be compared in — an earlier
+cut of M14 built exactly that, two baseline maps and a per-solution choice between them —
+but it does not, for two reasons.
+
+**Baselines are never missing.** Only solutions touching exactly one pair set a baseline
+(step 3), and such a solution puts its whole value on that pair, so the baseline is simply
+its recorded `total` — no decomposition, no fee, nothing to recover. That is what the Rust
+does too (`compute_baseline_scores` reads the solution's score). So the right-hand side of
+every comparison is exact by construction; only the left can be dark.
+
+**Surplus is not another currency, it is a lower bound.** Protocol fees are non-negative,
+so a dark pair's score is at least its user surplus. Substituting the surplus therefore
+gives a comparison that can still *prove* fairness and can never fabricate it:
+
+| dark pair | verdict |
+| --- | --- |
+| `surplus >= baseline` | **proved fair** — the score is at least the surplus, so it clears too. No fee needed. |
+| `surplus < baseline` | **unknown** — the missing fee genuinely decides. The filter drops it. |
+
+The asymmetry is the whole design: a dark pair can only ever make the filter *stricter*
+than the protocol was, never looser. It cannot keep a solution the protocol dropped for a
+reason we cannot see — which is exactly the failure mode the pre-M14 filter had, where all
+7 of its differences were false keeps.
+
+That also makes "how approximate is this run" answerable precisely. A comparison is a guess
+only when an inexact value fails its baseline; an inexact value that clears it is a proof,
+and so is a pair with no baseline at all. `Ranking.proxied_uids` records exactly those
+solutions, and nothing else.
+
+#### One dark pair must not blind the pairs beside it
+
+The other half of the same point: `is_fair` is a conjunction of **independent** per-pair
+comparisons, so a pair needs an exact score only when it has a baseline it cannot clear on
+surplus alone. Knowing three pairs out of four is worth exactly as much as knowing four
+when the fourth has no baseline.
+
+The first cut of M14 required the *whole* solution's split before using score at all, and
+auction 13492893 is what that cost:
+
+| pair | surplus | fee | score | baseline |
+| --- | --- | --- | --- | --- |
+| `40e3d1→dac17f` | 156,869,920,027,575 | 189,496,907,610,271 | **346,366,827,637,846** | **388,866,676,327,956** |
+| `a0b869→c02aaa` | 49,666,314,933,687 | unrecorded | — | 0 |
+| `c02aaa→7f39c5` | 559,190,890 | unrecorded | — | 0 |
+
+The pair that decides the solution is priced and fails its baseline outright; the two dark
+pairs have no baseline and cannot affect the verdict however they are valued. An
+all-or-nothing rule throws that away, falls back on all three, and keeps a solution the
+protocol dropped — which then outscores the recorded winner and takes the auction.
+
+Note also the shape of that first row: the baseline-setter is a *fee-dominated* solution,
+surplus 5.3e8 against a score of 3.9e14. The bar the batch has to clear is **4x higher** on
+the score scale than a surplus-derived one would be. That is the bias this whole change
+removes, in one auction.
+
+#### What it measures out at
+
+Over the three-day window the fallback decides **3 of 5,211 multi-pair solutions
+(0.058%)** — every other verdict is a proof, either from a recorded score or from a surplus
+that clears its baseline on its own. Measured against the recorded filter:
 
 | filter | decisions differing from the DB | auctions with a different winner set |
 | --- | --- | --- |
-| **surplus on both sides** | **7 / 5211 (0.13%)** | **5** |
+| **per-pair score, surplus as a lower bound (current)** | **0 / 5211** | **0** |
+| per-pair surplus on both sides (until M14) | 7 / 5211 (0.13%) | 5 |
 | `scaled` | 196 / 5211 (3.8%) | 76 |
 | `raw` | 200 / 5211 (3.8%) | 74 |
 
-Surplus wins by more than an order of magnitude despite being the one option that does not
-try to reconstruct the score split. The reason is that both sides move together: `scaled`
-and `raw` compare a batch against a baseline inflated by that baseline solution's own
-protocol fees, a systematic bias no split of the batch's score can correct for.
+The last two are earlier attempts, built and measured in M1 before being removed, and
+worth recording because they look like what M14 does and are not. `scaled` split a batch's
+score across its pairs in proportion to surplus and left single-pair baselines at full
+score; `raw` put surplus on the left and full-score baselines on the right. Both are 30×
+further from the recorded filter than the plain surplus comparison they replaced, because
+both compare a batch against a baseline inflated by *that baseline solution's* own
+protocol fees — a systematic bias no split of the batch's score can correct for. Surplus on
+both sides cancelled the bias; recomputing the fees removes it at its source, which is why
+it beats both outright rather than landing between them.
+
+#### Counting the guesses that could have mattered
+
+A guess is only a problem where it decides something. Most sit on solutions that lose
+either way, so the raw count of guesses overstates the uncertainty — sometimes by all of
+it.
+
+`filter_guess_could_matter` (`winner_selection.py`) measures the part that is left. Every
+guessed verdict is a *filter* — `proxied` means a pair failed its baseline on an inexact
+value, and a failed pair is what filters a solution — so the opposite outcome is always
+"kept". The check restores **every** guess at once and re-picks the winners.
+
+**`False` is a proof, not a sample.** If restoring all of them leaves the winner set alone
+then none of them won, which means each was blocked by a solution that wins in every
+scenario; restoring only some leaves those blockers in place, so no subset can move the
+winners either.
+
+This is the number the **counterfactual** needs, and the only one it has. `validate` can
+always check its answer against the record; a leave-one-out run cannot, because the auction
+it is describing never happened. It matters most on the removal side: taking out the solver
+whose solution set a baseline lowers that baseline, which is what un-filters solutions
+(`un_filtered`) — and a dark pair that still fails the *lowered* baseline is a solution the
+real mechanism might have un-filtered while we keep it out. `auctions_filter_relaxed`
+counts the un-filterings found; this counts the auctions where one could have been missed.
+`analyse` checks both sides and reports
+`auctions_filter_guess_could_matter`; `validate` reports the same over the recorded
+arbitration.
+
+Over the three-day window there are **3** guessed verdicts, and in **1** auction the guess
+could have moved the winners — auction 13493777, solution 3. Over the whole of July:
+**31** guesses, **13** sensitive auctions. That is the honest size of the filter's residual
+uncertainty on mainnet.
+
+The counterfactual number is the one to weigh, and it comes from removing each of July's
+26 solvers in turn (763,067 solver-auctions, 539,972 multi-pair solutions judged): **217
+guessed verdicts, 76 auctions where one could have moved the winners** — against **1,507
+auctions where removing a solver genuinely un-filtered a solution**. So the uncertainty
+runs at roughly 5% of the effect it perturbs. It also tracks solver size and disappears
+entirely for the small ones (Gnosis_BalancerSOR, Rosato, AlgoLabs, Flowdesk, Odos: zero),
+which is what it should do — a guess needs a dark pair *and* a baseline it cannot clear.
+
+All three guesses agree with the recorded competition, which filtered all three solutions
+too, and none is a close call: the failing pair's surplus falls short of its baseline by
+
+| auction | surplus | baseline | short by | could move winners |
+| --- | --- | --- | --- | --- |
+| 13493420 | 7.64e13 | 4.65e14 | 6x | no |
+| **13493777** | 9.72e8 | 2.46e14 | **253,000x** | **yes** |
+| 13496284 | 5.34e8 | 4.89e16 | 91,000,000x | no |
+
+A fee large enough to close a 253,000x gap on a single pair is not a realistic quantity —
+the median score/surplus ratio is 1.08 and p90 is
+2.70 ([measured](#measured-divergence--surplus-is-not-a-stand-in-for-score)) — so in
+practice all three verdicts are safe. The check does not know that: it asks only whether
+the *pick* would change if the flip happened, which is a structural question, not a
+plausibility one. Keeping the two separate is deliberate. A structural "no" is a proof and
+survives any future window; "the fee would have to be absurd" is a judgement that holds
+until some chain's fee policies make it false.
+
+Reference scores are deliberately **not** covered: a guess could move a reward without
+moving a winner, and the check does not look for that.
 
 #### Bounding what the missing split can cost
+
+The bracket below is what `validate` uses to name a *fallback* difference. There are none
+in the calibration window any more, and it is deliberately kept anyway: it applies the same
+lower-bound argument the filter does, but **jointly** across a solution's pairs rather than
+one at a time, so it can decide cases the per-pair test cannot and remains a valid statement
+about the recorded competition either way. Where every pair was decided by a proof the
+bracket is strictly weaker than what is known, so `filter_cause` checks that first — a
+difference with no fallback in it is a `bug`, with nothing left to excuse it.
 
 The unknown split is not unconstrained. For a solution with recorded score `S` and per-pair
 user surplus `u_i`, every valid per-pair score split satisfies
@@ -165,10 +339,12 @@ cannot see two baselines that are individually reachable but do not fit *togethe
 decided only 79% and its `undetermined` band was 21%. The joint feasibility test is exact:
 each verdict now proves what it claims.)
 
-The bracket deliberately uses **score** baselines, not the surplus ones the filter itself
-compares against, which is what makes it a statement about the recorded competition rather
-than about our model. A decisive verdict therefore binds the DB absolutely, and binds us in
-one direction only:
+The bracket uses **score** baselines throughout, which is what makes it a statement about
+the recorded competition rather than about our model. (In score mode those are also the
+baselines the filter itself compares against wherever it runs on the score scale; a
+fallback solution meets the surplus baselines instead, and it is exactly for those that the
+bracket still has work to do.) A decisive verdict binds the DB absolutely, and binds the
+fallback in one direction only:
 
 - Surplus baselines sit at or below score baselines, so keeping a solution the score filter
   drops (`must_filter`) is expected. `validate` reports it as `model`.
@@ -176,13 +352,12 @@ one direction only:
   *score* baseline, which is at least its surplus baseline, so the surplus filter keeps it
   too. Dropping it anyway means our baselines or valuation are wrong: `bug`.
 
-All 7 differences have a uniform shape: every one is the recorded filter dropping a batched
-solution that the surplus filter keeps, and all 7 involve a partially fillable order, where
-surplus and score diverge most. **For 2 of the 7 the bracket is decisive** (`must_filter`,
-auctions 13488644 and 13490028): the recorded decision is forced, so keeping the solution
-is provably the deliberate consequence of filtering on surplus — `model`, not an unknown.
-The other 5 fall in the `undetermined` band, where the missing split genuinely decides:
-`proxy`.
+No difference survives in this window, so no cause is assigned. Worth recording what used
+to be here: all seven pre-M14 differences had one shape — the recorded filter dropping a
+batched solution the surplus comparison keeps, on a partially fillable order, where surplus
+and score diverge most. Two of them (auctions 13488644 and 13490028) the bracket had proven
+`must_filter`, so keeping them was a provable consequence of filtering on surplus. The
+recomputed split decides all seven the way the protocol did.
 
 ### `max_solutions_per_solver` is applied before `arbitrate`
 
