@@ -91,9 +91,12 @@ uv run loo analyse --network mainnet \
 
 - **One `analyse` per network**, repeated for every chain each solver bid on — a solver
   with ten chains gets ten rows, including the rows that came back zero. Silently
-  dropping a chain overstates concentration.
-- **Both outcome rules**, always — they share the extraction pass, so the second is
-  nearly free. `inherited` carries the page; `assume-settled` is not a column but the
+  dropping a chain overstates concentration. `--all-solvers` derives the list from the
+  window instead of naming solvers by hand, which is also one query rather than one per
+  solver (D26).
+- **Both outcome rules**, always — they share the extraction pass, so only the arbitration
+  repeats. Measured on a 26-solver mainnet month: **16.3 min for two rules against 11.9
+  for one, 1.38x**. `inherited` carries the page; `assume-settled` is not a column but the
   settlement caveat needs it to say how far the figures move. Do not add a third
   scenario.
 - **Solver names match exactly** — `Arc` is not `Arctic`, and one name can span several
@@ -102,22 +105,58 @@ uv run loo analyse --network mainnet \
 - `uv run loo compare out/*.json` across every network is the number source for the
   table. Its row labels are the column labels the page should use.
 - A full month per chain takes minutes and re-imports `loo/` on each invocation — do not
-  edit `loo/` while a run is in flight, and check `REPORT_FORMAT` (currently 6) matches
+  edit `loo/` while a run is in flight, and check `REPORT_FORMAT` (currently 8) matches
   the reports; `compare` refuses stale ones.
 
 ## Page structure
 
 Follow [reference/template.html](reference/template.html) section for section: header,
-sign note, `Summary`, the solver-chain table, the fee-split section, `Reading each
-solver`, `Caveats`, method footnote. The order is fixed so successive months are
-diffable against each other.
+sign note, `Summary`, the solver table, the fee-split section, `Reading each solver`,
+`Caveats`, method footnote. The order is fixed so successive months are diffable against
+each other.
 
-Table conventions:
+### Solvers nest, chains filter
 
-- **Two rows per solver-chain, not one.** A `tr.main` carries one value per column and
-  nothing else; a `tr.detail` beneath it carries that value's supporting figures in
+**One row per solver, expandable to that solver's chains.** Chains are not a level of the
+hierarchy and not a second table; they are a filter over one table.
+
+The asymmetry that fixes this is which sums are scenarios. Removing a solver from mainnet
+and removing it from base are **independent counterfactuals**, so adding a solver's chains
+together is a real scenario — that solver absent everywhere. Adding *different solvers'*
+rows on one chain is not a scenario at all: they are mutually exclusive removals, and the
+field cannot lose all of them at once and still have anyone left to replace them. So a
+solver total is a number and a chain total is not. Never put a per-chain band carrying
+summed solver figures on the page; if a caveat is needed to disclaim a total, the total
+should not be there.
+
+- **A chain filter, not a chain axis.** A pill row selects one chain and flattens the
+  table to that chain's solvers, **re-sorted by that chain's Δsurplus** — otherwise one
+  chain's numbers are read in another's ranking. That is the "which solver matters here"
+  view, and it is the same table, not a new one.
+- **The single-chain case must degenerate exactly.** With one chain in scope the aggregate
+  *is* the chain row: render it flat, with native figures rather than dashes, and no
+  disclosure control. A one-chain run and a one-chain filter must both produce precisely
+  the table a chain-less page would.
+
+### What aggregates across chains, and what does not
+
+A solver row is not a row of sums; two of its cells cannot exist. Render those as an em
+dash with a `title` saying why — a blank cell reads as a missing figure, and a zero would
+be a lie.
+
+| quantity | aggregate | why |
+| --- | --- | --- |
+| USD deltas, order and auction counts | sum | the reason USD leads the format |
+| coverage share, win share | ratio of the sums | Σ orders / Σ executions |
+| largest-auction share | recompute | biggest single auction's \|Δsurplus\| in USD over the USD total |
+| Δprice, both conditionings | recompute | USD-converted moved Δsurplus over USD-converted volume, so each chain's own ratio stays exact and only the cross-chain blend is weighted at median rates |
+| **native amounts** | **never** | ETH + xDAI is not a quantity |
+| **median moved order** | **never** | a median of medians is not a median |
+
+- **Two rows per entry, not one**, at both levels. A `tr.main` carries one value per column
+  and nothing else; a `tr.detail` beneath it carries that value's supporting figures in
   smaller muted print, each on its own line, aligned under the column it qualifies. Only
-  the detail row draws the rule, so the pair reads as a single entry, and the chain cell
+  the detail row draws the rule, so the pair reads as a single entry, and the first cell
   spans both with `rowspan="2"`. This is what keeps the table narrow: a cell holding
   `−$184,150` sets a ~130px column, while the same cell holding the whole `·`-joined
   sub-line sets a ~300px one.
@@ -128,21 +167,24 @@ Table conventions:
   on its own. Detail cells take `vertical-align: top` so a one-line detail sits under its
   value instead of centring against the tallest cell in the row.
 - **Headers name the quantity, never the period.** No `/ month` in a column label, and
-  none in the group bands either — the same page has to render a week, a month or a
+  none in the chain pills either — the same page has to render a week, a month or a
   quarter. The window is stated once, in bold, in the subtitle, followed by the sentence
   that every table figure is a **total over that window, not a rate**. In prose say "the
   window" rather than "the month" wherever a figure is being described.
-- **No positional selectors on cells.** The chain cell spans both rows, so the first
-  `td` of a detail row is the Δsurplus detail, not the chain — a `td:first-child` rule
-  meant for the chain silently left-aligns one number column instead. Target cells by
-  class (`td.chain`, `td.group`, `td.sec`).
+- **No positional selectors on cells.** The first cell spans both rows, so the first
+  `td` of a detail row is the Δsurplus detail, not the label — a `td:first-child` rule
+  meant for the label silently left-aligns one number column instead. Target cells by
+  class (`td.chain`, `td.sec`).
 - Measure it rather than eyeballing it: the table should come in under the 64rem column
   with no horizontal scroll, and every cell's computed `text-align` should match its
   role. Rendering the table alone in a scratch page, reading `table.scrollWidth`, and
   sweeping `getComputedStyle(cell).textAlign` catches both faults in one pass.
-- Group solvers with a `td.group` band carrying that solver's totals; rows within a group
-  ordered by Δsurplus magnitude, descending.
+- Solver rows ordered by Δsurplus magnitude, descending; a solver's chain rows in the
+  same order beneath it. The order re-sorts when a chain filter is applied.
 - USD on the value row, native amount first on the detail row beneath it.
+- The disclosure control is a real `<button>` inside the label cell with `aria-expanded` —
+  a `<tr>` is not focusable, and a table nobody can open from the keyboard is a table with
+  a hidden half.
 
 **Colour is the accounting convention, not a verdict.** Negative deltas take `--neg`;
 positive deltas take plain `--ink`; there is **no green in the palette** and no `--pos`
@@ -168,11 +210,24 @@ group reads as one band whatever the signs in it happen to be.
 - [ ] Signs read as counterfactual − actual, and the sign note is present.
 - [ ] Gross and net fees are labelled distinctly everywhere they appear.
 - [ ] Excluded auctions (price-suspect, missing-JIT, fee-unpriced) are counted on the page.
-- [ ] No chain a solver bid on is missing from its group.
+- [ ] No chain a solver bid on is missing from its rows, including the ones that came back zero.
 - [ ] Anything the run measured but the page does not show is named once in the
       footnote, so a reader knows it exists.
 - [ ] The register list above was applied to the prose, not just to the headings.
 - [ ] `artifact-design` skill loaded before writing the HTML.
+- [ ] No total sums across solvers anywhere on the page.
+- [ ] Solver rows show an em dash — not a blank, not a zero — for native amounts and the
+      median moved order, and single-chain solvers render flat with real native figures.
+- [ ] Every chain filter was exercised, including the one that leaves a single chain, and
+      the row counts came out at twice the solver count.
+
+The page's script cannot be checked by opening the file: a local preview renders it as a
+static snapshot with the table empty. Run the render logic under JavaScriptCore
+(`/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc`) against the
+real data with a small `document` stub, asserting the row counts per filter state, that a
+single-chain solver's aggregate equals its own chain figures, and that a hand-summed
+multi-chain solver matches. That catches an empty table before publishing, which a
+screenshot of a snapshot never will.
 
 Save to `artifacts/<window>-<slug>.html`, commit it, then publish with the Artifact tool
 (`favicon` stable across redeploys, `<title>` stable, same file path to redeploy). To

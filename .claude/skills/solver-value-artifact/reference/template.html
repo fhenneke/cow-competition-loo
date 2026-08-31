@@ -167,6 +167,32 @@
     max-width: 70ch;
     margin: 1.4rem 0;
   }
+
+  /* --- chain filter and the two-level table ------------------------------- */
+  .chainfilter { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 1.4rem 0 0.2rem; }
+  .pill {
+    font: inherit; font-size: 0.78rem; font-weight: 600;
+    color: var(--muted); background: var(--surface);
+    border: 1px solid var(--line); border-radius: 999px;
+    padding: 0.25rem 0.8rem; cursor: pointer;
+  }
+  .pill[aria-pressed="true"] {
+    color: var(--surface); background: var(--accent); border-color: var(--accent);
+  }
+  .pill:focus-visible, .disclose:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* The disclosure is a real button: a <tr> takes no focus, and a table whose second
+     half only opens on a mouse click is a table with a hidden half. */
+  .disclose {
+    font: inherit; font-size: 0.95rem; color: inherit; background: none;
+    border: 0; padding: 0; cursor: pointer; text-align: left;
+    display: inline-flex; align-items: baseline; gap: 0.35rem;
+  }
+  .tri { color: var(--muted); font-size: 0.7rem; width: 0.7rem; display: inline-block; }
+  td.chain.sub { padding-left: 1.9rem; }
+  tr.sub td { background: color-mix(in srgb, var(--chip-bg) 40%, transparent); }
+  /* Not a missing figure: the quantity does not exist across chains. Carries a title. */
+  .na { color: var(--muted); }
+  #scope { color: var(--muted); font-size: 0.82rem; }
 </style>
 
 
@@ -184,6 +210,13 @@
 
   The outcome rule is never a column header — the sign note states how settlement is
   handled, and the settlement caveat carries the assume-settled comparison.
+
+  One row per solver, expandable to that solver's chains; a chain is a filter over this
+  table, never an axis of it. A solver's chains sum because removing it from each chain is
+  an independent counterfactual; different solvers on one chain do not, because those
+  removals are mutually exclusive. So there is no per-chain total band anywhere.
+
+  Fill DATA from the run's reports. Everything below the table renders itself.
 
   Fill every PLACEHOLDER. Delete nothing structural: a section that has nothing to say
   still gets its heading and one sentence saying the run produced nothing there.
@@ -232,11 +265,17 @@
     <strong>share of all executed orders</strong> that would not have traded. The two
     muted columns to the right carry supporting detail. Definitions are in the footnote,
     limits in the caveats.</p>
+    <div class="chainfilter" role="group" aria-label="Chain">
+      <button class="pill" data-chain="" aria-pressed="true">All chains</button>
+      <!-- PLACEHOLDER one <button class="pill" data-chain="ID" aria-pressed="false">ID</button> per chain;
+           omit this whole block when the run has a single chain -->
+    </div>
+    <p id="scope"></p>
     <div class="tablewrap">
       <table>
         <thead>
           <tr>
-            <th>Chain</th>
+            <th>Solver</th>
             <th>Δsurplus</th>
             <th>Δprice, all traded volume</th>
             <th>Δprotocol and partner fees</th>
@@ -245,26 +284,7 @@
             <th class="sec">Largest auction share</th>
           </tr>
         </thead>
-        <tbody>
-          <tr><td class="group" colspan="7">PLACEHOLDER solver — Δsurplus, Δprotocol fee, chain count</td></tr>
-          <tr class="main">
-            <td class="chain" rowspan="2">PLACEHOLDER chain <span class="chip">NATIVE</span></td>
-            <td class="num-neg">−$0</td>
-            <td class="num-neg">−0.000 bps</td>
-            <td class="num-neg">−$0</td>
-            <td>0.0%</td>
-            <td class="sec">0.0%</td>
-            <td class="sec">0%</td>
-          </tr>
-          <tr class="detail">
-            <td>−0.0000 NATIVE</td>
-            <td>still-traded −0.00 bps<br>median −0.00 bps<br>0 moved</td>
-            <td>−0.0000 NATIVE<br>protocol −$0<br>partner −$0<br>N auctions unpriced</td>
-            <td>0 orders<br>−$0 surplus</td>
-            <td>0 won<br>bid 0.0%</td>
-            <td></td>
-          </tr>
-        </tbody>
+        <tbody id="rows"></tbody>
       </table>
     </div>
     <p class="footnote">“Δsurplus” is the change in user surplus, summed over the window. “Δprice, all traded volume” spreads the moved-order Δsurplus over the window’s
@@ -384,3 +404,145 @@
   </section>
 
 </main>
+
+<script>
+// PLACEHOLDER — emit from the run's reports; see SKILL.md.
+const DATA = {chains: [], solvers: []};
+const M = "−";
+const fmtUsd = v => {
+  if (!v) return "$0";
+  const s = v < 0 ? M : "+", m = Math.abs(v);
+  return m >= 100 ? `${s}$${Math.round(m).toLocaleString("en-US")}`
+                  : `${s}$${m.toFixed(2)}`;
+};
+const fmtNat = (v, sym) => v ? `${v < 0 ? M : "+"}${Math.abs(v).toLocaleString("en-US",
+  {minimumFractionDigits: 4, maximumFractionDigits: 4})} ${sym}` : `0 ${sym}`;
+const fmtBps = (v, p = 3) => v === null || v === undefined ? "n/a"
+  : (v === 0 ? "0.000 bps" : `${v < 0 ? M : "+"}${Math.abs(v).toFixed(p)} bps`);
+const pct = (v, p = 2) => v === null || v === undefined ? "n/a" : `${(v * 100).toFixed(p)}%`;
+const neg = v => v < 0 ? "num-neg" : "num-pos";
+
+/* Aggregate one solver across the chains in scope.
+   USD sums; native does not (ETH + xDAI is not a number) and neither does a median of
+   medians, so both come back null and render as an em dash. */
+function aggregate(rows) {
+  const sum = k => rows.reduce((a, r) => a + (r[k] || 0), 0);
+  const volUsd = rows.reduce((a, r) => a + r.window_volume * r.rate, 0);
+  const movedUsd = rows.reduce((a, r) => a + r.pi_delta * r.rate, 0);
+  const baseUsd = rows.reduce((a, r) => a + r.pi_volume * r.rate, 0);
+  const usd_s = sum("usd_s");
+  const biggest = rows.reduce((a, r) =>
+    Math.abs(r.largest_usd) > Math.abs(a) ? r.largest_usd : a, 0);
+  return {
+    usd_s, usd_f: sum("usd_f"), usd_pr: sum("usd_pr"), usd_pa: sum("usd_pa"),
+    usd_only: sum("usd_only"),
+    native_s: null, native_f: null, median: null, sym: null,
+    bps: volUsd ? movedUsd * 10000 / volUsd : null,
+    still: baseUsd ? movedUsd * 10000 / baseUsd : null,
+    moved: sum("moved"), moved_auctions: sum("moved_auctions"),
+    orders: sum("orders"), executions: sum("executions"),
+    cov: sum("executions") ? sum("orders") / sum("executions") : null,
+    won: sum("won"), analysed: sum("analysed"), bid: sum("bid"),
+    unpriced: sum("unpriced"),
+    share: usd_s ? Math.abs(biggest) / Math.abs(usd_s) : null,
+  };
+}
+
+function cells(d, isAgg) {
+  const warn = d.share !== null && d.share >= 0.30 ? " ⚠" : "";
+  const dash = '<span class="na" title="not summable across chains">—</span>';
+  return {
+    main: [
+      `<td class="${neg(d.usd_s)}">${fmtUsd(d.usd_s)}</td>`,
+      `<td class="${neg(d.bps || 0)}">${fmtBps(d.bps)}</td>`,
+      `<td class="${neg(d.usd_f)}">${fmtUsd(d.usd_f)}</td>`,
+      `<td>${pct(d.cov)}</td>`,
+      `<td class="sec">${d.analysed ? pct(d.won / d.analysed, 1) : "n/a"}</td>`,
+      `<td class="sec">${d.share === null ? "n/a" : pct(d.share, 0)}${warn}</td>`,
+    ],
+    detail: [
+      `<td>${isAgg ? dash : fmtNat(d.native_s, d.sym)}</td>`,
+      `<td>still-traded ${fmtBps(d.still, 2)}<br>median ${
+        isAgg ? dash : fmtBps(d.median, 2)}<br>${d.moved.toLocaleString("en-US")} moved</td>`,
+      `<td>${isAgg ? dash : fmtNat(d.native_f, d.sym)}<br>protocol ${fmtUsd(d.usd_pr)}<br>partner ${
+        fmtUsd(d.usd_pa)}${d.unpriced ? `<br>${d.unpriced} auctions unpriced` : ""}</td>`,
+      `<td>${d.orders.toLocaleString("en-US")} orders<br>${fmtUsd(d.usd_only)} surplus</td>`,
+      `<td>${d.won.toLocaleString("en-US")} won<br>bid ${
+        d.analysed ? pct(d.bid / d.analysed, 1) : "n/a"}</td>`,
+      "<td></td>",
+    ],
+  };
+}
+
+/* ---- state ------------------------------------------------------------- */
+const state = { chain: null, open: new Set() };
+const single = DATA.chains.length === 1;
+
+function scoped(solver) {
+  return DATA.chains
+    .filter(c => !state.chain || c.id === state.chain)
+    .map(c => solver.chains[c.id])
+    .filter(Boolean);
+}
+
+function render() {
+  const body = document.getElementById("rows");
+  const out = [];
+  const entries = DATA.solvers
+    .map(s => ({ s, rows: scoped(s) }))
+    .filter(e => e.rows.length)
+    .map(e => ({ ...e, agg: aggregate(e.rows) }))
+    .sort((a, b) => Math.abs(b.agg.usd_s) - Math.abs(a.agg.usd_s));
+
+  for (const { s, agg } of entries) {
+    const chainIds = DATA.chains.filter(c => s.chains[c.id] &&
+      (!state.chain || c.id === state.chain)).map(c => c.id);
+    // With one chain in scope the aggregate *is* the chain row: render it flat, with
+    // that chain's native figures rather than a dash, and no disclosure control.
+    const flat = chainIds.length === 1;
+    const d = flat ? s.chains[chainIds[0]] : agg;
+    const c = cells(d, !flat);
+    const open = state.open.has(s.name);
+    const label = flat && !state.chain && !single
+      ? `${s.name} <span class="chip">${chainIds[0]}</span>` : s.name;
+    const control = flat ? label
+      : `<button class="disclose" aria-expanded="${open}" data-solver="${s.name}">
+           <span class="tri" aria-hidden="true">${open ? "▾" : "▸"}</span>${s.name}
+           <span class="chip">${chainIds.length} chains</span></button>`;
+    out.push(`<tr class="main"><td class="chain" rowspan="2">${control}</td>${c.main.join("")}</tr>`);
+    out.push(`<tr class="detail">${c.detail.join("")}</tr>`);
+
+    if (open && !flat) {
+      for (const id of chainIds) {
+        const cd = cells(s.chains[id], false);
+        out.push(`<tr class="main sub"><td class="chain sub" rowspan="2">
+          <span class="chip">${id}</span></td>${cd.main.join("")}</tr>`);
+        out.push(`<tr class="detail sub">${cd.detail.join("")}</tr>`);
+      }
+    }
+  }
+  body.innerHTML = out.join("\n");
+  document.getElementById("scope").textContent = state.chain
+    ? `${entries.length} solvers that bid on ${state.chain}`
+    : `${entries.length} solvers, ${DATA.chains.length} chains`;
+}
+
+document.getElementById("rows").addEventListener("click", e => {
+  const b = e.target.closest(".disclose");
+  if (!b) return;
+  const n = b.dataset.solver;
+  state.open.has(n) ? state.open.delete(n) : state.open.add(n);
+  render();
+});
+
+document.querySelectorAll(".pill").forEach(p => p.addEventListener("click", () => {
+  state.chain = p.dataset.chain || null;
+  state.open.clear();
+  document.querySelectorAll(".pill").forEach(q =>
+    q.setAttribute("aria-pressed", String(q === p)));
+  render();
+}));
+
+render();
+</script>
+
