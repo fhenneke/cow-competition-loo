@@ -10,6 +10,9 @@ on user surplus, solver rewards, and order coverage.
 - **[docs/winner-selection.md](docs/winner-selection.md)** — the algorithm, Rust source
   map, score/surplus formulas.
 - **[docs/rewards.md](docs/rewards.md)** — reward and cap formulas.
+- **[docs/quotes.md](docs/quotes.md)** — the quote competition: ClickHouse coverage, how
+  the winner is actually picked, the order↔request match, and what the quote side does and
+  does not measure.
 - **[solver-value-artifact skill](.claude/skills/solver-value-artifact/SKILL.md)** —
   writing a run up as a published artifact: which four measures lead, what stays
   visually quiet, and the neutral register the pages are written in. Read it before
@@ -86,6 +89,21 @@ Both are read-only references here. Do not modify them.
     `missing_data` collector
     ([details](docs/analytics-db.md#jit-orders-are-recorded-only-when-the-batch-settles)).
     The M1 window had zero of these — do not calibrate on it.
+14. **The quote winner need not bid on its order.** `analyse_auction` skips auctions the
+    removed solver never bid in, so anything wired through it that does not depend on the
+    solver's bid — the recharged price-improvement fee is the case in hand — has to be
+    routed past that early return, or it is dropped exactly where quoting and solving
+    solvers differ (D33). Likewise a quote-side *guard* (price suspect, gas over input) is
+    an excluded win and must run **after** the did-the-solver-win test; run first, it makes
+    every suspect order a win of every solver
+    ([both](docs/quotes.md#traps)).
+15. **`gold_quotes` does not hold every competition.** It is built off the `quote_requested`
+    event, and a competition whose event never arrived is in neither gold table — 0.6% of
+    requests, but the competitions behind a quarter of a day's orders (API callers). Link
+    through `raw_quotes.price_estimates` grouped by `request_id` before calling an order
+    unquoted, and never filter candidates on `quote_id` (`fast` is the one filter that
+    belongs: `order_quotes` never holds a fast quote)
+    ([measured](docs/quotes.md#the-gold-tables-do-not-hold-every-competition--link-through-the-raw-layer)).
 
 ## Environment
 

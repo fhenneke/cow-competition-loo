@@ -56,7 +56,16 @@ stays in the sections and docs each row links to; the milestone sections cite th
 | D24 | The coverage count gets a **window-level second reading**: only-with executions over every user-order execution the recorded winners traded in the window, **partially fillable included** — both sides counted per auction-order execution — with a distinct-order decomposition beneath it whose share exists for the fill-or-kill part only ([§12](#12-m10--coverage-share-of-all-traded-orders--done)) | quoting "of N compared" alone — it is relative to the solver's own auctions and overstates window-level dependence for a selective bidder (measured 35.2% vs under 1% for a solver bidding in 5.7% of auctions); a fill-or-kill-only share reusing D23's count — built first to avoid a format bump, revised in review: partially fillable orders dominate coverage exactly where coverage matters (xdai July: 5,316 of 5,698 distinct only-with orders) and the extraction already sees every execution, so the fuller denominator was judged worth format 5 and a sweep re-run; a distinct-order share for partially fillable orders — no window-wide distinct count exists and one would understate them exactly where they trade most | `counterfactual.recorded_executed_volume`, `Analysis.window_order_executions_base`, `aggregate.Report.coverage_share`, `coverage_share_fok` | — |
 | D26 | `--all-solvers` derives the scenario list from the **window**: one per catalogue name (rotated addresses together, D9) and one per uncatalogued address. A solver left with no analysed auction is then **reported and skipped**, not fatal — nobody named it, so there is no misreading to guard against, unlike D25's named groups ([§15](#15-m14--fee-aware-scoring--done)) | naming every solver by hand — a 26-entry command line that goes stale as solvers come and go, and the reason the July run had to be assembled from an ad-hoc catalogue query first; defaulting to all solvers with no flag — silently expensive, and `--solver` typos would stop failing fast | `extract.all_solvers`, `cli.resolve_scenarios` | — |
 | D25 | A comma-separated `--solver` entry is a **removal group**: one counterfactual with every member absent at once, whose deltas describe the joint scenario and are **never attributed to individual members** ([§13](#13-m11--joint-removal-of-multiple-solvers--done)) | summing single-solver runs — wrong in both directions, removed solvers stop replacing each other; per-member attribution (Shapley-style) — needs 2^n scenario runs and answers a different question; rejecting overlapping scenarios (the pre-M11 shared-address rule) — would forbid exactly the single-vs-joint comparison the feature exists for, so only *identical* address sets are rejected as duplicates | `run.analyse_window` (group resolution), `counterfactual.leave_one_out` (already set-based), `run.absent_members` + `Analysis.addresses_seen` (a member absent from every analysed auction fails the run rather than padding the label) | the reader combines scenarios; to attribute, run the subsets as separate groups |
-
+| D27 | The quote counterfactual re-runs the **protocol's own pick** — the verified class first, then an effective amount netted for the estimator's own gas — and `--quote-ranking` chooses the currency: `effective-sell` (default) nets in the sell token at the order's recorded `gas_price / sell_token_price`, `autopilot` in the out token at its native price ([§16](#16-m15--the-quote-competition--done), [measured](docs/quotes.md#the-two-ranking-rules-and-why-the-default-is-not-the-protocols-own)) | `argmax out_amount` — reproduces 51.6% of a day's mainnet picks and 61.5% of order-creating ones, so a gap metric on it is wrong about *who wins* in a third of cases; the autopilot rule as default — it needs the buy token's native price, which is not recorded per quote, where `effective-sell` reproduces 99.6% (mainnet) / 100.0% (bnb) from the record alone and is the same quantity the fee is charged against | `quotes.rank_key`, `quotes.pick`, `quotes.RANKING` | `--quote-ranking` exists; a third rule is a new branch in `rank_key` |
+| D28 | The quote effect on revenue goes **into the existing protocol-fee delta**, not into a column beside it: the counterfactual side values the affected orders' `priceimprovement` fee against the replacement quote, through the same `fees.py` path, while the baseline keeps the recorded quote ([§16](#16-m15--the-quote-competition--done)) **Revised 2026-09-07:** the fee deltas are computed with the **recorded quotes on both sides** — what the removal does through who executes — and the quote's own fee effect (the price-improvement fee the counterfactual executions pay against the replacement quotes minus against the recorded ones, `quote_fee_recharge`) is a **separate quote-side figure**, never added to them: a worse quote raises the fee baseline mechanically, and folding it in read as the protocol gaining from losing a good quoter | a separate quote-side fee figure — the price-improvement reference *is* the effective amount of the best quote, so a second number would be the same money counted twice and reconciled by hand; recomputing solution scores from the counterfactual quote — that is what D1 refuses, and it would make the quote change who *wins*; an elasticity model (users leave once the quote is ~2 bps worse, so less volume, less fee) — a demand curve nobody could defend, and the plain split is more legible | `counterfactual.analyse_auction` (`counterfactual_quotes`), `quotes.QuoteAnalysis.counterfactual_quotes`, `Analysis.quote_substituted_orders` | — |
+| D29 | An order↔request match is **corroborated** when the winning estimate's `out_amount` reproduces the amount stored on the order, and only corroborated matches feed the headline figures or move a fee; the heuristic tier is counted and carried as an `_all` companion ([data](docs/quotes.md#the-order--request-join-is-a-heuristic-with-an-exact-corroborator)) | one match rate and one number — on a heuristic match the recorded quote is not the ladder's winner, so a runner-up can beat the baseline and the degradation comes out *positive* (2 of 82 wins in a one-day test); dropping the heuristic tier entirely — its size is the honest measure of the match's uncertainty | `quotes.MatchTier`, `quotes.match_orders`, `QuoteAnalysis.add` | the tier test is one comparison in `match_orders` |
+| D30 | A **class flip** — removing the only verified estimator — is its own leaf with its own count and volume, and is excluded from both bps figures | netting it in: the replacement's nominal amount can be *higher* while the quote is worse in kind, and one such flip supplied the entire conditional figure of a one-day test (+70 bps on 5 ETH against 81 degraded orders) | `quotes.diff_quote` leaf, `QuoteAnalysis.class_flips` | — |
+| D31 | The quote window is **clamped forward** to the first day of recorded quote data, and orders created before it leave the population rather than counting as unmatched; both windows are reported and `compare` warns when they differ | keeping the run's window — two thirds of a July window predates the backfill, so every quote share would be deflated by the gap between the two | `quotes.load_quote_window`, `aggregate._report_warnings` | — |
+| D32 | Under a replaced quote, **everything the solvers did is held as recorded** — bids, executions, ranking — and **everything the mechanism computes from the quote is recomputed** — the fee. The user-price effect is the quote side's shown-price change, never a surplus recomputed against the limit the user would have signed ([§16](#16-m15--the-quote-competition--done), [why](docs/quotes.md#what-is-held-fixed-what-is-recomputed-and-why-the-user-effect-is-not-a-surplus)) | recomputing surplus against a wedge-shifted limit — surplus is measured against the limit, so a worse quote *raises* measured surplus on the identical execution and books a user gain exactly when the user was shown a worse price, double-counting the quote figure with the opposite sign; full propagation of the limit into every score — needs an unrecorded, integration-specific quote→limit model and arbitrates recorded bids against an order the solvers never saw | `counterfactual.analyse_auction` (docstring), `aggregate.CAVEATS` | — |
+| D33 | The fee substitution applies in **every auction that executed a recharged order, whether or not the removed solver bid there**; such an auction enters only the fee sums (its recharged orders' own fees) and the quote counters, and is retained in `changed` so the per-auction moves carry the fee effect `compare` converts to USD. `quote_substituted_orders` counts **distinct executed orders with a price-improvement policy**, not order-auction pairs ([§16](#16-m15--the-quote-competition--done), [why](docs/quotes.md#in-every-auction-that-executed-the-order-whether-or-not-the-solver-bid-there)) | the solver-present early return (the first implementation) — drops the quote effect exactly where quoting and solving solvers differ; `tsolver` was absent from the solve side on 52% of the orders it quoted, `dFusion` on all; whole-auction fee levels for absent auctions — inflates the base level by auctions the removal never touched | `counterfactual.analyse_auction`, `Analysis._add_quote_only`, `AuctionCounterfactual.anything_moved` | — |
+| D34 | Holding executions and ranking fixed under a replaced quote is **checked per auction, not assumed**: `quote_limit_unclearable_orders` counts recharged orders whose execution would not clear the limit the replacement quote implies (possible only on a class flip — a worse quote weakens the limit), and `auctions_quote_shift_would_change_winners` re-arbitrates with every score shifted by its substituted orders' measured-surplus change and counts the auctions where the winner set moves, over `auctions_quote_checked`, with the flagged ids in `quote_shift_auctions` ([§16](#16-m15--the-quote-competition--done)) | asserting both from the direction argument alone — the class-flip exception is real; applying the shift to the reported ranking — that is what D1 refuses, and a shift that moved winners would be a finding about the design rather than a correction | `quotes.shifted_limit`, `counterfactual._limit_checks`, `counterfactual._shift_moves_winners` | the wedge (signed limit rate over the recorded effective quote rate) is the one model in the check |
+| D35 | Orders are linked to competitions from **both layers**: the gold request table without the `quote_id` filter, and, for the orders that leaves unplaced, `raw_quotes.price_estimates` grouped by `request_id` — the gold tables are built off the `quote_requested` event and hold none of the competitions whose event never arrived (0.6% of requests, the competitions behind a quarter of a day's orders). `fast` requests stay excluded: `order_quotes` never holds a fast quote, so the quote an order carries is always a non-fast competition ([measured](docs/quotes.md#the-gold-tables-do-not-hold-every-competition--link-through-the-raw-layer)) | filtering candidates on `quote_id is not null` — the recovered competitions have no `quote_computed` either; matching fast requests — the Trust Wallet poll shares the amount but not the stored quote (0.45% gap, heuristic tier) while the order's real, non-fast competition sits in the raw layer exact to the atom; calling the gold-unmatched orders unquoted — they were quoted, in competitions the gold layer never received | `quotes.load_raw_candidates`, `quotes.load_ladders` (raw branch), `quotes.with_ladder`, `QuoteWindow.matched_raw` | — |
+| D36 | A replacement quote more than **2x off the recorded quote's rate, in either direction**, is the `implausible` leaf: counted with its volume, out of the bps and fee figures. The factor is D14's `PRICE_IMBALANCE_THRESHOLD`, so both guards call a number broken at the same point ([measured](docs/quotes.md#what-the-quote-side-computes)) | leaving it in — one buy order's three-atom replacement read as +1.16e15 bps and 1.45 billion bps of a window figure; guarding only the improvement direction — the −9,7xx bps orders on the other side were 86–99% of the concentrated rows and are the same kind of estimate; a tighter factor — a 2x-worse runner-up is a bad quote, not a broken one, and the reader should see it | `quotes.IMPLAUSIBLE_QUOTE_FACTOR`, `diff_quote`, `QuoteAnalysis.implausible` | the factor is one constant |
 ## 2. Two valuations, deliberately separate
 
 Decisions D1 and D2. The competition ranks on **score** = user surplus + protocol fees.
@@ -1288,3 +1297,216 @@ the 7,745-auction `validate` both run in the same time as before.
 - **Surplus mode.** It gets no score split by design; see §2.
 - **Solution totals.** Still `proposed_solutions.score`. There is no reason to recompute
   what is recorded exactly, and the fee path has a coverage gap the score does not.
+
+---
+
+## 16. M15 — the quote competition — **done**
+
+Every milestone so far removes a solver from the competition that **fills** orders. This
+one removes it from the competition that **prices them into existence**: the quote
+competition decides what the user was shown, and therefore the order's limit price and the
+baseline every `priceimprovement` fee is charged against. The argument that shaped it is
+[PROPOSAL-quote-competition.md](PROPOSAL-quote-competition.md); the durable data and
+protocol facts are [docs/quotes.md](docs/quotes.md).
+
+### The pick is not `argmax out_amount`, and that decides the design
+
+The proposal's first draft assumed it was. Measured on mainnet 2026-08-25, the recorded
+winner is the highest gross `out_amount` in **51.6%** of `optimal` requests and 27.0% of
+`verified` ones. The rule is a lexicographic pair
+(`price-estimation/src/competition/quote.rs`): a **verified** estimate beats an unverified
+one at any amount, then the estimate with the best amount **net of its own gas** wins.
+
+Neither of the prices that netting needs is in ClickHouse, but they enter the comparison
+only through a ratio common to every estimator of a request — so there are two currencies
+it can be done in, and `--quote-ranking` picks between them (D27):
+
+| rule | reproduces the recorded winner (2026-08-10..16) | needs |
+| --- | --- | --- |
+| `effective-sell` (default) | **99.6%** mainnet, **100.0%** bnb | `order_quotes.gas_price` / `sell_token_price` — recorded per order |
+| gross `out_amount` (not offered) | 61.5% / 90.2% | nothing |
+| `autopilot` | to be measured per run | the **buy** token's native price, from `auction_prices` |
+
+The default is not the protocol's own rule, and that is deliberate. `effective-sell` needs
+nothing that is not recorded against the order, and it is the *same quantity* the
+price-improvement fee is charged against, so the pick and the fee cannot disagree. It
+reproduces the pick because a quote asserts `in × sell_price ≈ out × buy_price`: the two
+nettings agree to first order and diverge only through the quote's own pricing error.
+`autopilot` is kept as the cross-check that measures that error.
+
+Every run reports its own reproduction rate. A window where it falls is a window where the
+rule changed, and every quote figure in it is then suspect — the quote-side equivalent of
+M1's gate, and the reason it is a row in `compare` rather than a one-off measurement.
+
+### The fee effect goes into the fee number that already exists
+
+The price-improvement fee is charged against the effective amount of the best quote, and
+`fees.py` has computed exactly that since M13: `_adjust_quote_to_order_limits` is
+`buy × (sell − fee) / sell` scaled to the order's limits. A different quote is therefore
+not a new fee model — it is the same validated function with a different `Quote`.
+
+So there is **no quote-side fee column** (D28). `analyse_auction` takes
+`counterfactual_quotes` and values the counterfactual side of the comparison with the
+replacement quote in place while the baseline keeps the recorded one; `delta_protocol_fees`
+then contains the quote effect, and `quote_substituted_orders` says how many orders it came
+from. Verified on a 400-auction mainnet slice with Fractal removed:
+
+| | solve only | with the quote side |
+| --- | --- | --- |
+| Δsurplus | −0.011873 ETH | −0.011873 ETH |
+| Δpartner fees | −0.0000048 ETH | −0.0000048 ETH |
+| Δrewards | −0.001068 ETH | −0.001068 ETH |
+| **ΔDAO fee revenue** | **−0.002879 ETH** | **−0.002073 ETH** |
+
+Surplus, partner fees and rewards are untouched to the wei — partner fees are volume
+policies and never see a quote, which is a free internal check — and the DAO fee delta
+moves by +0.000806 ETH, because the same executions carry a larger price-improvement fee
+against a worse quote.
+
+The quote does **not** move the ranking. Solution totals stay the recorded scores (D1), so
+a counterfactual quote changes what the mechanism charges on an execution, never who won
+it. Recomputing every score from a counterfactual quote is what D1 exists to refuse.
+
+### Review fixes (2026-09-02): the fee effect in every auction, and two checks
+
+A review of the first implementation found two accounting errors and settled the
+design question of how far a replaced quote should reach into the solve side.
+
+1. **Solver-absent auctions dropped the fee effect.** `analyse_auction` returned all-zero
+   deltas whenever the removed solver had no bid, before any quote substitution ran — so
+   an order the solver quoted but did not bid on carried no fee change. The proposal's own
+   measurement (`tsolver` absent on 52% of its quote wins, `dFusion` on all) says how much
+   that was. Now an auction holding a replacement quote is arbitrated regardless, enters
+   the fee sums through its recharged orders alone, and is retained in `changed` so the
+   USD conversion sees it (D33).
+2. **Every matched price-suspect order counted as a quote win of every solver.** The
+   guard ran before the did-the-solver-win test, adding a constant ~140 phantom wins to
+   each quoting solver's count — most of the displayed figure for the four smallest. The
+   guards now run after the winner test and are subsets of `quote_wins`.
+3. **`quote_substituted_orders` counted order-auction pairs in any bid.** It is now
+   distinct orders the counterfactual side *executed* with a price-improvement policy —
+   the set through which the effect actually entered the fee delta.
+4. **`nonpositive` quotes reached the fee path**, where the same arithmetic makes the
+   order's fee unknown and took the whole auction out of the fee sums. They are withheld,
+   and a replacement that still cannot be charged against is dropped alone rather than
+   voiding the auction.
+
+The design question — a different quote means a different limit price, so should every
+score move? — is answered by D32: no. Surplus is measured against the limit, so a worse
+quote *raises* measured surplus on the identical execution; the user effect is the
+shown-price change, already reported. What makes holding executions and ranking fixed
+sound is checked per auction (D34): a worse quote weakens the limit, so only a class flip
+can make a recorded execution fail the counterfactual limit, and that is counted; and the
+ranking channel is re-arbitrated with the measured-surplus shift applied and the auctions
+where winners would move are counted. Both are expected near zero; either being large is
+a finding, not an adjustment.
+
+Smaller fixes from the same review: the buy-order `QuoteDiff` stored its two effective
+amounts swapped (the bps sign was right, the fields lied); the estimator map is keyed on
+the `is_winner` row rather than the request row's `winner` column, the same identity the
+tier uses; ladders are deduplicated on `(request_id, estimator)` and loaded per request
+day; the Postgres session is pinned to UTC; `validate_picks` leaves price-suspect matches
+out; the trades aggregate in `ORDERS_SQL` is bounded to the window; `ch.NoQuoteDataError`
+replaces a catch-all `KeyError` in the CLI. docs/quotes.md corrects the ethflow `quoteId`
+mechanism and records what the ladder does not hold (arrival-order ties, the underwater
+clamp, errored estimators, the streaming endpoint).
+
+### Linking to ~100% (2026-09-02): the competitions the gold tables never held
+
+The first implementation matched 47% of one day's orders and read the rest as unquoted
+flow. The gap was on our side, in two parts. `quote_id is not null` in the candidate
+filter dropped competitions whose quote was never written to `quote_computed`; and the
+gold tables are built off the `quote_requested` event, so a competition whose event never
+arrived — 8,625 of 1,537,915 on 2026-07-25, the API callers behind `defibot`, `label`, the
+no-app-code orders and, it turned out, Trust Wallet's placement-time quotes — is in
+neither gold table while its estimates and winner are complete in `raw_quotes`.
+Candidates now come from the gold request table (fast excluded, `quote_id` ignored) and,
+for whatever that leaves unplaced, from `raw_quotes.price_estimates` grouped by request
+id; ladders and winners follow the same split (D35). 2026-07-25 mainnet: **2,935 of 2,937
+orders linked**, the 1,546 raw-layer matches corroborated 1,546 of 1,546, the pick
+reproduced on 99.3%. `fast` requests remain excluded because `order_quotes` never holds a
+fast quote — matching them had given the Trust Wallet orders a heuristic-tier link to the
+UI's poll while their real competition sat in the raw layer. Report format 12.
+
+### The fee split (2026-09-07)
+
+Folding the quote recharge into the fee column produced a number nobody could read:
+removing a good quoter *lowers* the baseline every price-improvement fee is measured
+against, so the same executions pay more, and the fee column showed the protocol gaining
+from losing its best quoters. D28 is revised: the fee column is computed with the recorded
+quotes on both sides (what the removal does through who executes), and the recharge —
+`analyse_auction` values the counterfactual executions a second time with the replacement
+quotes and takes the difference on the recharged orders — is the quote table's own fee
+figure, per auction and per order, with the median and concentration treatment the bps
+figures get. The two are never added on the page. Report format 13.
+
+### Three figures, and the two that are counts
+
+The quote side reports what it can answer and nothing more:
+
+1. **`window_bps`** — Δ effective quote over the window's whole quoted volume, the
+   quote-side analogue of D23, with `conditional_bps` (over the volume that moved) beside
+   it and labelled.
+2. **`no_quote`** — orders that would not have been created at all, with its share of every
+   order the quote window created.
+3. **The fee**, which is in `delta_protocol_fees` and not repeated.
+
+Two leaves stay out of the averages by construction. A **class flip** — removing the only
+verified estimator — leaves a quote whose nominal amount can be *higher* while its quality
+is worse, and in a one-day test one flip (+70 bps on 5 ETH) supplied the entire conditional
+figure against 81 genuinely degraded orders (D30). And a **heuristic** match is excluded
+from the headline and from every fee substitution, because on such a match the recorded
+quote is not the ladder's winner, so a runner-up can beat the baseline and the degradation
+comes out positive (D29). Both are counted, and the heuristic tier has an `_all` companion
+for every sum.
+
+### The match, and the identity that tiers it
+
+There is still no `quote_id` on an order, so the join stays a heuristic: same tokens and
+kind, the quoted amount (exact for sell orders, 0.5% for buy orders' slippage buffers), a
+request from ≤30 min before creation to ≤90 s after. What is new is the corroborator — the
+winning estimate's `out_amount` should be the amount stored on the order, and it is
+bit-exact for **77.9%** of mainnet matches. `match_orders` reproduces the prior art
+(1,852 of 2,497 orders on 2026-08-12 against quote-redesign's 1,850 of 2,495).
+
+Matching is **two-phase**, and that is a cost decision rather than a taste one: the amount
+filter is not selective — a popular round amount matches every request that ever asked for
+it, and a ten-day window asked in one go returned 1.9 M candidate requests for 38 k orders
+— so the time filter runs first, in Python, and ladders are loaded only for what survives
+it (13 k requests for a two-day window, not 136 k). Candidate queries are issued per
+creation day so each prunes to that day's partitions.
+
+### What was built
+
+- `loo/ch.py` — ClickHouse over plain HTTP (`urllib`, no new dependency), with the
+  supported-network map, the coverage query and the `Float64` coercion in one place.
+- `loo/quotes.py` — the pick (`rank_key`, `pick`, `leave_one_out`), the two rankings, the
+  effective amount, `counterfactual_quote`, the tiered match, `diff_quote` and its leaves,
+  `QuoteAnalysis`, `validate_picks`, and `load_quote_window` which loads the whole thing
+  once per window for every scenario (D18's rule, applied to the quote side).
+- `loo/counterfactual.py` — `analyse_auction(counterfactual_quotes=…)`: a second
+  valuation, built only for auctions holding a substituted order, feeds the counterfactual
+  side's fees. `AuctionCounterfactual.quote_substituted_uids` and the window counters.
+- `loo/run.py` — `analyse_window(with_quotes=…, quote_ranking=…)`, the quote payload and
+  the window's quote metadata in the report.
+- `loo/aggregate.py` — `QuoteSide`, six rows in `comparison`, two new warnings (the
+  clamped quote window, the match coverage), report **format 11**, and three caveats.
+- `loo/cli.py` — `--quotes`, `--quote-ranking`, and the quote block in the run report.
+- `tests/test_quotes.py`, `tests/test_ch.py` — the pure parts: the class rule, both rankings,
+  every leaf, the tier rule, the flip rule, the two-phase match, the ladder dedupe, the
+  shifted limit, the validation and the ClickHouse client; `tests/test_counterfactual.py`
+  the fee-path substitution end to end; `tests/test_aggregate.py` the quote block's
+  round trip through the report file.
+
+### Cost
+
+The quote pass adds ~16 s per two-day window on mainnet (candidate requests, ladders,
+match, validation) and is loaded once for every scenario and both outcome rules. The second
+valuation inside `analyse_auction` runs only for auctions holding a substituted order.
+
+### Out of scope, and named in the caveats
+
+Quote rewards (CIP-72) — the counterfactual quote's eligibility is not evaluated;
+conversion — there is no counterfactual for an order nobody placed, at a 0.13% conversion
+rate; and the limit-price/fillability channel, which needs the solve counterfactual re-run
+with perturbed limits.

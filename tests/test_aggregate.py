@@ -21,6 +21,7 @@ from loo.aggregate import (
     CAVEATS,
     REPORT_FORMAT,
     PriceImpact,
+    Report,
     Table,
     bps,
     comparison,
@@ -102,6 +103,10 @@ def move(
         "delta_protocol_and_partner_fees": gross,
         "delta_partner_fees": partner,
         "delta_protocol_fees": protocol,
+        "quote_fee_recharge": 0,
+        "quote_fee_recharge_partner": 0,
+        "quote_fee_recharge_protocol": 0,
+        "quote_fee_recharges": {},
     }
 
 
@@ -649,6 +654,12 @@ class TestComparison:
             "Δpartner fee",
             "Δprotocol fee",
         ]
+        # The quote side is its own group and follows the solve side's second tier: a
+        # different competition, read after the one it feeds.
+        assert top_level[9:11] == [
+            "quote price change, all executed volume",
+            "orders that would not have been quoted",
+        ]
         assert labels.index("Δrewards uncapped") > labels.index("Δprotocol fee")
 
     def test_fee_deltas_are_converted_per_auction(self, tmp_path: Path):
@@ -969,12 +980,189 @@ class TestReportRoundTrip:
 
 def test_caveats_cover_the_plan_list():
     """The plan names six caveats, plus the USD one, the missing-data one, the
-    coverage-denominator one and the relative-price one; a comparison must carry them
-    all, so their disappearance should fail loudly here."""
-    assert len(CAVEATS) == 10
+    coverage-denominator one, the relative-price one and the three the quote side adds
+    (what it does, quote rewards, conversion); a comparison must carry them all, so
+    their disappearance should fail loudly here."""
+    assert len(CAVEATS) == 12
     themes = (
-        "behavioural", "Settlement", "Filter", "Quote", "reward", "Price",
-        "neither order table", "two denominators", "relative price", "USD",
+        "behavioural", "Settlement", "Filter", "quote side", "Quote rewards",
+        "Conversion", "reward", "Price", "neither order table", "two denominators",
+        "relative price", "USD",
     )
     for theme, caveat in zip(themes, CAVEATS, strict=True):
         assert theme.lower() in caveat.lower()
+
+
+class TestQuoteSideRoundTrip:
+    """The quote block crosses the file boundary through hand-matched keys on both
+    sides (`run._quote_payload` / `aggregate._quote_side`), so the contract is pinned
+    end to end — including the fee-only auction that D33 adds to `changed`."""
+
+    def build(self, tmp_path: Path) -> tuple[Report, dict[str, Any]]:
+        from loo import run as run_module
+        from loo.counterfactual import Analysis, AuctionCounterfactual, OrderDiff
+        from loo.fees import Quote
+        from loo.quotes import PickValidation, QuoteAnalysis, QuoteDiff, QuoteWindow
+
+        fee_only = AuctionCounterfactual(
+            auction_id=9,
+            n_solutions=1,
+            solver_present=False,
+            baseline_winner_uids=frozenset({0}),
+            loo_winner_uids=frozenset({0}),
+            quote_carried_uids=frozenset({"ab"}),
+            quote_substituted_uids=frozenset({"ab"}),
+            order_diffs=(
+                OrderDiff(
+                    order_uid="ab",
+                    contributes=True,
+                    executed_base=True,
+                    executed_loo=True,
+                    surplus_base=100,
+                    surplus_loo=100,
+                    volume_base=600_000,
+                    volume_loo=600_000,
+                    fee_base=50,
+                    fee_loo=50,
+                    partner_fee_base=0,
+                    partner_fee_loo=0,
+                ),
+            ),
+            quote_fee_recharges={"ab": 30},
+            quote_partner_fee_recharges={"ab": 0},
+            block_deadline=123,
+            executed_volume_base=600_000,
+            executed_orders_base=1,
+            executed_orders_all_base=1,
+        )
+        analysis = Analysis(
+            solver="TestSolver", addresses=frozenset({"aa"}), capped_estimate=True
+        )
+        analysis.add(fee_only)
+
+        def diff(uid: str, loo: float, volume: int) -> QuoteDiff:
+            return QuoteDiff(
+                order_uid=uid,
+                leaf="degraded",
+                is_sell=True,
+                tier="corroborated",
+                winner="w",
+                replacement="s",
+                effective_base=1000.0,
+                effective_loo=loo,
+                volume_native=volume,
+                partially_fillable=False,
+                quote_loo=Quote(sell_amount=1000, buy_amount=int(loo), fee=0),
+            )
+
+        quote = QuoteAnalysis(
+            solver="TestSolver",
+            ranking="effective-sell",
+            window_orders=10,
+            window_volume_native=2_000_000,
+            window_quoted_volume_native=3_000_000,
+        )
+        for d in (diff("ab", 999.0, 600_000), diff("cd", 997.0, 400_000)):
+            quote.add(d)
+        quote_window = QuoteWindow(
+            network="mainnet",
+            start="2026-08-01",
+            end="2026-08-02",
+            ranking="effective-sell",
+            orders=[],
+            matches=[],
+            estimator_map={"w": "aa"},
+            buy_token_prices={},
+            validation=PickValidation(
+                ranking="effective-sell", requests=5, with_recorded_winner=5, reproduced=5
+            ),
+            coverage_start="2026-07-22 15:28:03",
+        )
+        window = run_module.WindowAnalysis(
+            network="mainnet",
+            start="2026-08-01",
+            end="2026-08-02",
+            auction_ids=[9],
+            missing_data=[],
+            runs=[],
+            quote_window=quote_window,
+        )
+        solver_run = run_module.SolverRun(
+            solver="TestSolver",
+            addresses=frozenset({"aa"}),
+            matches=[],
+            members=(run_module.GroupMember("TestSolver", frozenset({"aa"})),),
+            analysis=analysis,
+            cow=run_module.CowConversion(Decimal(0), Decimal(0), 0, 0, 0, Decimal(0)),
+            quote=quote,
+            quote_substitutions=quote.counterfactual_quotes,
+        )
+        path = str(tmp_path / "quotes.json")
+        run_module.write_report(path, window, solver_run)
+        with open(path) as handle:
+            raw = json.load(handle)
+        return load_report(path), raw
+
+    def test_the_quote_block_survives_the_round_trip(self, tmp_path: Path):
+        report, raw = self.build(tmp_path)
+        quote = report.quote
+        assert quote is not None
+        # −10 bps on 600,000 and −30 bps on 400,000: −1,800 over the 2,000,000 window
+        # is −9 bps; over the 1,000,000 that moved, −18; the median of two is their mean.
+        # (Quantised: the bps come from float ratios and carry 1e-15 of noise.)
+        cents = Decimal("0.001")
+
+        def rounded(value: Decimal | None) -> Decimal | None:
+            return None if value is None else value.quantize(cents)
+
+        assert rounded(quote.window_bps) == Decimal("-9.000")
+        assert rounded(quote.conditional_bps) == Decimal("-18.000")
+        assert rounded(quote.median_bps) == Decimal("-20.000")
+        assert rounded(quote.largest_bps) == Decimal("-30.000")
+        assert quote.largest_share is not None
+        assert quote.largest_share.quantize(Decimal("0.001")) == Decimal("0.667")
+        assert (quote.quote_wins, quote.degraded, quote.matched) == (2, 2, 2)
+        assert quote.orders_total == 0  # the fixture's window holds no orders
+        assert quote.pick_rate == Decimal(1)
+        assert (quote.start, quote.end) == ("2026-08-01", "2026-08-02")
+        # The D33 fee-only auction: one recharged order, one auction, none bid in.
+        assert quote.substituted_orders == 1
+        assert quote.substituted_auctions == 1
+        assert quote.checked_auctions == 1
+        assert quote.quote_only_auctions == 1
+        assert (quote.limit_unclearable, quote.shift_changed_auctions) == (0, 0)
+        assert quote.shift_changed_auction_ids == ()
+        assert [m.auction_id for m in report.moves] == [9]
+        # The fee delta is solve-only and zero here; the recharge rides apart.
+        assert report.moves[0].delta_protocol_fees == 0
+        assert report.moves[0].quote_fee_recharge == 30
+        assert report.moves[0].quote_fee_recharges == (30,)
+        assert report.delta_protocol_fees == 0
+        assert (quote.fee_recharge, quote.fee_recharge_protocol) == (30, 30)
+        assert quote.fee_recharge_median == Decimal(30)
+        assert quote.fee_recharge_largest_share == Decimal(1)
+        # Bookkeeping stays out of the file; the counts are what a reader needs.
+        assert "quote_substituted_uid_set" not in raw
+        assert "quote_unclearable_uid_set" not in raw
+        assert raw["quote_window"]["pick_price_suspect"] == 0
+
+    def test_the_comparison_renders_the_quote_rows(self, tmp_path: Path):
+        report, _ = self.build(tmp_path)
+        table = comparison(group_reports([report]))
+        rows = dict(table.rows)
+        assert rows["  orders whose fee used a replacement quote"][0] == (
+            "1 in 1 auctions, 1 of them without the solver's bid"
+        )
+        assert rows["  limit and ranking checks"][0] == (
+            "0 recharged orders would not clear the shifted limit; winners would move "
+            "in 0 of 1 auctions holding a replacement quote"
+        )
+        assert rows["  quote pick reproduced the recorded winner"][0] == (
+            "100.000% of 5 requests (effective-sell)"
+        )
+        assert rows["Δprotocol fee from the quote recharge"][0].startswith(
+            "+0.0000 ETH to the DAO, 0.0000 ETH to partners — not added to the fee rows"
+        )
+        assert rows["  quote wins in the window"][0] == (
+            "2 corroborated of 2 in 2 matched orders (0 via the raw layer)"
+        )

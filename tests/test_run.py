@@ -258,3 +258,96 @@ class TestRemovalGroups:
         (solver_run,) = window.runs
         assert run.absent_members(solver_run) == ["Ghost"]
         assert solver_run.analysis.delta_surplus == -200  # the single-solver result
+
+
+class TestQuoteSide:
+    """The quote pass is one load for every scenario and rule, and a network without
+    quote data is refused by type rather than by a stray `KeyError`."""
+
+    def test_a_network_without_quote_data_is_refused(self, stubbed: Calls):
+        from loo import ch
+
+        with pytest.raises(ch.NoQuoteDataError, match="xdai"):
+            run.analyse_window(
+                CONN,
+                ["TestSolver"],
+                "2026-07-01",
+                "2026-08-01",
+                network="xdai",
+                with_quotes=True,
+            )
+
+    def test_the_quote_side_is_loaded_once_and_feeds_every_run(
+        self, stubbed: Calls, monkeypatch: pytest.MonkeyPatch
+    ):
+        from loo import ch, quotes
+        from loo.fees import Quote
+        from loo.quotes import QuoteAnalysis, QuoteDiff, QuoteWindow
+
+        uid = "ab" * 56
+        loads: list[tuple[str, str, str, str, list[int]]] = []
+
+        class FakeWindow:
+            def analyse(self, label: str, addresses: frozenset[str]) -> QuoteAnalysis:
+                analysis = QuoteAnalysis(
+                    solver=label,
+                    ranking="effective-sell",
+                    window_orders=1,
+                    window_volume_native=1,
+                )
+                analysis.add(
+                    QuoteDiff(
+                        order_uid=uid,
+                        leaf="degraded",
+                        is_sell=True,
+                        tier="corroborated",
+                        winner="w",
+                        replacement="s",
+                        effective_base=2050.0,
+                        effective_loo=2020.0,
+                        volume_native=1,
+                        partially_fillable=False,
+                        quote_loo=Quote(sell_amount=1000, buy_amount=2020, fee=0),
+                    )
+                )
+                return analysis
+
+        def load_quote_window(
+            client: ch.Client,
+            conn: Connection,
+            network: str,
+            start: str,
+            end: str,
+            *,
+            ranking: str,
+            auction_ids: list[int],
+            log: object = None,
+        ) -> QuoteWindow:
+            loads.append((network, start, end, ranking, list(auction_ids)))
+            return cast(QuoteWindow, FakeWindow())
+
+        def from_env(cls: type[ch.Client]) -> ch.Client:
+            return cast(ch.Client, object())
+
+        monkeypatch.setattr(quotes, "load_quote_window", load_quote_window)
+        monkeypatch.setattr(ch.Client, "from_env", classmethod(from_env))
+
+        window = run.analyse_window(
+            CONN,
+            ["TestSolver"],
+            "2026-07-01",
+            "2026-08-01",
+            outcome_rules=("inherited", "assume-settled"),
+            with_quotes=True,
+        )
+        assert loads == [("mainnet", "2026-07-01", "2026-08-01", "effective-sell", [1, 2])]
+        assert stubbed.extractions == 1
+        for solver_run in window.runs:
+            assert solver_run.quote is not None
+            assert solver_run.quote.quote_wins == 1
+            assert list(solver_run.quote_substitutions) == [uid]
+            # The stubbed bundles carry no fee policies, so the replacement quote is
+            # carried into both auctions and recharges nothing — the distinction the
+            # report draws between "touched" and "recharged".
+            assert solver_run.analysis.auctions_quote_checked == 2
+            assert solver_run.analysis.quote_substituted_orders == 0

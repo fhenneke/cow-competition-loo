@@ -107,11 +107,46 @@ no analysed auction is an error, because its all-zero deltas would read as "remo
 solver costs nothing". Under `--all-solvers` nobody named it — the price-suspect exclusion
 or `--limit` simply took it out — so it is reported and skipped, and the run still exits 0.
 
+**`--quotes`** removes the solver from the **quote** competition as well:
+
+```bash
+uv run loo analyse --all-solvers --start 2026-07-22 --end 2026-08-01 --quotes --out "reports/{solver}.json"
+```
+
+The quote competition prices orders into existence, so removing a solver from it changes
+the price the user was shown and the baseline every price-improvement fee is charged
+against. The run then reports two more figures — how much worse the quotes would have
+been, in basis points over the executed volume of the window's quoted orders, and how many
+orders would not have been quoted at all — and **recharges the price-improvement fee** of
+the affected orders against the replacement quote in every auction that executed them,
+whether or not the solver bid there. That recharge is its own quote-side figure and is
+**not** added to the protocol-fee delta, which is computed with the recorded quotes on
+both sides: a worse quote raises the fee baseline mechanically, and folding it in read as
+the protocol gaining from losing a good quoter. Everything the solvers did — bids,
+executions, ranking — stays as recorded; two per-auction checks (would the execution still
+clear the limit the replacement quote implies; would the winner set move if every score
+carried the limit change) are counted and reported so that assumption is tested rather than
+held.
+
+It needs the `CLICKHOUSE_*` credentials and a network with quote data (mainnet, bnb, from
+2026-07-22); the quote window is clamped forward to the first day of that data and both
+windows are reported. Orders are linked to their competition through the gold request
+table and, where that table never received the competition, through the raw estimates —
+about 99.9% of a day's orders, every raw-layer match corroborated by the winning
+estimate's own amount. Fast quotes are not candidates: `order_quotes` never holds one. `--quote-ranking` chooses how the pick is re-run: `effective-sell`
+(default) nets the gas cost in the sell token at the order's own recorded prices and
+reproduces the recorded winner on 99.6% of mainnet requests from the record alone;
+`autopilot` uses the protocol's own out-token rule and needs the buy token's native
+price. Every run reports its own reproduction rate — a window where it falls is a window
+where the rule changed. See [docs/quotes.md](docs/quotes.md).
+
 | flag | |
 | --- | --- |
 | `--all-solvers` | one scenario per solver that bid in the window; excludes `--solver` |
 | `--outcome-rule` | `inherited` (default) or `assume-settled`, repeatable — all rules share the extraction pass; see below |
 | `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus |
+| `--quotes` | also remove the solver from the quote competition (mainnet, bnb) |
+| `--quote-ranking` | `effective-sell` (default) or `autopilot` |
 | `--limit N` | only the first N auctions — start here |
 | `--out report.json` | per-auction records, including both sides' reference scores and rewards; `{solver}` in the path becomes each solver's slug, `{rule}` the outcome rule |
 

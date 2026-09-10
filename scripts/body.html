@@ -1,0 +1,389 @@
+<main>
+
+  <header>
+    <div class="eyebrow">Leave-one-out solver analysis · CoW Protocol</div>
+    <h1>Every mainnet solver removed in turn, and the quotes with them</h1>
+    <p class="subtitle"><strong>Window: 2026-07-01 → 2026-08-01</strong>, every mainnet
+    auction in it re-arbitrated with one solver removed — 26 solvers, one
+    scenario each, 83,621 of 85,487 auctions analysed. The quote competition is re-run for the
+    same solvers over <strong>2026-07-22 → 2026-08-01</strong>, which is as far back as
+    the quote data goes. Every figure in the tables is a total over its window, not a
+    rate.</p>
+  </header>
+
+  <div class="sign-note">
+    <strong>What was measured:</strong> each auction’s winner selection is re-run on the
+    recorded bids with one solver’s bids removed, and the outcome compared with what
+    actually happened. The same solver is removed from the <strong>quote</strong>
+    competition, so the price the user was shown moves too; what that does to the
+    price-improvement fee is reported in the quote table and kept out of the fee column,
+    which is computed with the recorded quotes on both sides.
+    <strong>Signs:</strong> every delta is counterfactual − actual — negative Δsurplus
+    means users would have received less without the solver, and negative Δfees means the
+    protocol would have collected less. <strong>Settlement:</strong> a replacement winner
+    inherits the on-chain outcome of the recorded winner whose token pairs it claims, so a
+    batch that really reverted stays reverted whoever wins it; settlement cancels out of
+    Δsurplus and what the figures measure is the competition’s decision, not its
+    execution. <strong>USD figures</strong> are display-only conversions at each auction’s
+    own stablecoin-implied rate.
+  </div>
+
+  <section>
+    <h2>Summary</h2>
+    <ul class="lead">
+            <li><strong>Rizzolver</strong> is the largest on the solve side: −$184,152 of user
+        surplus (−101.80 ETH) over the window, −$118,358 of DAO fee revenue, and 1,687 order
+        executions that would not have happened — 1.6% of every user-order execution the
+        chain traded.</li>
+      <li><strong>Fractal</strong> follows at −$29,998 and <strong>Quasi</strong> at
+        −$29,528, then Tsolver at −$22,154 and Sector at −$17,887. Fractal carries the
+        largest coverage figure of any solver, 5,741 executions (5.6%).</li>
+      <!-- run-dependent: quote wins and recharged counts -->
+      <li>On the <strong>quote</strong> side 15 of the 26 solvers won a matched quote,
+        Curve exactly one. <strong>Tsolver</strong> won the most, 10,182, with a median
+        degradation of −29.80 bps; Flowdesk’s median is −24.25 bps on 139 wins and
+        Helixbox’s −21.94 bps on 493. <strong>Baseline</strong>’s removal would leave the
+        most orders unquoted, 41, with Tsolver next at 37.</li>
+      <li>Every quote-side average is heavy-tailed. Fractal’s −4.97 bps over all executed
+        volume is <strong>86.2% one order</strong> and its median is −7.55 bps; Baseline’s
+        −0.04 bps is 64.4% one order. The median and the concentration share are printed
+        beside every figure for that reason, and replacement quotes more than twice or less
+        than half the recorded rate are excluded as broken estimates rather than averaged
+        in.</li>
+      <!-- run-dependent: fee USD -->
+      <li>The fee column is computed with the recorded quotes on both sides and is negative
+        for every solver. The quote’s own fee effect runs the other way and is its own
+        column in the quote table: without <strong>Rizzolver</strong> the DAO would lose
+        $118,358 of fee on the solve side while the same executions, recharged against
+        worse quotes, would pay +$93,614 more (and +$48,253 to partners);
+        <strong>Kipseli</strong> −$6,706 against +$21,062, <strong>Wraxyn</strong> −$1,857
+        against +$20,641. The two are never added on this page.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>The window, one row per solver</h2>
+    <p>The four left columns are the measures this page reports: <strong>Δsurplus</strong>
+    in USD with the native amount beneath; <strong>Δprice</strong>, the same surplus change
+    spread over all volume the chain traded, with the still-traded conditional reading
+    beneath; <strong>Δprotocol and partner fees</strong>, the gross the mechanism charges,
+    split into the protocol’s and the partners’ shares beneath; and the <strong>share of
+    all executed orders</strong> that would not have traded. The two muted columns to the
+    right carry supporting detail. Definitions are in the footnote, limits in the
+    caveats.</p>
+    <p id="scope"></p>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Solver</th>
+            <th>Δsurplus</th>
+            <th>Δprice, all traded volume</th>
+            <th>Δprotocol and partner fees</th>
+            <th>Orders no longer executed, share of all</th>
+            <th class="sec">Won</th>
+            <th class="sec">Largest auction share</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <p class="footnote">“Δsurplus” is the change in user surplus, summed over the window.
+    “Δprice, all traded volume” spreads the moved-order Δsurplus over the window’s whole
+    executed fill-or-kill volume, so unmoved orders count as zero; its sub-line gives the
+    conditional reading — the change on just the still-traded orders whose price moved,
+    with the median moved order and the moved count. “Δprotocol and partner fees” is the
+    whole fee the winning solutions charged, split beneath into what the protocol keeps and
+    what passes to partners, with the auctions whose fees could not be priced noted at the
+    end; both are summed over every order either side traded, so an order that stops
+    trading contributes its whole fee. <strong>This column is computed with the recorded
+    quotes on both sides</strong>: it is what the removal does to fees through who
+    executes. The quote’s own fee effect is its own column in the next section, and the
+    two are not added anywhere on this page. “Orders no longer executed” divides the orders only the solver
+    executed by every user-order execution the chain’s recorded winners traded in the
+    window, partially fillable included; an order counts once per auction it executes in.
+    “Won” is the solver’s share of analysed auctions, with its bid rate beneath. “Largest
+    auction share” is a concentration check on the Δsurplus column and on nothing else: the
+    single largest auction’s |Δsurplus| as a share of the row’s total, over the auctions
+    where surplus moved at all — read the caveat before quoting a row above 30%. The fee
+    cell carries the same check on its own column beneath the split (“largest auction”),
+    because a single recharged order can be most of a quoting solver’s fee delta.
+    Price-suspect auctions (1,146) and auctions with unrecoverable JIT order data
+    (720) are excluded from every figure and enumerated in the report files. Solver
+    rewards move under these scenarios too and are reported in the comparison output; they
+    are not shown here.</p>
+  </section>
+
+  <section>
+    <h2>The quote competition</h2>
+    <p>The quote competition prices orders into existence: it decides the price the user
+    was shown, which becomes the order’s limit price and the baseline every
+    price-improvement fee is charged against. Removing a solver from it changes all three.
+    Three figures follow, one per question — how much worse the quotes would have been, how
+    often there would have been no quote at all, and what that does to the
+    price-improvement fee, which is a column here and is kept out of <strong>Δprotocol
+    and partner fees</strong> above.</p>
+    <p>Three facts about the window bound every figure in this table. The re-run pick
+    returns the estimator the competition actually chose on
+    <strong>99.53%</strong> of 38,043 matched requests (the 326 whose recorded token
+    price fails the cross-check below are left out of the check), and the rule that
+    a verified quote outranks an unverified one at any amount held on
+    <strong>14,810 of 14,810</strong> of the requests that carried both. Of the
+    38,396 orders created in the quote window that carry a recorded quote,
+    <strong>38,375</strong> are linked to the competition that priced them — 17,751
+    through the request table and 20,624 through competitions that table never received,
+    recovered from the raw estimate events — and 37,341 of those are confirmed by the
+    winning estimate’s own amount; the 326 whose two native price feeds disagree leave
+    38,070 in every denominator. And the quote window is
+    <strong>2026-07-22 → 2026-08-01</strong>, ten days of the run’s thirty-one, because
+    that is where the quote data begins.</p>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Solver</th>
+            <th>Δquote price, all executed volume</th>
+            <th>Δquote price, median moved order</th>
+            <th>Orders that would not have been quoted</th>
+            <th class="sec">Largest order share</th>
+            <th>Δprotocol fee from the quote</th>
+          </tr>
+        </thead>
+        <tbody id="qrows"></tbody>
+      </table>
+    </div>
+    <p class="footnote">“Δquote price” is the change in the effective quote — the quoted
+    amount net of the estimator’s own gas cost — spread over the <em>executed</em> volume
+    of the window’s quoted orders, what those orders actually traded rather than what was
+    quoted, so an order whose quote did not move, or that never traded, counts as zero;
+    the sub-line gives the conditional reading over the orders that did move. Wins where the removed solver was
+    the only <em>verified</em> estimator are excluded from both figures and counted on the
+    sub-line: the replacement’s nominal amount can be higher while the quote is worse in
+    kind, and a signed average would report that as an improvement. Wins whose replacement
+    quote is more than twice, or less than half, the recorded quote’s rate are excluded as
+    broken estimates promoted to winner — the ladder holds answers with a token’s decimals
+    mis-scaled, and once the winner is gone such an answer wins; their counts are in the
+    report files (69 over this window). Only matches corroborated by the winning
+    estimate’s amount feed these figures or a fee. “Orders that
+    would not have been quoted” are requests where the removed solver was the only usable
+    estimator, so the order would never have been created; the count of orders lost to a
+    removal is therefore this figure <em>and</em> the solve-side coverage column, and the
+    two overlap. “Δprotocol fee from the quote” is the price-improvement fee the
+    counterfactual executions would pay against the replacement quotes minus what they pay
+    against the recorded ones — the DAO’s part, in USD at each auction’s rate, with the
+    partners’ part, the count of recharged orders and the auctions holding them (including
+    auctions the solver never bid in, since the fee reference moved there all the same)
+    and the largest single order’s share beneath. It is <em>positive</em> for a solver whose
+    quotes were good: without it the baseline the fee is measured against falls, and the
+    same executions pay more. It is not added to the fee column above. The 326 orders whose two native price feeds disagree are
+    excluded from every quote figure; wins where the gas cost exceeded the quoted amount
+    are counted per solver in the report files and excluded. Quote rewards (CIP-72) are
+    not evaluated on either side.</p>
+  </section>
+
+  <section>
+    <h2>Protocol fee and partner fee</h2>
+    <p>The competition ranks solutions on score, which is user surplus plus protocol fees,
+    so a removal changes fee revenue as well as surplus. The fee figures are recomputed
+    from each auction’s recorded fee policies and reproduce the protocol’s own recorded
+    score exactly on the solutions where both are available.</p>
+    <p><strong>“Protocol fee” is used here in the budget sense: what the protocol
+    keeps.</strong> The analytics database and the protocol’s own code use the same words
+    for the gross amount including the partners’ share, so the two are labelled separately
+    — <strong>Δprotocol and partner fees</strong> for the gross, <strong>Δprotocol
+    fee</strong> for the remainder.</p>
+    <p>The partners' share of the <em>change</em> runs from about zero to 16% across these solvers (BitgetWallet 16%, Rizzolver 12%, Kipseli 11%, Tsolver 10%). Partner fees are charged on volume, so they are unaffected when a rival wins the same order at a worse price and are lost only when the order does not trade. The partners' share of a fee delta therefore reads out how much of the delta is coverage rather than price. It is not the partners' share of the fee <em>level</em>, which is larger.</p>
+    <p>The fee column does <em>not</em> carry the quote effect. A worse quote lowers the
+    baseline the price-improvement fee is measured against, so the same execution pays
+    <em>more</em> fee, and folding that into the column would show the protocol gaining
+    from losing a good quoter. It is reported instead as “Δprotocol fee from the quote” in
+    the quote table, computed on the counterfactual executions, and the two figures are
+    never added on this page.
+    <!-- run-dependent: recharged range, fee USD -->
+    The recharged-order counts run from 28 to 7,932 across the fourteen quoting solvers
+    with a recharge and are in the quote table, with the auctions holding them beneath —
+    many of them auctions the solver never bid in (3,061 of Tsolver’s 7,059, 1,509 of
+    Kipseli’s 3,312), because the quote winner often does not bid on its own order. The
+    recharge to the DAO runs from +$90 (Flowdesk) to +$93,614 (Rizzolver), +$158,221 over
+    the fourteen, and for Rizzolver, Kipseli and Wraxyn it is larger in magnitude than the
+    solve-side fee loss — Rizzolver’s −$118,358 of solve-side DAO fee against +$93,614 of
+    recharge, with a further +$48,253 to partners. That is why the two are kept apart: the
+    recharge is what the mechanism would charge against worse quotes, not revenue the
+    protocol would gain by losing a quoter. The largest single order is 38% of Wraxyn’s
+    recharge and 8% of Rizzolver’s; the fee column’s own largest-auction share is at most
+    30% (Flowdesk) and 17% for Tsolver.</p>
+  </section>
+
+  <section>
+    <h2>Reading each solver</h2>
+        <h3>Rizzolver</h3>
+    <!-- run-dependent: changed auctions, fees, quote wins -->
+    <p>The largest row on every solve-side measure: −$184,152 of user surplus over 12,309
+    changed auctions, −$118,358 of DAO fee revenue (−$134,559 gross, −$16,201 of it partner
+    fees), 1,687 executions that would not have traded. Its Δsurplus is not concentrated —
+    the largest single auction is 3% of the row — so the figure is a run rate rather than
+    an anecdote. On the quote side it won 4,333 matched quotes, degrading by a median
+    −2.77 bps, with 4.4% of the weighted figure in one order — the least concentrated quote
+    row on the page — and its quote recharge, +$93,614 to the DAO and +$48,253 to partners,
+    is the largest on the page; it sits in the quote table and is not netted against the
+    fee column.</p>
+
+    <h3>Fractal</h3>
+    <p>−$29,998 of surplus and the largest coverage figure in the window: 5,741 executions,
+    5.6% of everything the chain traded. Its fee delta is −$32,850 gross and −$32,565 to the
+    DAO, larger in magnitude than its surplus delta; its quote recharge is +$1,395. Under <code>assume-settled</code> its
+    surplus figure moves furthest of any solver, to −$51,858, so its headline figure is
+    the most sensitive on the page to the settlement rule. On the quote side, 2,143 wins
+    with a median degradation of −7.55 bps; its −4.97 bps window figure is the largest on
+    the page and 86.2% of it is one order at −1,894 bps.</p>
+
+    <h3>Tsolver</h3>
+    <!-- run-dependent: quote wins, recharged -->
+    <p>The solver with the most matched quote wins, 10,182, and the most recharged orders,
+    7,932 in 7,059 auctions, 3,061 of them auctions it never bid in; its median quote
+    degradation, −29.80 bps, is the largest on the page. Its solve-side row is −$22,154 of
+    surplus, −$9,254 of DAO fee and 1,255 executions; the quote recharge, +$10,806 to the
+    DAO, is in the quote table. 37 orders would not have been quoted at all without it,
+    second only to Baseline.</p>
+
+    <h3>Wraxyn</h3>
+    <!-- run-dependent: fees, recharged -->
+    <p>The row where the quote recharge is largest relative to everything else: −$2,874 of
+    Δsurplus and −$1,857 of solve-side DAO fee against +$20,641 of recharge, because the
+    1,057 recharged orders whose quotes it won would have been priced worse and the same
+    executions would then have paid more price-improvement fee; 38% of that recharge is one
+    order. Its −2.59 bps window figure is 61.6% one order at −4,846 bps, and the median is
+    −0.72 bps.</p>
+
+    <h3>Baseline</h3>
+    <p>Small on the solve side — −$1,549 of surplus — and the solver whose removal leaves
+    the most orders unquoted: 41 of 38,070, where no other solver exceeds 37. Its 9,281
+    quote wins degrade by a median −0.46 bps and its window figure is −0.04 bps, 64.4% of
+    it one order.</p>
+
+    <h3>The eleven solvers with no quote row</h3>
+    <p>Quasi, Portus, Arc, TrustedVolumes, Rosato, OKX, AlgoLabs, Arctic, NativeFi, Odos
+    and the uncatalogued <code>0x26a6fd…</code> won no matched quote in the window. That is
+    a finding, not missing data: they compete in the solve competition only. Quasi is the
+    third-largest solve-side row in the window at −$29,528. Curve won exactly one, an order
+    that would not have been quoted without it.</p>
+  </section>
+
+  <section>
+    <h2>Caveats</h2>
+    <ol class="caveats">
+      <li><strong>No behavioural response.</strong> Rivals’ bids and quotes are held fixed;
+        nobody re-quotes or re-routes because a competitor is absent. This matters most
+        where the figures are largest. The per-solver cap on solutions is applied before
+        winners are picked, so a solution suppressed by the cap cannot step in either.</li>
+      <li><strong>Settlement is inherited, and that is an assumption.</strong> Winning an
+        auction does not guarantee the batch lands on-chain, and a winner that never won
+        for real never settled either, so the counterfactual has to decide what a
+        replacement’s orders do. It gives the replacement the recorded winner’s outcome,
+        which is the only choice grounded in the record. The alternative — assuming
+        everything lands in time on both sides — is computed alongside and moves the
+        figures in both directions: Fractal moves furthest against the solver, from −$29,998 to −$51,858; Rizzolver from −$184,152 to −$194,479 and Portus from −$5,983 to −$14,537. In the other direction Barter moves from −$6,292 to −$3,938, Baseline from −$1,549 to −$1,124. Those figures are in the comparison
+        output.</li>
+      <li><strong>The quote pick is reproduced, not recorded.</strong> The competition
+        records which estimator won, not why, so the pick is re-derived from the recorded
+        ladder and the order’s own gas and token prices. It returns the recorded winner on
+        99.53% of matched requests; the rest are counted and not otherwise
+        adjusted. A window where that rate falls is a window where the protocol’s rule
+        changed, and every quote figure in it would be suspect.</li>
+      <li><strong>The order-to-quote match is a heuristic, placed against two
+        layers.</strong> Nothing in the analytics database records which quote request
+        created an order, so orders are matched on tokens, kind, amount and time, and the
+        match is called corroborated when the winning estimate’s amount reproduces the
+        amount stored on the order. The competition tables are built from the request
+        event, and a competition whose event never arrived is missing from them — the
+        API-placed orders, and Trust Wallet’s placement-time quotes — so those are
+        recovered from the raw estimate events, where every one of the 20,624 such matches
+        is corroborated. 38,375 of 38,396 orders are linked; fast quotes are never a
+        candidate, because the quote an order carries is always a non-fast competition.
+        Only corroborated matches feed a headline figure or a fee.</li>
+      <li><strong>A counterfactual quote does not change who won.</strong> Solution scores
+        are the recorded ones and are never recomputed, so a different quote changes what
+        the mechanism charges on an execution, not which solution the competition picked.
+        The quote’s fee effect is reported in the quote table and is not added to the fee
+        column; the two never compose on this page.
+        Everything the solvers did — bids, executions, ranking — is held as recorded, and
+        the fee is recomputed in every auction that executed a quoted order, whether or not
+        the solver bid there. The user effect of a worse quote is the shown-price change in
+        the quote table, not a surplus recomputed against the limit the user would have
+        signed: measured surplus rises exactly when the user is shown a worse price. Two
+        checks stand behind holding executions fixed and are counted in the report files:
+        recharged orders whose execution would not have cleared the limit the replacement
+        quote implies, which can only happen where the replacement quoted more, and
+        auctions where shifting every score by that limit change would have moved the
+        winner set. <!-- run-dependent: check counts --> Over this window the first
+        check flags 14 recharged orders in total (BitgetWallet 9, Rizzolver 3, Wraxyn 2),
+        all class flips; the second flags 166 of the 8,724 auctions holding a Tsolver
+        replacement quote, 25 of Baseline’s 7,962, 17 of Rizzolver’s 4,086, 13 of
+        Kipseli’s 5,341, two each for Fractal and Sector, one each for Wraxyn and Horadrim.
+        Where those auctions are in the report files, the replacement quotes in them are
+        ordinary (a median worst of −40 bps for Tsolver, none below −1,000 bps), so what
+        moved the winner set was a small shift in an already close race, not an extreme
+        quote; the flagged auction ids are in the report files.</li>
+      <li><strong>Conversion is out of scope.</strong> A worse quote means some users would
+        not have placed the order at all, and there is no counterfactual for an order nobody
+        created. Mainnet serves about 1.2 M quote requests a day against the 38,070 quoted
+        orders created in the ten-day quote window, about 3.8 k a day, so any elasticity
+        here would be a guess. The quote figures describe
+        the price shown on orders that <em>were</em> created.</li>
+      <li><strong>USD is display-only.</strong> Converted per auction from the auction’s
+        own stablecoin-implied native prices; nothing on the valuation or reward path
+        consumes a USD number. Native amounts are the exact figures. Quote-side figures
+        derive from a Float64 source and are not exact to the atom; the fee, surplus and
+        reward figures are.</li>
+      <li><strong>“Protocol fee” here excludes the partners’ share.</strong> The database
+        and the protocol’s own code use “protocol fee” for the gross amount; this page uses
+        it for what the protocol keeps and names the gross figure “protocol and partner
+        fees”. Reading the gross number as protocol revenue overstates it by whatever the
+        partners take: for the rows with a material gross the partners take up to 16% of the change (BitgetWallet 16%, Rizzolver 12%). The quote recharge in the quote table has a partners’ part of its own, shown beneath it — for Rizzolver +$48,253, because some partner fee policies are price-improvement fees too — and it is kept apart from this column in the same way.</li>
+      <li><strong>Fee figures are gross revenue.</strong> The protocol also pays rewards for
+        the competition, and the reward change usually runs opposite to the fee change. The
+        fee figures here are therefore not the net budget effect of a removal.</li>
+      <li><strong>Fees are exact where they are priced, and the exceptions are
+        counted.</strong> A fee cannot be computed when a solution the real competition
+        filtered out wins the counterfactual, because policies are only recorded for
+        solutions that were kept. Those auctions drop from both sides of the fee comparison
+        and are counted in the table. Nothing is read as a fee of zero.</li>
+      <li><strong>“Orders no longer executed” is a share of everything the chain
+        executed.</strong> The narrower per-auction reading — relative only to auctions the
+        solver bid in — is in the report files; it overstates chain-level dependence for a
+        selective bidder and is not shown here.</li>
+      <li><strong>Δprice comes in two conditionings, labelled.</strong> The headline spreads
+        the moved-order Δsurplus over all executed fill-or-kill volume; the sub-line is the
+        change on just the still-traded orders that moved. The two differ by up to two
+        orders of magnitude and neither substitutes for the other. Rows with few moved
+        orders are anecdotes rather than run rates — the uncatalogued solver <code>0x26a6fd…</code> moved 5 orders and Arctic 9, against Tsolver's 3,181 — and the moved count is
+        printed with every figure. Partially fillable orders are excluded from both, since
+        their two sides can execute different amounts.</li>
+      <li><strong>What “largest auction share” does and does not tell you.</strong> It is
+        the concentration of the <em>Δsurplus</em> column only — the biggest single
+        auction’s |Δsurplus| over the row’s signed total, across the auctions where surplus
+        moved. It says nothing about the coverage, price or quote columns, which
+        concentrate differently; the fee column carries its own largest-auction share on
+        its detail line, and a row whose deltas offset can exceed 100%. It is a
+        prompt to open the auction, not a discount factor: a 100% row is one real auction,
+        not a wrong number. What it tracks is <strong>how few auctions moved, not chain
+        size.</strong> For this run the concentrated rows are mostly the thin ones: of the seven rows at or above 30%, five moved fewer than 600 orders, Barter (56%, 6,443 moved) and Baseline (36%, 7,335 moved) are the exceptions, and the three largest rows by Δsurplus — Rizzolver, Fractal, Quasi — sit at 3%, 7% and 17%. A solver thin on a busy chain gets a concentrated row there.</li>
+      <li><strong>Concentrated rows, listed.</strong> Flowdesk 80%, Barter 56%, Gnosis_BalancerSOR 47%, OKX 41%, Baseline 36%, Arctic 30%, and the uncatalogued <code>0x26a6fd…</code> at 313% — that last one is a row whose auctions offset, not a wrong number. On the quote side the same check flags nine of the fifteen rows: Fractal 86%, Helixbox 66%, Baseline 64%, Wraxyn 62%, Barter 59%, BRRRolver 56%, BitgetWallet 44%, Gnosis_BalancerSOR 35% and Tsolver 34%.</li>
+      <li><strong>Exclusions are named, not silent.</strong> Price-suspect and missing-JIT
+        auctions are excluded from every statistic and enumerated in the report files.</li>
+      <li><strong>One chain.</strong> These solvers bid on other chains too, and removing a
+        solver from each chain is an independent counterfactual, so nothing here describes a
+        solver’s value across the protocol. Quote data exists for mainnet and BNB Chain
+        only.</li>
+    </ol>
+    <p class="footnote">Method: full re-arbitration per auction (fairness filter included)
+    on recorded scores; executed amounts from proposed executions; “executed” means settled
+    in time. Protocol fees recomputed from the recorded fee policies, validated against the
+    recorded score and against the accounting model’s own partner/protocol split. The quote
+    pick is re-derived from the recorded estimate ladder in ClickHouse, ranked on the
+    effective quote netted in the sell token at the order’s own recorded gas and token
+    price. Reports: 52 files, format 12, generated 2026-09-02. Produced
+    by <code>loo analyse --quotes</code> / <code>loo compare</code>.</p>
+  </section>
+
+</main>

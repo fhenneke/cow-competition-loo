@@ -29,6 +29,7 @@ from loo.counterfactual import (
     un_filtered,
 )
 from loo.extract import AuctionBundle, Bid, Settlement
+from loo.fees import FeeContext, Policy, Quote
 from loo.primitives import Pair
 from loo.valuation import Order, SolutionValuation, ValuedBid
 from loo.winner_selection import Solution, arbitrate
@@ -972,3 +973,268 @@ class TestJointRemoval:
         analysis.add(result)
         # `addresses - addresses_seen` is the dead weight the CLI refuses to carry.
         assert analysis.addresses_seen == frozenset({"y"})
+
+
+# --- the quote side reaching into the fee side ---------------------------------------
+
+PRICE_IMPROVEMENT = Policy(
+    kind="priceimprovement",
+    price_improvement_factor=0.5,
+    price_improvement_max_volume_factor=0.1,
+)
+RECORDED = Quote(sell_amount=1000, buy_amount=2050, fee=0)
+WORSE = Quote(sell_amount=1000, buy_amount=2020, fee=0)
+BETTER = Quote(sell_amount=1000, buy_amount=2200, fee=0)
+
+
+def quoted_bundle(
+    bids: list[Bid],
+    quotes: dict[str, Quote],
+    *,
+    auction_id: int = 1,
+    policies: dict[str, tuple[Policy, ...]] | None = None,
+    known_extra: tuple[str, ...] = (),
+) -> AuctionBundle:
+    """A bundle whose fee context charges a price-improvement fee on every quoted
+    order. `sell_order` executes 1,000 for 2,100 against a 2,000 limit, so the
+    improvement over `RECORDED` is 2,100 − 2,050 = 50 and over `WORSE` 80 — at a 50%
+    factor (re-expressed as 1.0) the fees are 50 and 80, in USDC atoms at a native
+    price of one, and the recharge is +30."""
+    # WETH at twice USDC's price, so the 1,000 -> 2,100 fill values the same on both
+    # legs and the D14 price-imbalance guard has nothing to exclude.
+    return AuctionBundle(
+        auction_id=auction_id,
+        jit_owners=frozenset(),
+        native_prices={USDC: ONE, WETH: 2 * ONE},
+        bids=tuple(bids),
+        reference_scores={},
+        fee_context=FeeContext(
+            policies=(
+                policies
+                if policies is not None
+                else {uid: (PRICE_IMPROVEMENT,) for uid in quotes}
+            ),
+            quotes=quotes,
+            partner_counts={},
+            known=frozenset(quotes) | frozenset(known_extra),
+        ),
+    )
+
+
+class TestQuoteSubstitution:
+    """The quote side reaching into the fee side (D28), in every auction that executed
+    a quoted order whether or not the solver bid there (D33), with the two limit checks
+    that license holding executions and ranking fixed (D34)."""
+
+    def test_the_fee_arithmetic_the_class_rests_on(self):
+        """Straight from `fees.py`, so every delta below can be read off by hand."""
+        from loo.fees import order_fees
+
+        context = quoted_bundle([], {"o1": RECORDED}).fee_context
+        recorded = order_fees(sell_order("o1"), context)
+        replaced = order_fees(sell_order("o1"), replace(context, quotes={"o1": WORSE}))
+        assert recorded is not None and recorded.total == 50
+        assert replaced is not None and replaced.total == 80
+
+    def test_a_recharged_fee_reaches_the_delta_in_an_auction_the_solver_never_bid_in(self):
+        """The quote winner often does not bid on its own order; the fee reference
+        moved all the same, and before D33 this auction returned all-zero deltas."""
+        result = analyse_auction(
+            quoted_bundle(
+                [bid(0, "a", 100, [sell_order("o1")], is_winner=True)], {"o1": RECORDED}
+            ),
+            WETH,
+            frozenset({"x"}),
+            settled={0: SETTLED},
+            counterfactual_quotes={"o1": WORSE},
+        )
+        assert result.solver_present is False
+        assert result.quote_carried_uids == frozenset({"o1"})
+        assert result.quote_substituted_uids == frozenset({"o1"})
+        assert result.baseline_winner_uids == result.loo_winner_uids == frozenset({0})
+        assert result.delta_surplus == 0
+        # With the recorded quotes on both sides nothing differs here; the recharge is
+        # the quote's own figure, per order and in total.
+        assert result.delta_protocol_fees == 0
+        assert result.quote_fee_recharges == {"o1": 30}
+        assert result.quote_fee_recharge == result.quote_fee_recharge_protocol == 30
+        assert result.quote_fee_recharge_partner == 0
+        assert result.quote_limit_unclearable_uids == frozenset()
+        assert result.quote_shift_winner_set_changed is False
+        # Retained: the per-auction moves are what `compare` converts to USD.
+        assert result.anything_moved
+
+        analysis = Analysis()
+        analysis.add(result)
+        assert (analysis.auctions, analysis.auctions_with_solver) == (1, 0)
+        assert analysis.auctions_quote_only == 1
+        assert analysis.auctions_quote_checked == 1
+        assert analysis.auctions_quote_substituted == 1
+        assert analysis.quote_substituted_orders == 1
+        assert analysis.delta_protocol_fees == 0
+        assert analysis.quote_fee_recharge == analysis.quote_fee_recharge_protocol == 30
+        # Nothing of this auction enters the fee levels: the solver never bid here.
+        assert analysis.protocol_fees_base == 0
+        assert analysis.surplus_base == 0
+        assert analysis.changed == [result]
+
+    def test_the_baseline_keeps_the_recorded_quote_and_the_counterfactual_the_replacement(self):
+        """`x` bid and lost; removing it changes no winner. The whole fee delta is the
+        recharge, on the counterfactual side only."""
+        result = analyse_auction(
+            quoted_bundle(
+                [
+                    bid(0, "a", 200, [sell_order("o1", executed_buy=2100)], is_winner=True),
+                    bid(1, "x", 100, [sell_order("o1", executed_buy=2090)]),
+                ],
+                {"o1": RECORDED},
+            ),
+            WETH,
+            frozenset({"x"}),
+            settled={0: SETTLED},
+            counterfactual_quotes={"o1": WORSE},
+        )
+        assert result.solver_present is True
+        assert result.baseline_winner_uids == result.loo_winner_uids == frozenset({0})
+        assert result.protocol_and_partner_fees_base == 50
+        assert result.protocol_and_partner_fees_loo == 50  # recorded quote on both sides
+        assert result.quote_fee_recharge == 30
+        assert result.delta_surplus == 0
+
+        analysis = Analysis()
+        analysis.add(result)
+        assert (analysis.auctions_with_solver, analysis.auctions_quote_only) == (1, 0)
+        assert analysis.quote_substituted_orders == 1
+        assert (analysis.delta_protocol_fees, analysis.quote_fee_recharge) == (0, 30)
+
+    def test_a_carried_quote_without_a_price_improvement_policy_recharges_nothing(self):
+        result = analyse_auction(
+            quoted_bundle(
+                [bid(0, "a", 100, [sell_order("o1")], is_winner=True)],
+                {"o1": RECORDED},
+                policies={"o1": ()},
+            ),
+            WETH,
+            frozenset({"x"}),
+            settled={0: SETTLED},
+            counterfactual_quotes={"o1": WORSE},
+        )
+        assert result.quote_carried_uids == frozenset({"o1"})
+        assert result.quote_substituted_uids == frozenset()
+        assert result.delta_protocol_fees == 0 and result.quote_fee_recharge == 0
+        assert not result.anything_moved
+
+    def test_an_unusable_replacement_drops_out_alone(self):
+        """A replacement whose fee exceeds its own sell amount cannot be charged
+        against; it keeps the recorded quote while the other order is still
+        recharged, rather than the whole auction reading as unpriced."""
+        result = analyse_auction(
+            quoted_bundle(
+                [bid(0, "a", 100, [sell_order("o1"), sell_order("o2")], is_winner=True)],
+                {"o1": RECORDED, "o2": RECORDED},
+            ),
+            WETH,
+            frozenset({"x"}),
+            settled={0: SETTLED},
+            counterfactual_quotes={
+                "o1": WORSE,
+                "o2": Quote(sell_amount=1000, buy_amount=2020, fee=2000),
+            },
+        )
+        assert result.quote_carried_uids == frozenset({"o1"})
+        assert result.quote_substituted_uids == frozenset({"o1"})
+        assert result.fees_complete
+        assert result.quote_fee_recharges == {"o1": 30}
+
+    def test_a_better_replacement_can_tighten_the_limit_past_the_execution(self):
+        """The one direction in which holding the execution fixed is not free: a
+        class flip's replacement may quote more, and the user would then have signed
+        a limit the recorded fill no longer clears. Counted, not modelled."""
+        result = analyse_auction(
+            quoted_bundle(
+                [bid(0, "a", 100, [sell_order("o1")], is_winner=True)], {"o1": RECORDED}
+            ),
+            WETH,
+            frozenset({"x"}),
+            settled={0: SETTLED},
+            counterfactual_quotes={"o1": BETTER},
+        )
+        assert result.quote_substituted_uids == frozenset({"o1"})
+        # 2,000 x 2200/2050 = 2,146 required against 2,100 received.
+        assert result.quote_limit_unclearable_uids == frozenset({"o1"})
+        # No improvement over a quote above the fill: the recharge is the whole fee, lost.
+        assert result.quote_fee_recharge == -50
+
+        analysis = Analysis()
+        analysis.add(result)
+        assert analysis.quote_limit_unclearable_orders == 1
+
+    def test_a_weaker_limit_that_would_flip_the_ranking_is_counted_not_applied(self):
+        """`a` loses the pair to `b` by five. Had `o1` been signed against a quote of
+        1,000 instead of 2,050, the mechanism would have measured ~1,024 more surplus
+        on `a`'s fill and `a` would have won. Scores are never recomputed (D1); the
+        auction is flagged so the design's assumption is tested rather than held."""
+        result = analyse_auction(
+            quoted_bundle(
+                [
+                    bid(0, "a", 100, [sell_order("o1")]),
+                    bid(1, "b", 105, [sell_order("o3")], is_winner=True),
+                ],
+                {"o1": RECORDED},
+                known_extra=("o3",),
+            ),
+            WETH,
+            frozenset({"x"}),
+            settled={1: SETTLED},
+            counterfactual_quotes={"o1": Quote(sell_amount=1000, buy_amount=1000, fee=0)},
+        )
+        assert result.baseline_winner_uids == result.loo_winner_uids == frozenset({1})
+        assert result.quote_carried_uids == frozenset({"o1"})
+        # `o1` sits in the losing bid: nothing was recharged, nothing moved...
+        assert result.quote_substituted_uids == frozenset()
+        assert not result.anything_moved
+        # ...but the ranking channel is live here, and says so.
+        assert result.quote_shift_winner_set_changed is True
+
+        analysis = Analysis()
+        analysis.add(result)
+        assert analysis.auctions_quote_checked == 1
+        assert analysis.auctions_quote_shift_would_change_winners == 1
+        assert analysis.quote_shift_auctions == [1]
+        assert analysis.changed == []
+
+    def test_an_absent_auction_with_no_carried_order_is_still_skipped(self):
+        result = analyse_auction(
+            quoted_bundle(
+                [bid(0, "a", 100, [sell_order("o1")], is_winner=True)], {"o1": RECORDED}
+            ),
+            WETH,
+            frozenset({"x"}),
+            settled={0: SETTLED},
+            counterfactual_quotes={"elsewhere": WORSE},
+        )
+        assert result.solver_present is False
+        assert result.order_diffs == ()
+        analysis = Analysis()
+        analysis.add(result)
+        assert analysis.auctions_quote_checked == 0
+
+    def test_an_order_recharged_in_two_auctions_is_one_order(self):
+        analysis = Analysis()
+        for auction_id in (1, 2):
+            analysis.add(
+                analyse_auction(
+                    quoted_bundle(
+                        [bid(0, "a", 100, [sell_order("o1")], is_winner=True)],
+                        {"o1": RECORDED},
+                        auction_id=auction_id,
+                    ),
+                    WETH,
+                    frozenset({"x"}),
+                    settled={0: SETTLED},
+                    counterfactual_quotes={"o1": WORSE},
+                )
+            )
+        assert analysis.auctions_quote_substituted == 2
+        assert analysis.quote_substituted_orders == 1
+        assert analysis.quote_fee_recharge == 60

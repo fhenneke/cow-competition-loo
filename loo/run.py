@@ -17,9 +17,10 @@ import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from decimal import Decimal
+from types import MappingProxyType
 from typing import Any, NamedTuple, cast
 
-from . import extract
+from . import ch, extract, quotes
 from .aggregate import REPORT_FORMAT, SIGN_CONVENTION_ID
 from .counterfactual import (
     OUTCOME_RULE,
@@ -29,7 +30,9 @@ from .counterfactual import (
     analyse_auction,
 )
 from .db import Connection
+from .fees import Quote
 from .primitives import MAX_WINNERS, wrapped_native_token
+from .quotes import QuoteAnalysis, QuoteRanking, QuoteWindow
 from .valuation import Mode
 
 
@@ -123,6 +126,14 @@ class SolverRun:
     cow: CowConversion | None = None
     """Native -> COW conversion of the reward deltas; `None` in surplus mode, where no
     rewards exist to convert."""
+    quote_substitutions: Mapping[str, Quote] = MappingProxyType({})
+    """`order_uid -> counterfactual quote`, cached off `quote.counterfactual_quotes` so
+    the auction loop does not rebuild it per auction."""
+    quote: QuoteAnalysis | None = None
+    """The quote side of this scenario; `None` when the run had no quote pass, which is
+    the state a network without quote data is always in (Q-D10). Rule-independent — the
+    quote competition has no settlement — so the runs of one scenario under two outcome
+    rules share it."""
 
 
 def absent_members(solver_run: SolverRun) -> list[str]:
@@ -150,6 +161,9 @@ class WindowAnalysis:
     """Auctions excluded before arbitration because a traded order is in neither order
     table (D17). A property of the window, so shared by every run."""
     runs: list[SolverRun]
+    quote_window: QuoteWindow | None = None
+    """The quote competition over the same window, loaded once for every scenario;
+    `None` when the quote pass was off or the network has no quote data."""
 
 
 def analyse_window(
@@ -164,6 +178,8 @@ def analyse_window(
     max_winners: int = MAX_WINNERS,
     include_price_suspects: bool = False,
     limit: int | None = None,
+    with_quotes: bool = False,
+    quote_ranking: QuoteRanking = "effective-sell",
     log: Callable[[str], None] | None = None,
 ) -> WindowAnalysis:
     """Remove each scenario's solvers from every auction in `[start, end)` and diff
@@ -277,6 +293,38 @@ def analyse_window(
     if not auction_ids:
         return window
 
+    # The quote side, loaded once for every scenario and every rule: the ladder and the
+    # order match are scenario-independent, exactly as the auction bundles are (D18).
+    # A network without quote data is refused here rather than silently reporting zeros.
+    if with_quotes:
+        if not ch.has_quote_data(network):
+            raise ch.NoQuoteDataError(
+                f"--quotes was asked for on {network!r}, which has no quote data; "
+                f"quote coverage is {', '.join(sorted(ch.NETWORK_CHAIN_IDS))}"
+            )
+        window.quote_window = quotes.load_quote_window(
+            ch.Client.from_env(),
+            conn,
+            network,
+            start,
+            end,
+            ranking=quote_ranking,
+            auction_ids=auction_ids,
+            log=log,
+        )
+        by_scenario = {
+            label: window.quote_window.analyse(label, addresses)
+            for label, _, addresses, _ in resolved
+        }
+        for run in runs:
+            run.quote = by_scenario[run.solver]
+            run.quote_substitutions = run.quote.counterfactual_quotes
+            emit(
+                f"quote side {run.solver!r}: {run.quote.quote_wins} quote wins "
+                f"({run.quote.no_quote} would leave no quote), "
+                f"{len(run.quote_substitutions)} counterfactual quotes for the fee path"
+            )
+
     settled: dict[int, dict[int, extract.Settlement]] = {}
     if any(rule != "assume-settled" for rule in outcome_rules):
         settled = extract.load_settlement_outcomes(conn, auction_ids)
@@ -307,6 +355,7 @@ def analyse_window(
                     outcome_rule=run.analysis.outcome_rule,
                     settled=settled.get(bundle.auction_id, {}),
                     solution_caps=caps.get(bundle.auction_id, {}),
+                    counterfactual_quotes=run.quote_substitutions,
                 )
             )
 
@@ -350,6 +399,7 @@ _ANALYSIS_PROPERTIES = (
     "delta_surplus",
     "delta_rewards",
     "delta_rewards_capped",
+    "quote_fee_recharge_protocol",
     *_FEE_PROPERTIES,
 )
 _AUCTION_PROPERTIES = (
@@ -361,12 +411,21 @@ _AUCTION_PROPERTIES = (
     "protocol_and_partner_fees_loo",
     "partner_fees_base",
     "partner_fees_loo",
+    "quote_fee_recharge",
+    "quote_fee_recharge_partner",
+    "quote_fee_recharge_protocol",
     *_FEE_PROPERTIES,
 )
 
 
 def _fields_and_properties(obj: Any, properties: Sequence[str]) -> dict[str, Any]:
-    data = {f.name: getattr(obj, f.name) for f in fields(obj)}
+    """Every field and the named properties, except fields declared
+    `metadata={"report": False}` — bookkeeping behind a reported count, not a result."""
+    data = {
+        f.name: getattr(obj, f.name)
+        for f in fields(obj)
+        if f.metadata.get("report", True)
+    }
     data.update({name: getattr(obj, name) for name in properties})
     return data
 
@@ -389,6 +448,79 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"cannot serialise {type(value).__name__}: {value!r}")
 
 
+_QUOTE_PROPERTIES = (
+    "window_bps",
+    "window_bps_all_tiers",
+    "conditional_bps",
+    "no_quote_share",
+)
+
+
+def _quote_payload(analysis: QuoteAnalysis) -> dict[str, Any]:
+    """One run's quote side, with the per-order diffs reduced to what a reader of the
+    file needs: the leaf, its weight and its bps. The counterfactual `Quote` itself is
+    dropped — it is an input to the fee path, not a result, and it is the one field that
+    would double the file."""
+    data = {
+        f.name: getattr(analysis, f.name)
+        for f in fields(analysis)
+        if f.name != "diffs"
+    }
+    data.update({name: getattr(analysis, name) for name in _QUOTE_PROPERTIES})
+    data["diffs"] = [
+        {
+            "order_uid": diff.order_uid,
+            "leaf": diff.leaf,
+            "tier": diff.tier,
+            "winner": diff.winner,
+            "replacement": diff.replacement,
+            "delta_bps": diff.delta_bps,
+            "volume_native": diff.volume_native,
+            "partially_fillable": diff.partially_fillable,
+        }
+        for diff in analysis.diffs
+    ]
+    return data
+
+
+def _quote_window_payload(quote_window: QuoteWindow) -> dict[str, Any]:
+    """The window's quote metadata — shared by every scenario, so it says what the
+    quote side could see rather than what one solver did with it."""
+    validation = quote_window.validation
+    return {
+        "ranking": quote_window.ranking,
+        "ranking_description": quotes.RANKING[quote_window.ranking],
+        "coverage_start": quote_window.coverage_start,
+        "start": quote_window.start,
+        "end": quote_window.end,
+        "orders": len(quote_window.orders),
+        "orders_dropped": quote_window.orders_dropped,
+        "orders_before_coverage": quote_window.orders_before_coverage,
+        "matched": len(quote_window.matches),
+        "matched_corroborated": sum(
+            1 for m in quote_window.matches if m.tier == "corroborated"
+        ),
+        "matched_raw": quote_window.matched_raw,
+        "volume_native": quote_window.window_volume_native,
+        "quoted_volume_native": quote_window.window_quoted_volume_native,
+        "price_suspects": len(quote_window.price_suspects),
+        "coverage_by_app": [
+            {"app_code": app, "orders": n, "matched": m}
+            for app, n, m in quote_window.coverage_by_app()[:25]
+        ],
+        "estimators_mapped": len(quote_window.estimator_map),
+        "pick_requests": validation.with_recorded_winner,
+        "pick_reproduced": validation.reproduced,
+        "pick_rate": validation.rate,
+        "pick_mixed_class": validation.mixed_class,
+        "pick_mixed_class_correct": validation.mixed_class_correct,
+        "pick_tied": validation.tied,
+        "pick_unpriced": validation.unpriced,
+        "pick_price_suspect": validation.price_suspect,
+        "pick_disagreements": validation.disagreements[:20],
+    }
+
+
 def report_payload(window: WindowAnalysis, run: SolverRun) -> dict[str, Any]:
     """The `analyse --out` payload for one run.
 
@@ -405,6 +537,12 @@ def report_payload(window: WindowAnalysis, run: SolverRun) -> dict[str, Any]:
         "end": window.end,
         "outcome_rule_description": OUTCOME_RULE[analysis.outcome_rule],
         "cow": run.cow._asdict() if run.cow is not None else None,
+        "quote": _quote_payload(run.quote) if run.quote is not None else None,
+        "quote_window": (
+            _quote_window_payload(window.quote_window)
+            if window.quote_window is not None
+            else None
+        ),
     }
     payload.update(_fields_and_properties(analysis, _ANALYSIS_PROPERTIES))
     payload["changed"] = [

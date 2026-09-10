@@ -63,6 +63,10 @@ def connect(network: str = "mainnet", *, connect_timeout: int = 20) -> Connectio
     user, password = credentials.split(":", 1)
     host, port = hostport.split(":")
 
+    # Timestamps come back rendered in the session's timezone, and the quote side
+    # compares them as naive strings against ClickHouse's UTC clock inside a window of
+    # minutes — so the timezone is pinned rather than inherited from the server or a
+    # `PGTZ` in the environment, where a change would silently empty every match.
     conn = psycopg2.connect(
         host=host,
         port=port,
@@ -70,6 +74,7 @@ def connect(network: str = "mainnet", *, connect_timeout: int = 20) -> Connectio
         password=password,
         dbname=database_name(network),
         connect_timeout=connect_timeout,
+        options="-c timezone=UTC",
     )
     conn.set_session(readonly=True)
     return conn

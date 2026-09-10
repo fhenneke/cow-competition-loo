@@ -44,10 +44,21 @@ WEI = Decimal(10) ** 18
 HEADLINE_RULE = "inherited"
 ALTERNATIVE_RULES = ("assume-settled",)
 
-REPORT_FORMAT = 8
+REPORT_FORMAT = 13
 """Version marker of the `analyse --out` payload, required by `load_report`. Bumped
 when the shape changes, so a stale file fails with "re-run analyse" instead of a
-KeyError deep inside a comparison. Format 8 added
+KeyError deep inside a comparison. Format 13 splits the fee: the fee deltas are computed
+with the recorded quotes on both sides and the quote's own fee effect is carried apart, per
+auction and per recharged order (`quote_fee_recharge*`, D28 revised). Format 12 links
+orders to the competitions the gold tables do not hold (recovered from the raw layer) and
+carries the per-source match count.
+Format 11 recounts `quote_substituted_orders` as
+distinct executed orders, adds the quote-only auction count and the two limit checks
+(D33, D34), and retains fee-only auctions in `changed` — a format-10 file's per-auction
+fee moves are short by the quote effect wherever nothing else moved. Within format 11
+the optional `quote_shift_auctions` id list was added later and is read with a default,
+so the one file shape that predates it still loads. Format 10 added
+the quote side (M15). Format 8 added
 `auctions_filter_guess_could_matter` — whether a guessed filter verdict could have moved
 an auction's winners, the counterfactual's one filter number with no ground truth behind
 it. Format 7 moved the fairness filter onto per-pair
@@ -97,7 +108,33 @@ CAVEATS = (
     "fallback actually decided something. On the mainnet calibration window the filter "
     "reproduces the recorded competition exactly "
     "(docs/winner-selection.md#the-filter-runs-on-score).",
-    "Quote rewards are excluded: no data on counterfactual quoting.",
+    "The quote side, when run, is a second removal: the solver is taken out of the "
+    "quote competition too, the pick is re-run for every order created in the window "
+    "that could be linked to its competition, and the price-improvement fee of the "
+    "affected orders is recharged against the replacement quote in every auction that "
+    "executed them, whether or not the solver bid there. That recharge is reported as "
+    "its own row and is NOT added to the fee rows, which are computed with the recorded "
+    "quotes on both sides: a worse quote raises the price-improvement baseline "
+    "mechanically, so folding it in would read as the protocol gaining from losing a good "
+    "quoter. One rule decides what moves: everything the solvers did — bids, executions, "
+    "ranking — is held as recorded; the user-price effect is the shown-price change on "
+    "the quote side, never a surplus recomputed against a limit nobody signed, which "
+    "would rise exactly when the user was shown a worse price. Three limits ride "
+    "with it. The pick is reproduced, not recorded: the table reports how often "
+    "re-running it returns the recorded winner. The order to request match is a "
+    "heuristic (tokens, kind, amount, time) — placed against the gold request table and, "
+    "for the competitions that table does not hold, against the raw estimates — of which "
+    "about four in five are corroborated by the winning estimate's own amount, and only "
+    "corroborated matches are allowed to move a fee. And holding "
+    "executions and ranking fixed is checked, not assumed: the "
+    "table counts recharged orders whose execution would not have cleared the limit the "
+    "replacement quote implies, and auctions where shifting every score by that limit "
+    "change would move the winner set.",
+    "Quote rewards (CIP-72) are excluded: the counterfactual quote's eligibility is "
+    "not evaluated, so no reward figure on either side includes them.",
+    "Conversion is out of scope: a worse quote means some users would not have placed "
+    "the order at all, and there is no counterfactual for an order nobody created. The "
+    "quote figures describe the price shown on orders that *were* created.",
     "Two reward figures: uncapped is the mechanism's exact accounting but not what is "
     "paid out; capped is at payout scale but an estimate (a replacement winner "
     "inherits the reward cap of the slot it takes). The net-change row nets against "
@@ -156,7 +193,113 @@ class AuctionMove:
     delta_partner_fees: int = 0
     delta_protocol_fees: int = 0
     """Per-auction fee deltas, so the USD conversion uses each auction's own rate rather
-    than a window average — the same treatment Δsurplus gets."""
+    than a window average — the same treatment Δsurplus gets. Computed with the recorded
+    quotes on both sides; the quote's own fee effect is the recharge below."""
+    quote_fee_recharge: int = 0
+    quote_fee_recharge_partner: int = 0
+    quote_fee_recharge_protocol: int = 0
+    quote_fee_recharges: tuple[int, ...] = ()
+    """The price-improvement fee the counterfactual executions pay against the replacement
+    quotes minus against the recorded ones — gross, the partners' part, the DAO's — and
+    the per-order values behind them, for the median and the concentration check."""
+
+
+@dataclass(frozen=True)
+class QuoteSide:
+    """The quote competition's part of one report.
+
+    Three figures lead, one per question the quote side exists to answer, and the fee
+    consequence is deliberately not among them: it is inside `delta_protocol_fees`,
+    because the counterfactual quote is what the recorded execution's
+    `priceimprovement` fee was recomputed against. One fee number, not two.
+    """
+
+    ranking: str
+    start: str
+    end: str
+    """The window the quote side covers. Shorter than the run's when the quote data
+    begins later — reported rather than left to look like a thin market."""
+    orders_total: int
+    """Every order created in the quote window that carries a recorded quote — the base
+    the match rate is over, before the price-suspect exclusion."""
+    window_orders: int
+    window_volume_native: int
+    """Orders created in the window carrying a recorded quote **and** passing the
+    price cross-check, and the **executed** sell-side value of those orders in native
+    wei — the denominators of `no_quote_share` and `window_bps`. Executed rather than
+    quoted: probe orders that never trade would otherwise be most of the denominator."""
+    window_quoted_volume_native: int
+    price_suspects: int
+    """What was quoted whether it traded or not, and the orders excluded because their
+    two native price feeds disagree."""
+    matched: int
+    matched_corroborated: int
+    matched_raw: int
+    """How many of those the ladder could be attached to, how many of those the winning
+    estimate's own amount corroborates, and how many rest on competitions the gold tables
+    do not hold (recovered from the raw layer). Everything below is over `matched`."""
+    quote_wins: int
+    quote_wins_corroborated: int
+    no_quote: int
+    no_quote_all: int
+    no_quote_share: Decimal | None
+    class_flips: int
+    """Wins where the replacement is unverified while the removed winner was verified:
+    the quote survives and may even read better in bps, while its quality falls. Its own
+    count, never netted into the bps figures."""
+    degraded: int
+    unpriced: int
+    nonpositive: int
+    implausible: int
+    """Wins whose replacement quote is more than 2x off the recorded one in either
+    direction — a broken estimate promoted to winner, excluded from every figure."""
+    window_bps: Decimal | None
+    window_bps_all_tiers: Decimal | None
+    conditional_bps: Decimal | None
+    """The quote-side price change, spread over the window's whole quoted volume and —
+    the conditional reading — over the volume of the orders whose quote moved. Both are
+    labelled; neither substitutes for the other (D23's rule, applied to quotes)."""
+    median_bps: Decimal | None
+    largest_share: Decimal | None
+    largest_bps: Decimal | None
+    """The distribution behind those averages, because it is heavy-tailed and the
+    averages are dominated by their tail: the median moved order, and the largest single
+    order's share of the numerator with its own bps. Measured on July mainnet, one order
+    was 86.6% of one solver's figure and 84.6% of another's — the same concentration
+    check the solve side runs on Δsurplus, and the same reason it exists. Derived from
+    the stored diffs at load time, so no re-run is needed to revise the conditioning."""
+    fee_recharge: int
+    fee_recharge_partner: int
+    fee_recharge_protocol: int
+    fee_recharge_median: Decimal | None
+    fee_recharge_largest_share: Decimal | None
+    """The quote's own fee effect: the price-improvement fee the counterfactual
+    executions pay against the replacement quotes minus against the recorded ones —
+    gross, the partners' part, the DAO's — with the median recharged order and the
+    largest single order's share of the total, from the per-order values in the moves.
+    Positive for a solver whose quotes were good, and **not** added to the fee deltas:
+    a worse quote raises the fee baseline mechanically, which is not revenue the protocol
+    would gain (D28 revised)."""
+    substituted_orders: int
+    substituted_auctions: int
+    checked_auctions: int
+    quote_only_auctions: int
+    """Distinct executed orders whose price-improvement fee the counterfactual side
+    charged against a replacement quote, the auctions holding them, every auction where
+    any bid's order carried a replacement quote at all, and how many of those the solver
+    never bid in (D33). The quote effect visible inside `delta_protocol_fees`."""
+    limit_unclearable: int
+    shift_changed_auctions: int
+    shift_changed_auction_ids: tuple[int, ...]
+    """The two checks behind holding executions and ranking fixed under a replaced
+    quote (D34): recharged orders whose execution would not have cleared the limit the
+    replacement implies, and auctions where shifting every score by the limit change
+    would move the winner set. Both are expected near zero; either being large is a
+    finding about the design, not a number to adjust by."""
+    pick_rate: Decimal | None
+    pick_requests: int
+    """The gate: how often re-running the pick returns the estimator the competition
+    recorded, over the matched requests that had a recorded winner."""
 
 
 @dataclass(frozen=True)
@@ -201,8 +344,10 @@ class Report:
     delta_protocol_fees: int
     protocol_fees_base: int
     auctions_fees_incomplete: int
-    """How the protocol fee changes without the solver. `delta_protocol_and_partner_fees` is the
-    whole fee the mechanism charges and is the headline; `delta_partner_fees` is the
+    """How the protocol fee changes without the solver, **with the recorded quotes on both
+    sides** — what the removal does to fees through who executes; the quote's own fee
+    effect is `quote.fee_recharge`, kept apart (D28 revised). `delta_protocol_and_partner_fees` is
+    the whole fee the mechanism charges and is the headline; `delta_partner_fees` is the
     share passed on to partners, and `delta_protocol_fees` the remainder the DAO keeps.
     Partner fees are most of the *level* and almost none of the movement — see
     docs/analytics-db.md. All three are over the **union** of orders traded by either
@@ -247,6 +392,10 @@ class Report:
     included, counted once per auction it executes in — order executions. The
     denominator of `coverage_share` (D24)."""
     moves: tuple[AuctionMove, ...]
+    quote: QuoteSide | None = None
+    """The quote side of the same scenario, or `None` when the run had no quote pass —
+    which is the permanent state of a network with no quote data (Q-D10). `None` and
+    "all zeroes" are different findings and the comparison renders them differently."""
 
     @property
     def overall_bps(self) -> Decimal | None:
@@ -385,6 +534,112 @@ def _only_with_surplus(order_diffs: Sequence[Mapping[str, Any]]) -> int:
     )
 
 
+def _decimal_or_none(value: Any) -> Decimal | None:
+    return None if value is None else Decimal(str(value))
+
+
+def _quote_distribution(
+    diffs: Sequence[Mapping[str, Any]],
+) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+    """`(median_bps, largest_share, largest_bps)` over the diffs the headline is built
+    from — degraded, corroborated.
+
+    The share is the largest single order's contribution over the signed total, so a row
+    whose contributions offset can exceed 100%, exactly as the solve side's
+    largest-auction share can. It is a prompt to open the order, not a discount factor.
+    """
+    rows = [
+        d
+        for d in diffs
+        if d["leaf"] == "degraded" and d["tier"] == "corroborated"
+    ]
+    if not rows:
+        return None, None, None
+    contributions = [
+        (Decimal(str(d["delta_bps"])) / 10_000 * Decimal(d["volume_native"]), d)
+        for d in rows
+    ]
+    total = sum((c for c, _ in contributions), Decimal(0))
+    largest, row = max(contributions, key=lambda item: abs(item[0]))
+    middle = median(Decimal(str(d["delta_bps"])) for d in rows)
+    share = abs(largest) / abs(total) if total else None
+    return middle, share, Decimal(str(row["delta_bps"]))
+
+
+def median_of(values: Sequence[Decimal]) -> Decimal:
+    """`statistics.median` for `Decimal`s, kept exact on odd counts."""
+    return Decimal(median(values))
+
+
+def _quote_side(payload: Mapping[str, Any]) -> QuoteSide | None:
+    """The quote block of a report, or `None` when the run had no quote pass.
+
+    `quote_window` carries what the window could see and `quote` what one scenario did
+    with it, so both are needed: the pick rate is a property of the window and belongs
+    beside every solver's figures, since a poor one invalidates all of them.
+    """
+    quote = payload.get("quote")
+    window = payload.get("quote_window")
+    if quote is None or window is None:
+        return None
+    median, largest_share, largest_bps = _quote_distribution(quote["diffs"])
+    recharges = [
+        Decimal(v) for row in payload["changed"] for v in row["quote_fee_recharges"].values()
+    ]
+    recharge_total = sum(recharges, Decimal(0))
+    recharge_median = median_of(recharges) if recharges else None
+    recharge_share = (
+        max((abs(v) for v in recharges), default=Decimal(0)) / abs(recharge_total)
+        if recharges and recharge_total
+        else None
+    )
+    return QuoteSide(
+        ranking=quote["ranking"],
+        start=window["start"],
+        end=window["end"],
+        orders_total=window["orders"],
+        window_orders=quote["window_orders"],
+        window_volume_native=quote["window_volume_native"],
+        window_quoted_volume_native=window["quoted_volume_native"],
+        price_suspects=window["price_suspects"],
+        matched=quote["matched"],
+        matched_corroborated=quote["matched_corroborated"],
+        matched_raw=window["matched_raw"],
+        quote_wins=quote["quote_wins"],
+        quote_wins_corroborated=quote["quote_wins_corroborated"],
+        no_quote=quote["no_quote"],
+        no_quote_all=quote["no_quote_all"],
+        no_quote_share=_decimal_or_none(quote["no_quote_share"]),
+        class_flips=quote["class_flips"],
+        degraded=quote["degraded"],
+        unpriced=quote["unpriced"],
+        nonpositive=quote["nonpositive"],
+        implausible=quote["implausible"],
+        window_bps=_decimal_or_none(quote["window_bps"]),
+        window_bps_all_tiers=_decimal_or_none(quote["window_bps_all_tiers"]),
+        conditional_bps=_decimal_or_none(quote["conditional_bps"]),
+        median_bps=median,
+        largest_share=largest_share,
+        largest_bps=largest_bps,
+        fee_recharge=payload["quote_fee_recharge"],
+        fee_recharge_partner=payload["quote_partner_fee_recharge"],
+        fee_recharge_protocol=payload["quote_fee_recharge_protocol"],
+        fee_recharge_median=recharge_median,
+        fee_recharge_largest_share=recharge_share,
+        substituted_orders=payload["quote_substituted_orders"],
+        substituted_auctions=payload["auctions_quote_substituted"],
+        checked_auctions=payload["auctions_quote_checked"],
+        quote_only_auctions=payload["auctions_quote_only"],
+        limit_unclearable=payload["quote_limit_unclearable_orders"],
+        shift_changed_auctions=payload["auctions_quote_shift_would_change_winners"],
+        # Optional: added after format 11 was cut. A file without it loads with no ids
+        # rather than failing, since nothing else about it differs.
+        shift_changed_auction_ids=tuple(payload.get("quote_shift_auctions", ())),
+        pick_rate=_decimal_or_none(window["pick_rate"]),
+        pick_requests=window["pick_requests"],
+    )
+
+
 def load_report(path: str) -> Report:
     """Parse one `analyse --out` JSON, checking it is internally consistent.
 
@@ -428,6 +683,10 @@ def load_report(path: str) -> Report:
             delta_protocol_and_partner_fees=row["delta_protocol_and_partner_fees"],
             delta_partner_fees=row["delta_partner_fees"],
             delta_protocol_fees=row["delta_protocol_fees"],
+            quote_fee_recharge=row["quote_fee_recharge"],
+            quote_fee_recharge_partner=row["quote_fee_recharge_partner"],
+            quote_fee_recharge_protocol=row["quote_fee_recharge_protocol"],
+            quote_fee_recharges=tuple(row["quote_fee_recharges"].values()),
         )
         for row in payload["changed"]
     )
@@ -499,6 +758,7 @@ def load_report(path: str) -> Report:
         window_orders=payload["window_orders_base"],
         window_executions=payload["window_order_executions_base"],
         moves=moves,
+        quote=_quote_side(payload),
     )
 
     # An order executed only with the solver implies its winning solution changed, so
@@ -784,6 +1044,19 @@ def comparison(
     partner_fees = row("Δpartner fee")
     protocol_fees = row("Δprotocol fee")
 
+    # --- the quote side. Three figures, one per question it answers: how much worse
+    # the quotes, how often no quote at all, and what that does to the price-improvement
+    # fee — reported here, never added to the fee rows above (D28 revised). The pick rate
+    # rides along because it validates all three.
+    quote_price = row("quote price change, all executed volume")
+    quote_price_conditional = row("  on the orders whose quote moved")
+    quote_missing = row("orders that would not have been quoted")
+    quote_wins_row = row("  quote wins in the window")
+    quote_fee = row("Δprotocol fee from the quote recharge")
+    quote_substituted = row("  orders whose fee used a replacement quote")
+    quote_checks = row("  limit and ranking checks")
+    quote_pick = row("  quote pick reproduced the recorded winner")
+
     # --- detail
     surplus_median = row("  median non-zero auction")
     surplus_signs = row("  auctions moved + / −")
@@ -956,6 +1229,100 @@ def comparison(
             f"{report.auctions_filter_guess_could_matter:,}"
         )
 
+        quote = report.quote
+        if quote is None:
+            for cells in (
+                quote_price,
+                quote_price_conditional,
+                quote_missing,
+                quote_wins_row,
+                quote_fee,
+                quote_substituted,
+                quote_checks,
+                quote_pick,
+            ):
+                cells.append("no quote data")
+        else:
+            quote_price.append(
+                f"{bps(quote.window_bps, 3)} of {eth(quote.window_volume_native, 2)} "
+                f"ETH executed ({quote.window_orders:,} quoted orders, "
+                f"{eth(quote.window_quoted_volume_native, 2)} ETH quoted)"
+                if quote.window_bps is not None
+                else "n/a — the window's quoted orders traded nothing"
+            )
+            excluded = ", ".join(
+                part
+                for part in (
+                    f"{quote.class_flips:,} lost verification" if quote.class_flips else "",
+                    f"{quote.nonpositive:,} gas over input" if quote.nonpositive else "",
+                    f"{quote.price_suspects:,} price-suspect" if quote.price_suspects else "",
+                    f"{quote.implausible:,} implausible replacement" if quote.implausible else "",
+                )
+                if part
+            )
+            concentration = (
+                f"; largest order {bps(quote.largest_bps)} is "
+                f"{quote.largest_share:.0%} of it"
+                + (" ⚠" if quote.largest_share >= Decimal("0.30") else "")
+                if quote.largest_share is not None and quote.largest_bps is not None
+                else ""
+            )
+            median = (
+                f", median {bps(quote.median_bps)}"
+                if quote.median_bps is not None
+                else ""
+            )
+            quote_price_conditional.append(
+                f"{bps(quote.conditional_bps)} over {quote.degraded:,} orders"
+                f"{median}{concentration}"
+                + (f" ({excluded} excluded)" if excluded else "")
+                if quote.conditional_bps is not None
+                else "no quote moved"
+            )
+            quote_missing.append(
+                f"{quote.no_quote:,}"
+                + (
+                    f" ({quote.no_quote_share:.3%} of {quote.window_orders:,})"
+                    if quote.no_quote_share is not None
+                    else ""
+                )
+            )
+            quote_wins_row.append(
+                f"{quote.quote_wins_corroborated:,} corroborated of "
+                f"{quote.quote_wins:,} in {quote.matched:,} matched orders "
+                f"({quote.matched_raw:,} via the raw layer)"
+            )
+            recharge_detail = (
+                f"; median recharged order {signed_eth(quote.fee_recharge_median, 6)} ETH, "
+                f"largest {quote.fee_recharge_largest_share:.0%} of the total"
+                if quote.fee_recharge_median is not None
+                and quote.fee_recharge_largest_share is not None
+                else ""
+            )
+            quote_fee.append(
+                f"{signed_eth(quote.fee_recharge_protocol)} ETH to the DAO, "
+                f"{signed_eth(quote.fee_recharge_partner)} ETH to partners — not added to "
+                f"the fee rows above{recharge_detail}"
+            )
+            quote_substituted.append(
+                f"{quote.substituted_orders:,} in {quote.substituted_auctions:,} "
+                f"auctions, {quote.quote_only_auctions:,} of them without the "
+                f"solver's bid"
+            )
+            sample = ", ".join(str(a) for a in quote.shift_changed_auction_ids[:3])
+            quote_checks.append(
+                f"{quote.limit_unclearable:,} recharged orders would not clear the "
+                f"shifted limit; winners would move in {quote.shift_changed_auctions:,} "
+                f"of {quote.checked_auctions:,} auctions holding a replacement quote"
+                + (f" (e.g. {sample})" if sample else "")
+            )
+            quote_pick.append(
+                f"{quote.pick_rate:.3%} of {quote.pick_requests:,} requests "
+                f"({quote.ranking})"
+                if quote.pick_rate is not None
+                else "n/a"
+            )
+
         warnings.extend(_report_warnings(window, usd))
 
     return Table(
@@ -1026,6 +1393,21 @@ def _report_warnings(window: SolverWindow, usd: UsdContext | None) -> list[str]:
             warnings.append(
                 f"{label}: {report.cow_auctions_without_rate} auctions fall in an "
                 f"accounting period with no COW rate yet; COW figures omitted"
+            )
+        quote = report.quote
+        if quote is not None and (quote.start, quote.end) != (report.start, report.end):
+            warnings.append(
+                f"{label}: the quote side covers {quote.start}..{quote.end}, not the "
+                f"run's {report.start}..{report.end} — quote data begins later, so "
+                f"every quote figure is over that shorter window while the solve "
+                f"figures are over the whole one"
+            )
+        if quote is not None and quote.matched < quote.orders_total:
+            warnings.append(
+                f"{label}: {quote.matched:,} of {quote.orders_total:,} orders created "
+                f"in the quote window could be linked to a quote competition "
+                f"({quote.matched / quote.orders_total:.1%}); the unlinked ones "
+                f"contribute zero to every quote figure"
             )
         if usd:
             missing = sum(1 for m in report.moves if m.auction_id not in usd.rates)

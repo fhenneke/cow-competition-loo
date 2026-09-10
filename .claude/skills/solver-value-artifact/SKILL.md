@@ -75,6 +75,10 @@ concentrate differently and are not described by it; a row whose deltas offset c
 chains average higher only because they usually have few moved auctions, and a solver
 thin on a busy chain gets the same concentrated row. Frame it as a prompt to open the
 auction, not a discount factor: a 100% row is one real auction, not a wrong number.
+The fee column gets the same check on its own detail line (`fee_share`: the largest
+auction's |Δgross fee| over the row's signed total), unflagged, because a single recharged
+order with a price-improvement-kind partner policy can be most of a quoting solver's fee
+delta; it never substitutes for the Δsurplus share and is not summed across chains.
 
 ## The run comes first
 
@@ -105,8 +109,49 @@ uv run loo analyse --network mainnet \
 - `uv run loo compare out/*.json` across every network is the number source for the
   table. Its row labels are the column labels the page should use.
 - A full month per chain takes minutes and re-imports `loo/` on each invocation — do not
-  edit `loo/` while a run is in flight, and check `REPORT_FORMAT` (currently 8) matches
+  edit `loo/` while a run is in flight, and check `REPORT_FORMAT` (currently 13) matches
   the reports; `compare` refuses stale ones.
+- **`--quotes` where the chain has quote data** (mainnet, bnb): it removes the solver from
+  the quote competition too. It changes the meaning of a column the page already has — see
+  "The quote side" below — so a page built from quote-enabled reports and one built without
+  are not diffable on the fee column.
+
+## The quote side
+
+`--quotes` adds a second removal: the solver is taken out of the quote competition as well,
+and the price-improvement fee of the orders it quoted is recharged against the replacement
+quote. Two consequences for the page.
+
+**The fee column does not change meaning.** Δprotocol and partner fees is computed with the
+recorded quotes on both sides — what the removal does to fees through who executes. The
+quote's own fee effect (a worse quote raises the price-improvement baseline, so unchanged
+executions pay more) is **a column of the quote table**, "Δprotocol fee from the quote",
+never added to the fee column: folded in, it read as the protocol gaining from losing a
+good quoter. Say so where each is defined, and never sum the two on the page.
+
+**The quote side gets its own section, not columns in the focus band.** Three figures, one
+row per solver that won a matched quote:
+
+| figure | what it is |
+| --- | --- |
+| Δquote price | the change in the effective quote, in bps over the **executed** volume of the window's quoted orders — what those orders traded, not what was quoted — with the conditional reading (over the volume that moved) beneath |
+| orders that would not have been quoted | the count and its share of every order the quote window created — the coverage analogue |
+| Δprotocol fee from the quote | the price-improvement fee the counterfactual executions pay against the replacement quotes minus against the recorded ones — the DAO's part in USD at each auction's rate, with the partners' part, the recharged-order and auction counts (and how many auctions the solver never bid in) and the largest single order's share beneath |
+
+Two checks ride with the fee column and are named in the caveats with their counts:
+recharged orders whose execution would not have cleared the limit the replacement quote
+implies, and auctions where shifting every score by that limit change would move the
+winner set. Both should be near zero; a large one is a finding about the method and the
+page says so rather than adjusting by it.
+
+The section states three things about the window before the table, because they bound every
+figure in it: the **pick reproduction rate** (a window where it falls is a window where the
+protocol's rule changed), the **match coverage** (unmatched orders contribute zero), and
+the **quote window**, which is shorter than the run's whenever the quote data begins later.
+Class flips and heuristic-tier matches are excluded from the bps figures and their counts
+are named — see docs/quotes.md. State how the orders were linked: the gold request table
+plus the raw estimates for the competitions it never held, with the per-source match count
+the report carries.
 
 ## Page structure
 

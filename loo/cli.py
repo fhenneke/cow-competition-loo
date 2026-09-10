@@ -23,7 +23,7 @@ import sys
 from dataclasses import asdict
 from typing import cast
 
-from . import aggregate, counterfactual, db, extract, rewards, run, validate
+from . import aggregate, ch, counterfactual, db, extract, quotes, rewards, run, validate
 from .aggregate import cow_amount, eth, pct
 from .primitives import MAX_WINNERS, wrapped_native_token
 
@@ -126,6 +126,30 @@ def main(argv: list[str] | None = None) -> int:
             "keep auctions whose native prices fail the two-sided sanity check in "
             "every statistic instead of excluding them (they are excluded by default "
             "because a wrong price fabricates score, surplus and rewards)"
+        ),
+    )
+    analyse.add_argument(
+        "--quotes",
+        action="store_true",
+        help=(
+            "also remove the solver from the QUOTE competition: re-run the quote pick "
+            "for every order created in the window, report how much worse the quotes "
+            "would be and how often no quote would exist at all, and charge the "
+            "price-improvement fee of the affected orders against the replacement "
+            "quote so the protocol-fee delta includes the quote effect. Needs the "
+            "CLICKHOUSE_* credentials and a network with quote data (mainnet, bnb)"
+        ),
+    )
+    analyse.add_argument(
+        "--quote-ranking",
+        choices=("effective-sell", "autopilot"),
+        default="effective-sell",
+        help=(
+            "how the quote competition is re-run: on the effective quote netted in the "
+            "sell token at the order's own recorded prices (default, reproduces the "
+            "recorded winner on 99.6%% of mainnet requests and needs nothing that is "
+            "not recorded), or on the autopilot's own out-token rule, which needs the "
+            "buy token's native price and is the cross-check"
         ),
     )
     analyse.add_argument("--max-winners", type=int, default=MAX_WINNERS)
@@ -454,10 +478,15 @@ def run_analyse(args: argparse.Namespace) -> int:
                 max_winners=args.max_winners,
                 include_price_suspects=args.include_price_suspects,
                 limit=args.limit,
+                with_quotes=args.quotes,
+                quote_ranking=args.quote_ranking,
                 log=lambda message: print(message, file=sys.stderr),
             )
         except (extract.SolverResolutionError, ValueError) as error:
             print(f"ERROR: {error}", file=sys.stderr)
+            return 4
+        except ch.NoQuoteDataError as error:
+            print(f"ERROR: {error.args[0] if error.args else error}", file=sys.stderr)
             return 4
         except counterfactual.MissingSettlementError as error:
             # The settlement source does not reach this window. Reporting a partial run
@@ -474,7 +503,7 @@ def run_analyse(args: argparse.Namespace) -> int:
     reduced: dict[str, list[str]] = {}
     skipped = False
     for solver_run in window.runs:
-        report_analysis(solver_run.analysis, args, solver_run.cow)
+        report_analysis(solver_run.analysis, args, solver_run.cow, solver_run.quote)
         if args.out:
             path = report_path(
                 args.out, solver_run.solver, solver_run.analysis.outcome_rule
@@ -590,10 +619,66 @@ def run_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def report_quote_side(analysis: quotes.QuoteAnalysis) -> None:
+    """The quote side of one run: three figures and what they rest on.
+
+    The fee consequence is deliberately absent — it is inside the protocol-fee delta
+    printed above, because the counterfactual quote is what the recorded execution's
+    price-improvement fee was recomputed against.
+    """
+    print(f"\n--- quote competition ({analysis.ranking}) ---")
+    if not analysis.quote_wins:
+        print(
+            "  the solver won no matched quote in the window — nothing on the quote "
+            "side moves"
+        )
+        return
+    window_bps, conditional = analysis.window_bps, analysis.conditional_bps
+    print(
+        f"  quote price      "
+        f"{window_bps:+.3f} bps of all quoted volume"
+        if window_bps is not None
+        else "  quote price      n/a — the window quoted nothing"
+    )
+    if conditional is not None:
+        print(
+            f"                   {conditional:+.2f} bps over the "
+            f"{analysis.degraded:,} orders whose quote moved"
+        )
+    share = analysis.no_quote_share
+    print(
+        f"  no quote at all  {analysis.no_quote:,} orders"
+        + (f" ({share:.3%} of {analysis.window_orders:,} created)" if share else "")
+    )
+    print(
+        f"  quote wins       {analysis.quote_wins:,} of {analysis.matched:,} matched "
+        f"orders ({analysis.matched_corroborated:,} corroborated)"
+    )
+    if analysis.class_flips:
+        print(
+            f"  lost verification {analysis.class_flips:,} wins whose replacement is "
+            f"unverified — the bps figure understates these"
+        )
+    excluded = [
+        (analysis.nonpositive, "the gas cost swallowed the input"),
+        (analysis.price_suspect, "the order's two native price feeds disagree"),
+        (analysis.unpriced, "the ranking had no native price for the out token"),
+        (
+            analysis.implausible,
+            f"the replacement quote is more than {quotes.IMPLAUSIBLE_QUOTE_FACTOR:g}x off "
+            f"the recorded one — a broken estimate promoted to winner",
+        ),
+    ]
+    for count, why in excluded:
+        if count:
+            print(f"  excluded         {count:,} wins — {why}")
+
+
 def report_analysis(
     analysis: counterfactual.Analysis,
     args: argparse.Namespace,
     cow: run.CowConversion | None = None,
+    quote: quotes.QuoteAnalysis | None = None,
 ) -> None:
     total = analysis.auctions
     print(f"\n=== leave one out: {analysis.solver} ===")
@@ -660,7 +745,13 @@ def report_analysis(
     print(f"delta partner fees            {eth(analysis.delta_partner_fees)} ETH")
     print(
         f"delta DAO fee revenue         {eth(analysis.delta_protocol_fees)} ETH"
-        "   <- negative: the DAO collects less without the solver"
+        + (
+            "   <- negative: the DAO collects less without the solver"
+            if analysis.delta_protocol_fees < 0
+            else "   <- positive: the DAO collects more without the solver"
+            if analysis.delta_protocol_fees > 0
+            else ""
+        )
     )
     if analysis.auctions_fees_incomplete:
         print(
@@ -782,6 +873,27 @@ def report_analysis(
         f"{analysis.reference_influence} auction-solver pairs"
         "  <- where its removal moves a reward"
     )
+
+    if quote is not None:
+        report_quote_side(quote)
+        print(
+            f"  fees recharged   {analysis.quote_substituted_orders:,} executed orders "
+            f"in {analysis.auctions_quote_substituted:,} auctions had their "
+            f"price-improvement fee charged against the replacement quote, "
+            f"{analysis.auctions_quote_only:,} of those auctions without a bid from "
+            f"the solver"
+            "\n                   <- already inside the delta protocol fee above"
+        )
+        print(
+            f"  limit check      {analysis.quote_limit_unclearable_orders:,} recharged "
+            f"orders would not have cleared the limit the replacement quote implies "
+            f"(class flips only — a worse quote weakens the limit)"
+        )
+        print(
+            f"  ranking check    shifting every score by the limit change would move the "
+            f"winner set in {analysis.auctions_quote_shift_would_change_winners:,} of "
+            f"{analysis.auctions_quote_checked:,} auctions holding a replacement quote"
+        )
 
     if analysis.valuation_failures:
         print(f"\nvaluation failures ({len(analysis.valuation_failures)}):")

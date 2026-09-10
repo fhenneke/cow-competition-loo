@@ -21,13 +21,15 @@ winner's orders are given, which is the one judgement call this module makes —
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Literal
 
 from .extract import AuctionBundle, Bid, Settlement, SolutionCap
+from .fees import FeeContext, Quote
 from .primitives import MAX_WINNERS, Pair, price_in_eth
+from .quotes import shifted_limit
 from .rewards import SolverReward, Win, uncapped_rewards
 from .valuation import Mode, ValuedBid, build_solutions
 from .winner_selection import (
@@ -711,6 +713,36 @@ class AuctionCounterfactual:
     cap_orphans_loo: frozenset[int] = frozenset()
     """LOO winners whose cap could not even be estimated; their solvers' capped
     rewards are `None` and the auction drops out of the capped aggregate."""
+    quote_carried_uids: frozenset[str] = frozenset()
+    """Orders of any bid here that carried a replacement quote into the counterfactual
+    valuation, because a removed solver had won their quote competition. The auctions
+    with a non-empty set are the ones the quote side touched at all — the denominator
+    of the ranking check — and they include auctions the removed solver never bid in
+    (D33): the fee reference does not need the solver's bid to exist."""
+    quote_substituted_uids: frozenset[str] = frozenset()
+    """Of those, the orders the counterfactual side **executed** and charged a
+    `priceimprovement` fee on: exactly the orders through which the quote effect enters
+    `quote_fee_recharge`. An order in a losing bid, or without a price-improvement
+    policy, carries a replacement quote and moves nothing."""
+    quote_fee_recharges: dict[str, int] = field(default_factory=dict[str, int])
+    quote_partner_fee_recharges: dict[str, int] = field(default_factory=dict[str, int])
+    """Per recharged order, in native: the fee the counterfactual execution pays against
+    the replacement quote minus what it pays against the recorded one, and the partners'
+    part of that. The quote's own fee effect — kept **apart** from the fee deltas below,
+    which are computed with the recorded quotes on both sides (D28 revised): a worse
+    quote raises the price-improvement baseline mechanically, and folding that into the
+    fee column read as the protocol gaining from losing a good quoter."""
+    quote_limit_unclearable_uids: frozenset[str] = frozenset()
+    """Of those, the orders whose recorded execution would **not** have satisfied the
+    limit price the replacement quote implies (`quotes.shifted_limit`). Only a class
+    flip can produce one — a worse quote weakens the limit — so this is the residual
+    of holding executions fixed under a replaced quote (D34)."""
+    quote_shift_winner_set_changed: bool = False
+    """Would the counterfactual winner set differ if every solution's score carried the
+    measured-surplus shift its substituted orders' weaker limits imply? The ranking
+    channel of a replaced quote, checked rather than modelled (D34): scores are never
+    recomputed from a counterfactual quote (D1), so this is a validation count."""
+
     price_suspect_uids: frozenset[int] = frozenset()
     """Solutions whose sell-side and buy-side trade values disagree by more than
     `PRICE_IMBALANCE_THRESHOLD`, meaning a native price is probably wrong and every
@@ -789,10 +821,17 @@ class AuctionCounterfactual:
         """Is this auction worth retaining rather than just counting?
 
         Δsurplus only moves when the winner set does, but rewards also move on a reference
-        score alone, so retention is deliberately wider than `winner_set_changed`.
+        score alone, so retention is deliberately wider than `winner_set_changed` — and
+        a replaced quote recharges a fee with nothing else moving at all, so an auction
+        that recharged an order is retained too: the per-auction moves are what
+        `compare` converts to USD, and a recharge absent from them would be absent from
+        the page.
         """
         return (
-            self.winner_set_changed or self.filter_relaxed or self.reference_scores_moved
+            self.winner_set_changed
+            or self.filter_relaxed
+            or self.reference_scores_moved
+            or bool(self.quote_substituted_uids)
         )
 
     @property
@@ -867,6 +906,21 @@ class AuctionCounterfactual:
         return self.protocol_fees_loo - self.protocol_fees_base
 
     @property
+    def quote_fee_recharge(self) -> int:
+        """The quote's own fee effect on this auction's counterfactual executions, gross:
+        Σ over recharged orders of (fee against the replacement quote − fee against the
+        recorded one). Positive when the removed solver's quotes were good."""
+        return sum(self.quote_fee_recharges.values())
+
+    @property
+    def quote_fee_recharge_partner(self) -> int:
+        return sum(self.quote_partner_fee_recharges.values())
+
+    @property
+    def quote_fee_recharge_protocol(self) -> int:
+        return self.quote_fee_recharge - self.quote_fee_recharge_partner
+
+    @property
     def rewards_base(self) -> int:
         return sum(r.uncapped_reward for r in self.baseline_rewards.values())
 
@@ -915,6 +969,147 @@ class AuctionCounterfactual:
         return bool(self.price_suspect_uids)
 
 
+def _quote_overlay(
+    bundle: AuctionBundle,
+    baseline: Sequence[ValuedBid],
+    quoted: frozenset[str],
+    counterfactual_quotes: Mapping[str, Quote],
+    weth: str,
+    mode: Mode,
+) -> tuple[list[ValuedBid] | None, frozenset[str]]:
+    """Value every bid with the replacement quotes in place of the recorded ones.
+
+    Returns the valued bids and the orders whose replacement actually went in. A
+    replacement quote the fee path cannot charge against does not fail the valuation —
+    `value_solution` records the order's fee as unknown instead — so the test is
+    whether an order's fee is unknown here and was not in the baseline. Such orders
+    keep their recorded quote (their fee reads as unmoved rather than as wrong) and the
+    rest are valued once more, so one unusable replacement does not void every other
+    substitution in the auction by making the whole auction unpriceable. `None` if
+    nothing could be substituted.
+    """
+    known_in_baseline = {
+        order.uid
+        for entry in baseline
+        for order in entry.bid.orders
+        if order.uid not in entry.valuation.fees_unknown
+    }
+    overlay: dict[str, Quote] = {uid: counterfactual_quotes[uid] for uid in quoted}
+    for _attempt in range(2):
+        if not overlay:
+            return None, frozenset()
+        quotes: dict[str, Quote] = dict(bundle.fee_context.quotes)
+        quotes.update(overlay)
+        valued, failures = build_solutions(
+            bundle.bids,
+            bundle.native_prices,
+            weth,
+            mode=mode,
+            fee_context=replace(bundle.fee_context, quotes=quotes),
+        )
+        broken = {
+            uid
+            for entry in valued
+            for uid in entry.valuation.fees_unknown
+            if uid in overlay and uid in known_in_baseline
+        } | {
+            order.uid
+            for bid in bundle.bids
+            if bid.uid in failures
+            for order in bid.orders
+            if order.uid in overlay
+        }
+        if not failures and not broken:
+            return valued, frozenset(overlay)
+        overlay = {uid: quote for uid, quote in overlay.items() if uid not in broken}
+    return None, frozenset()
+
+
+def _charges_price_improvement(context: FeeContext, uid: str) -> bool:
+    return any(p.kind == "priceimprovement" for p in context.policies.get(uid, ()))
+
+
+def _limit_checks(
+    valued: Iterable[ValuedBid],
+    substituted: frozenset[str],
+    executed_by: Mapping[str, int | None],
+    counterfactual_quotes: Mapping[str, Quote],
+    fee_context: FeeContext,
+    native_prices: Mapping[str, int],
+) -> tuple[frozenset[str], dict[int, dict[Pair, int]]]:
+    """The two facts about a replaced quote's *limit* that the solve side needs.
+
+    `unclearable`: substituted orders whose counterfactual-side execution would not
+    have cleared the limit the replacement quote implies. `shifts`: per solution and
+    per pair, the native change in the surplus the mechanism would have measured on
+    its substituted orders against those shifted limits — the input to the ranking
+    check, never a reported surplus.
+    """
+    unclearable: set[str] = set()
+    shifts: dict[int, dict[Pair, int]] = {}
+    for entry in valued:
+        for order in entry.bid.orders:
+            if order.uid not in substituted:
+                continue
+            recorded = fee_context.quotes.get(order.uid)
+            if recorded is None or order.uid not in entry.valuation.order_surplus_native:
+                continue
+            shift = shifted_limit(order, recorded, counterfactual_quotes[order.uid])
+            if shift is None:
+                continue
+            if not shift.clears and executed_by.get(order.uid) == entry.bid.uid:
+                unclearable.add(order.uid)
+            token = order.buy_token if order.side == "sell" else order.sell_token
+            price = native_prices.get(token)
+            if price is None or not shift.surplus_shift_atoms:
+                continue
+            atoms = shift.surplus_shift_atoms
+            native = (
+                price_in_eth(price, atoms) if atoms > 0 else -price_in_eth(price, -atoms)
+            )
+            pair: Pair = (order.sell_token, order.buy_token)
+            by_pair = shifts.setdefault(entry.bid.uid, {})
+            by_pair[pair] = by_pair.get(pair, 0) + native
+    return frozenset(unclearable), shifts
+
+
+def _shift_moves_winners(
+    solutions: Iterable[Solution],
+    removed: frozenset[str],
+    shifts: Mapping[int, Mapping[Pair, int]],
+    loo_winner_uids: frozenset[int],
+    max_winners: int,
+) -> bool:
+    """Re-arbitrate the counterfactual side with every solution's score shifted by what
+    its substituted orders' weaker limits would add to measured surplus, and ask whether
+    the winner set moves. A weaker limit raises every solution holding the order by
+    (nearly) the same amount, so this is expected to say no; it is checked because the
+    quote side rests on it (D34)."""
+    shifted: list[Solution] = []
+    for solution in solutions:
+        if solution.solver in removed:
+            continue
+        delta = shifts.get(solution.solution_uid)
+        if not delta:
+            shifted.append(solution)
+            continue
+        shifted.append(
+            replace(
+                solution,
+                total=solution.total + sum(delta.values()),
+                pair_values={
+                    pair: value + delta.get(pair, 0)
+                    for pair, value in solution.pair_values.items()
+                },
+                pair_scores={
+                    pair: value + delta.get(pair, 0)
+                    for pair, value in solution.pair_scores.items()
+                },
+            )
+        )
+    return arbitrate(shifted, max_winners).winner_uids != loo_winner_uids
+
+
 def analyse_auction(
     bundle: AuctionBundle,
     weth: str,
@@ -925,11 +1120,37 @@ def analyse_auction(
     outcome_rule: OutcomeRule = "inherited",
     settled: Mapping[int, Settlement] | None = None,
     solution_caps: Mapping[int, SolutionCap] | None = None,
+    counterfactual_quotes: Mapping[str, Quote] | None = None,
 ) -> AuctionCounterfactual:
     """Arbitrate one auction with and without `removed`, and diff the two.
 
     `solution_caps` (recorded winners only) switches on the capped-reward estimate;
-    without it only uncapped rewards are computed."""
+    without it only uncapped rewards are computed.
+
+    `counterfactual_quotes` is the quote side reaching into the fee side: an order whose
+    quote came from a removed solver would have been priced by whoever replaced it, and
+    a `priceimprovement` fee is charged against exactly that quote. The counterfactual
+    executions are therefore valued **twice**: with the recorded quotes, which is the
+    fee delta the report carries — what the removal does to fees through who executes —
+    and with the replacements, whose difference on the recharged orders is the quote's
+    own fee effect, `quote_fee_recharge`, reported beside the quote figures and never
+    added to the fee delta (D28 revised): a worse quote raises the price-improvement
+    baseline mechanically, so folding it in read as the protocol gaining from losing a
+    good quoter. This holds whether or not a removed solver bid here (D33): the quote
+    winner often does not bid on its own order, and the fee reference moved all the
+    same.
+
+    What is held fixed and what is recomputed follows one rule (D32): everything the
+    solvers *did* — bids, executions, ranking — stays as recorded; everything the
+    mechanism *computes from the quote* — the fee — is recomputed. Solution totals are
+    the recorded scores (D1), so a counterfactual quote changes what the mechanism
+    charges on a given execution, not who wins, and the user-price effect is the
+    quote side's own shown-price delta rather than a surplus recomputed against a limit
+    nobody signed. The two facts that make holding executions fixed *sound* rather than
+    merely convenient are checked per auction (D34): whether each recharged order's
+    execution still clears the limit the replacement quote implies, and whether shifting
+    every score by the limit change would move the winner set.
+    """
     settled = settled or {}
     db_winner_uids = frozenset(b.uid for b in bundle.bids if b.is_winner)
     removed_present = frozenset(b.solver for b in bundle.bids) & removed
@@ -952,7 +1173,19 @@ def analyse_auction(
             valued, db_winner_uids, outcome_rule=outcome_rule, settled=settled
         )
 
-    if failures or not present:
+    # Orders of this auction that carry a replacement quote. An auction the removed
+    # solver never bid in is still arbitrated when it holds one: the two sides then
+    # agree on everything but the fee of those orders, which is the whole point.
+    quoted: frozenset[str] = frozenset()
+    if counterfactual_quotes:
+        quoted = frozenset(
+            order.uid
+            for bid in bundle.bids
+            for order in bid.orders
+            if order.uid in counterfactual_quotes
+        )
+
+    if failures or (not present and not quoted):
         # A valuation failure means we cannot arbitrate this auction faithfully at all.
         # Validation measured zero over three days, so it is reported rather than tolerated.
         return AuctionCounterfactual(
@@ -971,6 +1204,18 @@ def analyse_auction(
 
     solutions = [v.solution for v in valued]
     by_uid = {v.bid.uid: v for v in valued}
+
+    # The loo side's valuations differ from the baseline's only where a counterfactual
+    # quote applies, and only in the fee: surplus, volumes and pair values are
+    # quote-independent, so the arbitration below runs on `solutions` either way.
+    substituted: frozenset[str] = frozenset()
+    by_uid_loo = by_uid
+    if quoted and counterfactual_quotes:
+        loo_valued, substituted = _quote_overlay(
+            bundle, valued, quoted, counterfactual_quotes, weth, mode
+        )
+        if loo_valued is not None:
+            by_uid_loo = {v.bid.uid: v for v in loo_valued}
 
     baseline = arbitrate(solutions, max_winners)
     # Over the solutions the filter actually judged — zero-value ones are dropped before
@@ -998,6 +1243,9 @@ def analyse_auction(
         recorded_winner_uids=db_winner_uids,
         inherit=inherit,
     )
+    # The counterfactual side with the *recorded* quotes: the fee deltas below are
+    # base -> this, so they carry what the removal does through who executes and
+    # nothing about the quote (D28 revised).
     loo_side = side_outcomes(
         [by_uid[s.solution_uid] for s in loo.winners],
         outcome_rule=outcome_rule,
@@ -1005,6 +1253,50 @@ def analyse_auction(
         recorded_winner_uids=db_winner_uids,
         inherit=inherit,
     )
+
+    # The quote effect's footprint on this side: the recharged orders — executed here
+    # against a replacement quote, with a price-improvement policy to charge — valued
+    # once more with the replacements, so each order's recharge is the difference; and
+    # the two limit checks that license holding the executions fixed (D34).
+    recharged: frozenset[str] = frozenset()
+    unclearable: frozenset[str] = frozenset()
+    shift_moves_winners = False
+    fee_recharges: dict[str, int] = {}
+    partner_recharges: dict[str, int] = {}
+    if substituted and counterfactual_quotes:
+        loo_replaced = side_outcomes(
+            [by_uid_loo[s.solution_uid] for s in loo.winners],
+            outcome_rule=outcome_rule,
+            settled=settled,
+            recorded_winner_uids=db_winner_uids,
+            inherit=inherit,
+        )
+        recharged = frozenset(
+            uid
+            for uid in substituted
+            if (outcome := loo_side.orders.get(uid)) is not None
+            and outcome.executed
+            and _charges_price_improvement(bundle.fee_context, uid)
+        )
+        for uid in recharged:
+            before, after = loo_side.orders[uid], loo_replaced.orders[uid]
+            if before.fee_native is not None and after.fee_native is not None:
+                fee_recharges[uid] = after.fee_native - before.fee_native
+                partner_recharges[uid] = (after.partner_fee_native or 0) - (
+                    before.partner_fee_native or 0
+                )
+        unclearable, shifts = _limit_checks(
+            valued,
+            substituted,
+            {uid: outcome.solution_uid for uid, outcome in loo_side.orders.items()},
+            counterfactual_quotes,
+            bundle.fee_context,
+            bundle.native_prices,
+        )
+        unclearable &= recharged
+        shift_moves_winners = bool(shifts) and _shift_moves_winners(
+            solutions, removed, shifts, loo.winner_uids, max_winners
+        )
 
     baseline_references = compute_reference_outcomes(baseline, max_winners)
     baseline_reference_scores = {
@@ -1076,7 +1368,7 @@ def analyse_auction(
     return AuctionCounterfactual(
         auction_id=bundle.auction_id,
         n_solutions=len(bundle.bids),
-        solver_present=True,
+        solver_present=present,
         removed_present=removed_present,
         solver_won_baseline=any(s.solver in removed for s in baseline.winners),
         solver_won_db=bool(removed & {b.solver for b in bundle.bids if b.is_winner}),
@@ -1103,6 +1395,12 @@ def analyse_auction(
         executed_orders_all_base=executed_orders_all,
         un_filtered_uids=relaxed,
         un_filtered_winner_uids=relaxed & loo.winner_uids,
+        quote_carried_uids=substituted,
+        quote_substituted_uids=recharged,
+        quote_fee_recharges=fee_recharges,
+        quote_partner_fee_recharges=partner_recharges,
+        quote_limit_unclearable_uids=unclearable,
+        quote_shift_winner_set_changed=shift_moves_winners,
         order_diffs=diff_outcomes(base.orders, loo_side.orders),
         replacements_base=base.replacements,
         replacements_loo=loo_side.replacements,
@@ -1173,7 +1471,9 @@ class Analysis:
     protocol_and_partner_fees_loo: int = 0
     partner_fees_base: int = 0
     partner_fees_loo: int = 0
-    """Protocol fee charged by the winners on each side, and the partners' share of it,
+    """Protocol fee charged by the winners on each side — with the **recorded quotes on
+    both sides**, so the delta is what the removal does through who executes and carries
+    nothing of the quote (that is `quote_fee_recharge`) — and the partners' share of it,
     summed over the auctions where **both** sides could be priced in full. The
     protocol's own revenue is the difference, and its delta is the direct
     value-to-the-protocol number: the fee side of what a solver is worth, where
@@ -1243,6 +1543,51 @@ class Analysis:
     7,745 auctions (0.6%), but those 44 carried 82% of Sector's Δsurplus and 97% of
     its uncapped Δrewards, all fabricated. Switching this off (`--include-price-suspects`)
     keeps them in every number instead; the flagged ids are reported either way."""
+    auctions_quote_checked: int = 0
+    """Auctions where some bid's order carried a replacement quote — everything the
+    quote side touched, and the denominator of the ranking check below."""
+    quote_substituted_orders: int = 0
+    auctions_quote_substituted: int = 0
+    """Distinct orders the counterfactual side executed with their price-improvement
+    fee charged against a replacement quote, and the auctions holding them. Zero on a
+    run with no quote pass, and zero on a solve-only solver — the two read differently
+    and the report says which."""
+    auctions_quote_only: int = 0
+    """Of the checked auctions, the ones no removed solver bid in (D33). They enter the
+    fee sums through their recharged orders alone and nothing else — no surplus, no
+    reward, no `auctions_with_solver` — because nothing else in them can differ."""
+    quote_limit_unclearable_orders: int = 0
+    """Recharged orders whose execution would not have cleared the limit the
+    replacement quote implies (D34). Only a class flip can produce one."""
+    auctions_quote_shift_would_change_winners: int = 0
+    """Auctions where shifting every score by its substituted orders' limit change
+    would move the counterfactual winner set (D34). The ranking channel of a replaced
+    quote, as a count: the design holds the ranking fixed, and this says how often
+    that assumption is tested."""
+    quote_shift_auctions: list[int] = field(default_factory=list[int])
+    """The ids behind that count, so a flagged auction can be opened. Kept as ids
+    rather than by retaining the auctions in `changed`: nothing moved in them, and a
+    zero-delta move would only pad the per-auction conversion."""
+    quote_fee_recharge: int = 0
+    quote_partner_fee_recharge: int = 0
+    """The quote's own fee effect, gross and the partners' part, summed over the auctions
+    whose fees are complete: the price-improvement fee the counterfactual executions pay
+    against the replacement quotes minus what they pay against the recorded ones.
+    Reported beside the quote figures and never added to the fee deltas (D28 revised).
+    Positive for a solver whose quotes were good — without it the baseline the fee is
+    measured against falls and the same executions pay more — which is why it is not
+    read as revenue the protocol would gain."""
+    quote_substituted_uid_set: set[str] = field(
+        default_factory=set[str], metadata={"report": False}
+    )
+    quote_unclearable_uid_set: set[str] = field(
+        default_factory=set[str], metadata={"report": False}
+    )
+    """The distinct-order bookkeeping behind the two counts above. An order can be
+    proposed in several auctions before it trades, so a per-auction sum would count it
+    each time; these are kept out of the report file (`metadata`) — the counts are what
+    a reader needs, and the uids are in the retained auctions' order diffs."""
+
     price_suspect_auctions: list[int] = field(default_factory=list[int])
 
     missing_data_auctions: list[int] = field(default_factory=list[int])
@@ -1320,6 +1665,11 @@ class Analysis:
         return self.protocol_and_partner_fees_loo - self.partner_fees_loo
 
     @property
+    def quote_fee_recharge_protocol(self) -> int:
+        """The DAO's part of the quote's fee effect."""
+        return self.quote_fee_recharge - self.quote_partner_fee_recharge
+
+    @property
     def delta_protocol_fees(self) -> int:
         """Counterfactual minus actual, over the protocol's own fee revenue.
 
@@ -1365,9 +1715,12 @@ class Analysis:
         self.window_orders_base += result.executed_orders_base
         self.window_order_executions_base += result.executed_orders_all_base
         if not result.solver_present:
+            if result.quote_carried_uids:
+                self._add_quote_only(result)
             return
 
         self.auctions_with_solver += 1
+        self._add_quote_checks(result)
         self.addresses_seen |= result.removed_present
         self.multi_pair_solutions += result.multi_pair_solutions
         self.multi_pair_filter_proxied += result.multi_pair_filter_proxied
@@ -1385,6 +1738,8 @@ class Analysis:
             self.protocol_and_partner_fees_loo += result.protocol_and_partner_fees_loo
             self.partner_fees_base += result.partner_fees_base
             self.partner_fees_loo += result.partner_fees_loo
+            self.quote_fee_recharge += result.quote_fee_recharge
+            self.quote_partner_fee_recharge += result.quote_fee_recharge_partner
         else:
             self.auctions_fees_incomplete += 1
         self.rewards_base += result.rewards_base
@@ -1434,6 +1789,44 @@ class Analysis:
                 self.jit_orders_only_with_solver += diff.only_with_solver
                 self.jit_orders_only_without_solver += diff.only_without_solver
 
+        if result.anything_moved:
+            self.changed.append(result)
+
+    def _add_quote_checks(self, result: AuctionCounterfactual) -> None:
+        self.auctions_quote_checked += bool(result.quote_carried_uids)
+        self.quote_substituted_uid_set |= result.quote_substituted_uids
+        self.quote_substituted_orders = len(self.quote_substituted_uid_set)
+        self.auctions_quote_substituted += bool(result.quote_substituted_uids)
+        self.quote_unclearable_uid_set |= result.quote_limit_unclearable_uids
+        self.quote_limit_unclearable_orders = len(self.quote_unclearable_uid_set)
+        self.auctions_quote_shift_would_change_winners += (
+            result.quote_shift_winner_set_changed
+        )
+        if result.quote_shift_winner_set_changed:
+            self.quote_shift_auctions.append(result.auction_id)
+
+    def _add_quote_only(self, result: AuctionCounterfactual) -> None:
+        """An auction no removed solver bid in, arbitrated only because an order in it
+        carries a replacement quote (D33).
+
+        With the recorded quotes on both sides nothing differs here at all, so the fee
+        sums and every other counter are untouched; only the quote's own fee effect on
+        its recharged orders and the quote counters see this auction.
+        """
+        self.auctions_quote_only += 1
+        self._add_quote_checks(result)
+        if not result.quote_substituted_uids:
+            return
+        diffs = [
+            d
+            for d in result.order_diffs
+            if d.contributes and d.order_uid in result.quote_substituted_uids
+        ]
+        if not all(d.fees_known for d in diffs):
+            self.auctions_fees_incomplete += 1
+        else:
+            self.quote_fee_recharge += result.quote_fee_recharge
+            self.quote_partner_fee_recharge += result.quote_fee_recharge_partner
         if result.anything_moved:
             self.changed.append(result)
 
