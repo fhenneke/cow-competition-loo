@@ -1,5 +1,19 @@
 # Brief: speed up `loo analyse`
 
+> **Correction, 2026-09-15.** The "85% of wall time is Python" conclusion below is wrong.
+> A one-solver run over one mainnet day (2,958 auctions) measured 42 s of wall time and
+> **1.7 s of CPU** — the process waits on the DB for ~96% of the run — and an
+> all-solvers run of the same day (25 scenarios × 2 rules) took the same 34 s of
+> extraction plus 16 s of CPU in total. The SQL profile below was taken warm and
+> subtracted from a cold run's wall time, which is where the gap came from. What was
+> real: `analyse_auction` does recompute the valuation and baseline arbitration per
+> (scenario, rule) — about 8 s of CPU per run per month, ~7 minutes for 26 solvers under
+> both rules — and `ALL_SOLVERS_SQL` / `SOLVER_SQL` were planned as sequential scans of
+> `proposed_solutions`, now fixed by bounding them to the window's auction-id range
+> ([docs](docs/analytics-db.md#bound-joins-against-proposed_solutions-to-the-windows-auction-id-range)).
+> The extraction cache remains the one structural win; per-query micro-optimisation is
+> still aimed at the wrong place, but for the opposite reason to the one given below.
+
 Context for an agent picking up extraction/analysis performance. Written 2026-08-29 on
 branch `m13-protocol-fee-delta`, after a full-month × 10-network rerun made the runtime
 the binding constraint on how often the shared artifacts can be refreshed.

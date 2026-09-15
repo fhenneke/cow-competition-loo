@@ -855,7 +855,8 @@ the same `MissingSettlementError` the sides do, so the denominator's coverage
 requirement is exactly the analysis's own.
 
 Report format 4 (`window_volume_base`, `window_orders_base`); older files refuse with
-"re-run analyse" — a sweep is ~12 minutes since M8.
+"re-run analyse" — a sweep is 12–25 minutes since M8, set by the DB's response time
+(README, "A month of mainnet…").
 
 ## 12. M10 — coverage share of all traded orders — **done**
 

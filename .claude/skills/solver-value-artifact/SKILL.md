@@ -100,7 +100,8 @@ uv run loo analyse --network mainnet \
   solver (D26).
 - **Both outcome rules**, always — they share the extraction pass, so only the arbitration
   repeats. Measured on a 26-solver mainnet month: **16.3 min for two rules against 11.9
-  for one, 1.38x**. `inherited` carries the page; `assume-settled` is not a column but the
+  for one, 1.38x** — on a fast DB day; the absolute figures move 2x with the DB's
+  response time (README, "A month of mainnet…"), the ratio less so. `inherited` carries the page; `assume-settled` is not a column but the
   settlement caveat needs it to say how far the figures move. Do not add a third
   scenario.
 - **Solver names match exactly** — `Arc` is not `Arctic`, and one name can span several

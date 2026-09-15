@@ -104,6 +104,18 @@ Both are read-only references here. Do not modify them.
     unquoted, and never filter candidates on `quote_id` (`fast` is the one filter that
     belongs: `order_quotes` never holds a fast quote)
     ([measured](docs/quotes.md#the-gold-tables-do-not-hold-every-competition--link-through-the-raw-layer)).
+16. **A window CTE joined against `proposed_solutions` is planned as a sequential scan
+    of the whole table** (13.4M rows on mainnet): the planner cannot size a CTE whose
+    bounds are subqueries. `ALL_SOLVERS_SQL` and `SOLVER_SQL` did exactly this — once
+    per solver under `--all-solvers` — and a cold cache or a busy DB turned each scan
+    into minutes, which is where the "`--all-solvers` never returns" reports came from.
+    Both now bound `ps.auction_id` to the window's min/max, which puts the join on the
+    index; keep that bound on any new query of the same shape
+    ([rule](docs/analytics-db.md#bound-joins-against-proposed_solutions-to-the-windows-auction-id-range)).
+17. **Runtime claims in this repo are DB-bound and drift.** A `loo analyse` process sits
+    at ~4% CPU; the same window has measured 2x apart on different days. Quote a range
+    and the day it was measured, never one number, and re-measure before planning a
+    sweep.
 
 ## Environment
 

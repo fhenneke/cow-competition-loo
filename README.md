@@ -155,7 +155,15 @@ valued, 4 if a `--solver` did not resolve (or the flags are inconsistent, or a n
 solver bid in no analysed auction), 5 if the settlement source does not cover the window.
 
 A month of mainnet with every solver removed in turn — 84,767 auctions, 26 scenarios —
-takes about 12 minutes, nearly all of it the single shared extraction pass.
+has taken between 12 and 25 minutes on different days. The process itself is idle for
+most of that: one day of mainnet (2,958 auctions) took 42 s of wall time and 1.7 s of CPU
+for one solver, so the runtime is the analytics DB's response time, which varies by 2x
+or more with its cache state and whoever else is querying it. Arbitration adds about
+8 s of CPU per (solver, rule) per month on top — some 7 minutes for 26 solvers under
+both rules — and resolving the solvers costs about half a second each since the
+solver queries were bounded to the window's auction-id range
+([why](docs/analytics-db.md#bound-joins-against-proposed_solutions-to-the-windows-auction-id-range)).
+Measure before promising a runtime: `--limit 3000` on one day gives the DB's rate.
 
 From Python, the same pipeline is one call — the CLI is a rendering around it:
 

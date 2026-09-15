@@ -361,6 +361,14 @@ where auction_id = any(%(ids)s)
 # `resolve_solver` does with a name. Uncatalogued addresses have no name to group by
 # (`dune_data__cow_protocol__solvers` calls them all "Uncatalogued"), so each is its own
 # competitor, named by its address.
+#
+# The `between` on `ps.auction_id` here and in `SOLVER_SQL` is load-bearing. The window
+# CTE's size is invisible to the planner (its bounds are subqueries), so a plain join
+# against `proposed_solutions` was planned as a hash join over a sequential scan of the
+# whole table — 13.4M rows on mainnet, 10 s warm and far longer cold or under load, and
+# repeated once per solver by `resolve_solver`. Bounding the join to the window's id
+# range gives the `(auction_id, uid)` index a leading-column range to scan: 0.5 s.
+# Auction ids are sparse but monotone, so the range holds the window and little else.
 ALL_SOLVERS_SQL = """
 with window_auctions as (
     select distinct auction_id
@@ -373,6 +381,8 @@ bidders as (
     select distinct ps.solver
     from dbt.stg_backend_data__proposed_solutions ps
     join window_auctions w on w.auction_id = ps.auction_id
+    where ps.auction_id between (select min(auction_id) from window_auctions)
+                            and (select max(auction_id) from window_auctions)
 )
 select distinct coalesce(s.name, encode(b.solver, 'hex')) as label
 from bidders b
@@ -413,7 +423,9 @@ activity as (
         count(*) filter (where ps.is_winner) as winning_solutions
     from dbt.stg_backend_data__proposed_solutions ps
     join window_auctions using (auction_id)
-    where ps.solver in (select address from candidates)
+    where ps.auction_id between (select min(auction_id) from window_auctions)
+                            and (select max(auction_id) from window_auctions)
+      and ps.solver in (select address from candidates)
     group by 1
 )
 select

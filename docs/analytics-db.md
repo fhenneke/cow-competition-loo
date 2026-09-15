@@ -599,6 +599,40 @@ materialization before shipping a large `= any(array)` probe against it, and pre
 `between` range plus client-side filtering when the table is unindexed — a range
 predicate costs two integer comparisons per row, an N-element array costs N.
 
+## Bound joins against `proposed_solutions` to the window's auction-id range
+
+`stg_backend_data__proposed_solutions` is indexed on `(auction_id, uid)` only. Every
+extraction query reaches it through `auction_id = any(<chunk of ids>)`, which the planner
+turns into index probes. The two solver-resolution queries did not: they joined the table
+against a `window_auctions` CTE (`pre_stg__orders_per_auction_with_at_least_one_bid`
+bounded by two block-number subqueries). The planner cannot see how large that CTE is
+— it estimated 13,805 rows for a 3-day and a 7-day window alike — and chose a **hash
+join over a sequential scan of all 13.4M rows** for both windows.
+
+Measured 2026-09-15 on mainnet, 7-day window (20,415 auctions), the DB partly warm:
+
+| query | plan | time |
+| --- | --- | --- |
+| `ALL_SOLVERS_SQL`, as written | seq scan + hash join | 2.7–10 s |
+| `SOLVER_SQL`, as written, per solver | seq scan + hash join | 1.6–2.1 s |
+| either, with `ps.auction_id between (min) and (max)` of the window | index scan | 0.3–0.6 s |
+| window ids first, then `auction_id = any(ids)` | index probes | 0.35–0.64 s |
+
+Warm, the difference is a factor of five and 26 solvers cost 45 s of scans per run. Cold
+or with other sessions loading the DB, each scan is minutes, and that is the mechanism
+behind the "`--all-solvers` did not return in 34 minutes" and "a week took 2.5 hours"
+observations of 2026-09-15: nothing in that run was pathological in the plan, it was
+27 sequential scans of a large table on a contended server. Both queries now carry the
+range bound. Auction ids are sparse but monotone, so the window's `[min, max]` covers
+the window and little else, and the results are row-for-row identical (checked on
+seven names including a rotated key, an uncatalogued address and the Arc/Arctic pair,
+and on July as a 31-day window).
+
+The lesson generalises the one above: on this DB a CTE-bounded join is as blind to the
+planner as an unindexed table, so give any query that touches a large staging table an
+explicit `auction_id` predicate — a range or an array of ids — and check with `explain`
+that no `Seq Scan on stg_backend_data__…` appears.
+
 ## Reading the dbt model source
 
 The models are defined in a separate repo, cloned locally at `~/Work/Code/cow-dagster`:
