@@ -58,7 +58,8 @@ Auction context:
 | Table | Notes |
 | --- | --- |
 | `stg_backend_data__competition_auctions` | `order_uids` (array — auction membership), `surplus_capturing_jit_order_owners`, `block_number`, `block_deadline` |
-| `stg_backend_data__auction_prices` | `(auction_id, token) → price` — native prices |
+| `stg_backend_data__competition_auctions` `price_tokens`, `price_values` | parallel arrays: the auction's native prices. **NULL before 2026-09-15** ([source rules](#native-prices-price-arrays-and-the-legacy-table)) |
+| `stg_backend_data__auction_prices` | `(auction_id, token) → price` — **deprecated**, frozen 2026-09-21 ~10:00 UTC, but the only copy of prices before 2026-09-15 |
 | `stg_backend_data__orders` | `uid, kind` (buy/sell), `sell_amount`, `buy_amount`, `partially_fillable`, `owner`, `class` |
 | `stg_backend_data__jit_orders` | same shape for JIT orders |
 | `stg_backend_data__fee_policies` | `(auction_id, order_uid, application_order) → kind, factors` |
@@ -89,8 +90,8 @@ uid | id      | rows matched via uid | via id
 2   | 11      | 1                    | 1     <- coincidental collision
 ```
 
-Other joins are unsurprising: `orders.uid = order_uid`, `auction_prices` on
-`(auction_id, token)`, `reference_scores` on `(auction_id, solver)`. Addresses and uids
+Other joins are unsurprising: `orders.uid = order_uid`, prices on
+`(auction_id, token)` once unnested, `reference_scores` on `(auction_id, solver)`. Addresses and uids
 are `bytea` — compare with `decode(...,'hex')` or `\x…` literals, and render with
 `encode(col,'hex')`.
 
@@ -132,7 +133,9 @@ native_amount = token_amount * price / 1e18
 ```
 
 matching `price_in_eth` (`services/crates/winner-selection/src/primitives.rs:20`). Prices
-are per auction; there is no global price table.
+are per auction; there is no global price table. Where they are read from changed in
+September 2026 — see
+[price arrays and the legacy table](#native-prices-price-arrays-and-the-legacy-table).
 
 ## Native prices can be plain wrong
 
@@ -334,12 +337,81 @@ fine for aggregate work and wrong by up to one atom per order for anything that 
 match the protocol. Reproduce integer ceiling division exactly (`-(-a // b)` in Python,
 `div()` plus a remainder test in SQL) rather than `ceil(a / b)`.
 
-## `competition_auctions` price arrays are empty
+## Native prices: price arrays and the legacy table
 
-`price_tokens` and `price_values` on `stg_backend_data__competition_auctions` are `NULL`
-in recent data, despite looking like a convenient denormalised copy. Use
-`stg_backend_data__auction_prices`, which had 917 rows for auction `13509867` while the
-array columns were null.
+**Read prices from the `price_tokens` / `price_values` arrays of
+`stg_backend_data__competition_auctions`, falling back to
+`stg_backend_data__auction_prices` only for auctions whose arrays are NULL.** Neither
+source covers the whole history on its own. `extract.fetch_prices` does this, and every
+price query goes through it.
+
+`stg_backend_data__auction_prices` stopped updating at **2026-09-21 ~10:00 UTC on every
+network** (mainnet max auction 13856678). cow-dagster#1016 moved auction prices to the
+arrays, the raw `raw_prod_*.auction_prices` tables were dropped on 2026-09-22, and the
+staging table is to follow. Code that kept reading it raised no error. Every later
+auction came back with no prices and became a valuation failure; `analyse` reported
+those auctions as abandoned and exited 0.
+
+The arrays are no drop-in replacement either (measured 2026-09-28):
+
+| Source | Populated for |
+| --- | --- |
+| `stg_backend_data__competition_auctions` arrays | **2026-09-15 00:00 UTC onward**, on every network; NULL for 2026 before that, bar one 31-auction island on linea |
+| `raw_prod_<net>.competition_auctions` arrays (the dbt source) | from ~2026-07-30 (mainnet: auction 13478258, 14:11 UTC) — the backend only started writing them then |
+| `stg_backend_data__auction_prices` | the whole history up to 2026-09-21 ~10:00 UTC |
+
+So on mainnet the staging arrays start at auction 13810689, the legacy table ends at
+13856678, and **for every auction before 2026-09-15 the legacy table is the only copy of
+its prices in the staging schema** — and before 2026-07-30 the only copy anywhere in the
+analytics DB. Every window analysed before September 2026 (the M1 window, July 2026) sits
+in that range. The staging model is incremental and adds the array columns with
+`add column if not exists`, so rows built before the columns existed were never
+backfilled. A dbt backfill over 2026-07-30..09-15 would close the staging gap from the raw
+table. Nothing can recover the earlier prices once the legacy table is dropped.
+
+Where the staging arrays start (first auction of the populated run): mainnet 13810689,
+xdai 17248560, base 29101262, arbitrum-one 8918187, avalanche 33827839, polygon 40364192,
+bnb 25462762 — all within a minute of 2026-09-15 00:00 UTC — then linea 36358462 (00:07),
+plasma 9113987 (01:15), ink 5078289 (01:30). **The boundary is not clean everywhere.**
+Linea has an island of 31 populated auctions on 2026-08-31 (36262726..36275821) with
+NULLs on both sides, so a date or id cut-off would be wrong. The fallback is therefore
+decided per auction. Lens stopped on 2026-03-03 and has no arrays after 2025-10-14.
+
+**The two agree exactly wherever both exist.** Three 300-auction samples of the overlap
+were taken on every network; plasma's came back empty. On the other nine, 780,240 of
+780,240 (auction, token) prices match to the wei. No array repeats a token (the property
+cow-dagster's `assert_price_tokens_unique_per_auction` test guards), and none has a
+length mismatch or a NULL element. End to end, on mainnet:
+
+- `loo validate` over 2026-09-14..16, which straddles the boundary (6,529 auctions),
+  writes a **byte-identical** JSON report to the legacy-only code on `main`. The same
+  holds query by query: `PRICES_SQL`, `USD_PRICES_SQL` and the quote medians return
+  identical rows across the boundary on mainnet, bnb and base, including chunks that mix
+  the two sources.
+- Over 2026-09-23 the legacy-only code fails **all 49,884** solutions' valuations; with
+  the arrays, 3. Those three are `negative surplus` on bids whose tokens are all priced
+  — the check runs on executed amounts against limits, so native prices do not enter
+  it — and they, like the 35 pick disagreements alongside them, all fall in
+  11:53–12:25 UTC that day. That is a separate finding, not a price-source effect.
+
+How the fallback behaves:
+
+- An auction is "unpriced" when its staging `price_tokens` is NULL. Only those are
+  looked up in the legacy table, so a window from 2026-09-15 on never queries it and
+  keeps working once it is dropped.
+- An unpriced auction with bids and no legacy rows raises `MissingPricesError` rather
+  than becoming a valuation failure. So does a query that needs the legacy table after
+  it has been dropped: the error names the stranded auction range.
+- `stg_backend_data__competition_auctions` is a wide row (`order_uids`, two ~900-element
+  arrays), and unnesting it costs more than an indexed lookup. Measured cold on mainnet:
+  +0.25 s per 200-auction `PRICES_SQL` chunk (≈ +30 s on a week of `analyse`), and the
+  quote path's window-wide median (`quotes.TOKEN_PRICES_SQL`) went from 21 s to 57 s for
+  a week of ~25k auctions.
+
+Do not use `int_backend_data__auction_prices` in place of the arrays. It is the new
+indexed `(auction_id, token) → price` model, but it only holds tokens of **settled**
+trades, so it has no prices for losing bids, unsettled winners, or stablecoins nobody
+traded.
 
 ## Fee policies cover every order of every kept solution
 

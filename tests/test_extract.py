@@ -1,4 +1,5 @@
-"""`load_auctions`, the D17 missing-order policy, and the conversion-rate loader.
+"""`load_auctions`, the D17 missing-order policy, the price source, and the
+conversion-rate loader.
 
 The DB is faked by monkeypatching `extract.fetch` with canned rows keyed on the module's
 own SQL constants, so the tests exercise exactly the code path the CLI uses.
@@ -7,6 +8,7 @@ own SQL constants, so the tests exercise exactly the code path the CLI uses.
 from decimal import Decimal
 from typing import Any, cast
 
+import psycopg2.errors
 import pytest
 
 from loo import extract
@@ -41,7 +43,8 @@ def execution(auction_id: int, missing: bool = False) -> Row:
 def canned_db(monkeypatch: pytest.MonkeyPatch) -> None:
     data: dict[str, list[Row]] = {
         extract.AUCTIONS_SQL: [
-            {"auction_id": a, "block_deadline": 1, "jit_owners": []} for a in (GOOD, BAD)
+            {"auction_id": a, "block_deadline": 1, "jit_owners": [], "unpriced": False}
+            for a in (GOOD, BAD)
         ],
         extract.SOLUTIONS_SQL: [
             {
@@ -55,7 +58,7 @@ def canned_db(monkeypatch: pytest.MonkeyPatch) -> None:
             for a in (GOOD, BAD)
         ],
         extract.EXECUTIONS_SQL: [execution(GOOD), execution(BAD, missing=True)],
-        extract.PRICES_SQL: [],
+        extract.price_query(extract.PRICES_SQL, legacy=False): [],
         extract.REFERENCE_SCORES_SQL: [],
         extract.FEE_POLICIES_SQL: [
             {
@@ -135,6 +138,110 @@ class TestFeeContext:
         monkeypatch.setattr(extract, "fetch", fetch_with_filtered_solution)
         bundle = next(iter(extract.load_auctions(CONN, [GOOD])))
         assert bundle.fee_context.known == frozenset()
+
+
+class TestPriceSource:
+    """Prices come from the `competition_auctions` arrays. The legacy table is read only
+    for auctions whose arrays are NULL, so dropping it cannot break a window the arrays
+    cover, and cannot silently empty one they do not."""
+
+    def test_covered_auctions_never_touch_the_legacy_table(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        queries: list[str] = []
+
+        def fake_fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
+            queries.append(sql)
+            return []
+
+        monkeypatch.setattr(extract, "fetch", fake_fetch)
+        extract.fetch_prices(CONN, extract.USD_PRICES_SQL, {"ids": [GOOD], "tokens": []}, set())
+
+        assert len(queries) == 1
+        assert extract.LEGACY_PRICES_TABLE not in queries[0]
+        assert "price_tokens" in queries[0]
+
+    def test_only_the_unpriced_auctions_are_read_from_the_legacy_table(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        calls: list[tuple[str, Any]] = []
+
+        def fake_fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
+            calls.append((sql, params))
+            return []
+
+        monkeypatch.setattr(extract, "fetch", fake_fetch)
+        params = {"ids": [GOOD, BAD], "tokens": []}
+        extract.fetch_prices(CONN, extract.USD_PRICES_SQL, params, {BAD})
+
+        [(sql, sent)] = calls
+        assert extract.LEGACY_PRICES_TABLE in sql
+        assert sent == {"ids": [GOOD, BAD], "tokens": [], "unpriced": [BAD]}
+
+    def test_legacy_prices_reach_the_bundle(
+        self, canned_db: None, monkeypatch: pytest.MonkeyPatch
+    ):
+        original = extract.fetch
+        legacy_sql = extract.price_query(extract.PRICES_SQL, legacy=True)
+
+        def fetch_unpriced(conn: Connection, sql: str, params: Any = None) -> list[Row]:
+            if sql is extract.AUCTIONS_SQL:
+                return [{**row, "unpriced": True} for row in original(conn, sql, params)]
+            if sql == legacy_sql:
+                assert params["unpriced"] == [GOOD]
+                return [{"auction_id": GOOD, "token": "bb" * 20, "price": 7}]
+            return original(conn, sql, params)
+
+        monkeypatch.setattr(extract, "fetch", fetch_unpriced)
+        bundle = next(iter(extract.load_auctions(CONN, [GOOD])))
+        assert bundle.native_prices == {"bb" * 20: 7}
+
+    def test_bids_with_no_prices_anywhere_raise(
+        self, canned_db: None, monkeypatch: pytest.MonkeyPatch
+    ):
+        """What a dropped-but-empty or never-backfilled source looks like: without the
+        guard the auction becomes a valuation failure and the run exits 0."""
+        original = extract.fetch
+        legacy_sql = extract.price_query(extract.PRICES_SQL, legacy=True)
+
+        def fetch_unpriced(conn: Connection, sql: str, params: Any = None) -> list[Row]:
+            if sql is extract.AUCTIONS_SQL:
+                return [{**row, "unpriced": True} for row in original(conn, sql, params)]
+            if sql == legacy_sql:
+                return []
+            return original(conn, sql, params)
+
+        monkeypatch.setattr(extract, "fetch", fetch_unpriced)
+        with pytest.raises(extract.MissingPricesError, match=f"auction {GOOD} has bids"):
+            list(extract.load_auctions(CONN, [GOOD]))
+
+    def test_a_dropped_legacy_table_names_what_it_strands(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        def fake_fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
+            raise psycopg2.errors.UndefinedTable(
+                f'relation "dbt.{extract.LEGACY_PRICES_TABLE}" does not exist'
+            )
+
+        monkeypatch.setattr(extract, "fetch", fake_fetch)
+        with pytest.raises(extract.MissingPricesError, match=f"2 auctions in {GOOD}..{BAD}"):
+            extract.fetch_prices(
+                CONN, extract.USD_PRICES_SQL, {"ids": [GOOD, BAD], "tokens": []}, {GOOD, BAD}
+            )
+
+    def test_another_missing_table_is_not_blamed_on_prices(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        def fake_fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
+            raise psycopg2.errors.UndefinedTable(
+                'relation "dbt.stg_backend_data__competition_auctions" does not exist'
+            )
+
+        monkeypatch.setattr(extract, "fetch", fake_fetch)
+        with pytest.raises(psycopg2.errors.UndefinedTable):
+            extract.fetch_prices(
+                CONN, extract.USD_PRICES_SQL, {"ids": [GOOD], "tokens": []}, {GOOD}
+            )
 
 
 class TestAllSolvers:

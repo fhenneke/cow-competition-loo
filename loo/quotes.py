@@ -60,6 +60,7 @@ from typing import TYPE_CHECKING, Literal
 
 from . import ch
 from .db import Connection, as_int, chunked, fetch
+from .extract import fetch_prices, unpriced_auctions
 from .fees import FeeError, Quote, quote_fee
 from .primitives import ONE_ETH
 
@@ -84,12 +85,12 @@ RANKING: dict[QuoteRanking, str] = {
 PRICE_IMBALANCE_THRESHOLD = 2.0
 """D14 on the quote side. Two independent feeds price the order's sell token: the api's,
 recorded per order as `order_quotes.sell_token_price` (wei per atom), and the autopilot's,
-in `auction_prices` (the same quantity scaled by 1e18). They agree to four decimals on
-real tokens — measured 1.0000 for WETH, 0.9999 for USDC, 1.0004 for USDT — and disagree by
-factors of 1e7 to 1e18 where one of them is broken. An order past this threshold is
-excluded from every quote figure and counted, because the same wrong price sets both its
-weight and its gas cost: one such order carried 6.9 M ETH of apparent executed volume,
-90% of a corrected window."""
+in the auction's own price vector (the same quantity scaled by 1e18). They agree to four
+decimals on real tokens — measured 1.0000 for WETH, 0.9999 for USDC, 1.0004 for USDT — and
+disagree by factors of 1e7 to 1e18 where one of them is broken. An order past this
+threshold is excluded from every quote figure and counted, because the same wrong price
+sets both its weight and its gas cost: one such order carried 6.9 M ETH of apparent
+executed volume, 90% of a corrected window."""
 
 BUY_AMOUNT_TOLERANCE = 0.005
 """A buy order's quoted amount carries a slippage buffer, so the request it came from
@@ -341,14 +342,14 @@ order by o.creation_timestamp
 
 # The autopilot's native price per token: the median over the window's auctions. Crude by
 # design — it is a cross-check and the `autopilot` ranking's input, never a valuation —
-# and a token the window never priced stays absent rather than being guessed.
+# and a token the window never priced stays absent rather than being guessed. Prices are
+# read through `extract.fetch_prices`; the source is described above `extract.PRICES_SQL`.
 TOKEN_PRICES_SQL = """
 select encode(ap.token, 'hex') as token, percentile_cont(0.5) within group (
            order by ap.price
        ) as price
-from dbt.stg_backend_data__auction_prices ap
-where ap.auction_id = any(%(ids)s)
-  and ap.token = any(%(tokens)s)
+from {auction_prices} ap
+where ap.token = any(%(tokens)s)
 group by ap.token
 """
 
@@ -994,11 +995,13 @@ def load_token_prices(
     if not auction_ids or not tokens:
         return prices
     raw = [bytes.fromhex(token) for token in sorted(set(tokens))]
+    unpriced = unpriced_auctions(conn, auction_ids)
     for part in chunked(raw, 5000):
-        rows = fetch(
+        rows = fetch_prices(
             conn,
             TOKEN_PRICES_SQL,
             {"ids": list(auction_ids), "tokens": list(part)},
+            unpriced,
         )
         for row in rows:
             if row["price"]:

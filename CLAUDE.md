@@ -89,6 +89,14 @@ Both are read-only references here. Do not modify them.
     `missing_data` collector
     ([details](docs/analytics-db.md#jit-orders-are-recorded-only-when-the-batch-settles)).
     The M1 window had zero of these — do not calibrate on it.
+14. Native prices come from the `price_tokens` / `price_values` arrays of
+    `stg_backend_data__competition_auctions`. Those arrays are **NULL before
+    2026-09-15**, so the deprecated `stg_backend_data__auction_prices` (frozen 2026-09-21
+    ~10:00 UTC, to be dropped) is still the only copy of every earlier price. Go through
+    `extract.fetch_prices`, which falls back per auction; never query one source
+    directly. Code that reads either source alone gets no prices for some windows, marks
+    those auctions abandoned, and still exits 0
+    ([coverage](docs/analytics-db.md#native-prices-price-arrays-and-the-legacy-table)).
 14. **The quote winner need not bid on its order.** `analyse_auction` skips auctions the
     removed solver never bid in, so anything wired through it that does not depend on the
     solver's bid — the recharged price-improvement fee is the case in hand — has to be

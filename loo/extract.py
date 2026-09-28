@@ -12,10 +12,13 @@ joins `proposed_solutions.uid`, never `.id`.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from statistics import median
+from typing import Any
+
+import psycopg2.errors
 
 from .db import Connection, Row, as_int, chunked, fetch
 from .fees import (
@@ -53,6 +56,18 @@ class MissingAuctionContextError(Exception):
     because `EXECUTIONS_SQL` inner-joins the table every execution would vanish — leaving
     zero-order bids whose empty `winner_pairs` are disjoint from everything, which
     `pick_winners` therefore always selects."""
+
+
+class MissingPricesError(Exception):
+    """An auction's native prices are recorded nowhere the analytics DB can reach.
+
+    Every real auction has a price vector — the autopilot cannot run one without — so
+    this is always a gap in the source, and it comes as a range of auctions, not one:
+    the `competition_auctions` price arrays are NULL before 2026-09-15, and the legacy
+    `stg_backend_data__auction_prices` that covers those auctions is being dropped.
+    Tolerating it would be silent: every such auction becomes a valuation failure, the
+    run reports it as abandoned and exits 0 with numbers over whatever is left
+    ([docs](../docs/analytics-db.md#native-prices-price-arrays-and-the-legacy-table))."""
 
 
 class SolverResolutionError(Exception):
@@ -192,9 +207,42 @@ select
     array(
         select encode(owner, 'hex')
         from unnest(surplus_capturing_jit_order_owners) as owner
-    ) as jit_owners
+    ) as jit_owners,
+    price_tokens is null as unpriced
 from dbt.stg_backend_data__competition_auctions
 where auction_id = any(%(ids)s)
+"""
+
+# Native prices, `(auction_id, token) -> price`, come from the parallel `price_tokens` /
+# `price_values` arrays of `competition_auctions`. They replace
+# `stg_backend_data__auction_prices`, which stopped updating on 2026-09-21 ~10:00 UTC
+# (cow-dagster#1016) and is to be dropped. The staging arrays are only populated from
+# 2026-09-15 00:00 UTC, though, so for every earlier auction the legacy table is still
+# the only copy: it is read for exactly the auctions whose arrays are NULL, which means a
+# window from 2026-09-15 on never touches it and keeps working once it is gone. The two
+# agree exactly where both exist
+# ([measured](../docs/analytics-db.md#native-prices-price-arrays-and-the-legacy-table)).
+#
+# Queries over prices read the relation `{auction_prices}`, restricted to `%(ids)s`, and
+# run through `fetch_prices`, which fills it in.
+_ARRAY_PRICES = """
+    select ca.auction_id, ap.token, ap.price
+    from dbt.stg_backend_data__competition_auctions ca
+    cross join lateral unnest(ca.price_tokens, ca.price_values) as ap (token, price)
+    where ca.auction_id = any(%(ids)s)
+"""
+LEGACY_PRICES_TABLE = "stg_backend_data__auction_prices"
+_LEGACY_PRICES = f"""
+    select auction_id, token, price
+    from dbt.{LEGACY_PRICES_TABLE}
+    where auction_id = any(%(unpriced)s)
+"""
+
+UNPRICED_SQL = """
+select auction_id
+from dbt.stg_backend_data__competition_auctions
+where auction_id = any(%(ids)s)
+  and price_tokens is null
 """
 
 # The valuation itself only needs buy-token prices — `compute_order_score` converts
@@ -214,7 +262,7 @@ with traded as (
     where pte.auction_id = any(%(ids)s)
 )
 select ap.auction_id, encode(ap.token, 'hex') as token, ap.price
-from dbt.stg_backend_data__auction_prices ap
+from {auction_prices} ap
 join traded t on t.auction_id = ap.auction_id and t.token = ap.token
 """
 
@@ -337,10 +385,9 @@ group by accounting_period_start_time, conversion_rate_cow_to_native
 # table; a major stablecoin's native price in the auction's own price vector implies
 # the rate — see `primitives.USD_REFERENCE_TOKENS`.
 USD_PRICES_SQL = """
-select auction_id, encode(token, 'hex') as token, price
-from dbt.stg_backend_data__auction_prices
-where auction_id = any(%(ids)s)
-  and token = any(%(tokens)s)
+select ap.auction_id, encode(ap.token, 'hex') as token, ap.price
+from {auction_prices} ap
+where ap.token = any(%(tokens)s)
 """
 
 # `--solver` takes a name or an address. Names are matched **exactly** (case-insensitively):
@@ -452,6 +499,51 @@ def auctions_in_window(conn: Connection, start: str, end: str) -> list[int]:
     return [row["auction_id"] for row in rows]
 
 
+def price_query(sql: str, *, legacy: bool) -> str:
+    """`sql` with its `{auction_prices}` relation filled in: the price arrays alone, or
+    the arrays plus the legacy table's rows for the `%(unpriced)s` auctions."""
+    source = f"{_ARRAY_PRICES}union all{_LEGACY_PRICES}" if legacy else _ARRAY_PRICES
+    return sql.format(auction_prices=f"({source})")
+
+
+def unpriced_auctions(conn: Connection, auction_ids: Sequence[int]) -> set[int]:
+    """The auctions among `auction_ids` whose `competition_auctions` price arrays are NULL."""
+    rows = fetch(conn, UNPRICED_SQL, {"ids": list(auction_ids)})
+    return {row["auction_id"] for row in rows}
+
+
+def fetch_prices(
+    conn: Connection, sql: str, params: dict[str, Any], unpriced: Collection[int]
+) -> list[Row]:
+    """Run a query over `{auction_prices}` for the auctions in `params["ids"]`.
+
+    `unpriced` names those among them whose price arrays are NULL. The legacy table is
+    queried only when there are any, and only for them — so once it is dropped, a window
+    the arrays cover still runs, and one they do not fails here, by name, instead of
+    every auction in it quietly becoming a valuation failure.
+    """
+    if not unpriced:
+        return fetch(conn, price_query(sql, legacy=False), params)
+    try:
+        return fetch(
+            conn, price_query(sql, legacy=True), {**params, "unpriced": sorted(unpriced)}
+        )
+    except psycopg2.errors.UndefinedTable as error:
+        if LEGACY_PRICES_TABLE not in str(error):
+            raise
+        raise MissingPricesError(
+            f"{_auction_span(unpriced)} predate the price arrays in "
+            f"stg_backend_data__competition_auctions, and {LEGACY_PRICES_TABLE}, the only "
+            f"other copy of their native prices, no longer exists"
+        ) from error
+
+
+def _auction_span(auction_ids: Collection[int]) -> str:
+    if len(auction_ids) == 1:
+        return f"auction {next(iter(auction_ids))}"
+    return f"{len(auction_ids)} auctions in {min(auction_ids)}..{max(auction_ids)}"
+
+
 def load_auctions(
     conn: Connection,
     auction_ids: Sequence[int],
@@ -481,9 +573,10 @@ def load_auctions(
         contexts = {
             row["auction_id"]: row for row in fetch(conn, AUCTIONS_SQL, params)
         }
+        unpriced = {a for a, context in contexts.items() if context["unpriced"]}
         solution_rows = fetch(conn, SOLUTIONS_SQL, params)
         execution_rows = fetch(conn, EXECUTIONS_SQL, params)
-        price_rows = fetch(conn, PRICES_SQL, params)
+        price_rows = fetch_prices(conn, PRICES_SQL, params, unpriced)
         reference_rows = fetch(conn, REFERENCE_SCORES_SQL, params)
         fee_contexts = (
             _load_fee_contexts(conn, ids, execution_rows, solution_rows)
@@ -510,6 +603,14 @@ def load_auctions(
         solutions: dict[int, list[Row]] = {}
         for row in solution_rows:
             solutions.setdefault(row["auction_id"], []).append(row)
+
+        lost = sorted(a for a in unpriced if a in solutions and a not in prices)
+        if lost:
+            verb = "has" if len(lost) == 1 else "have"
+            raise MissingPricesError(
+                f"{_auction_span(lost)} {verb} bids but no native prices: the price "
+                f"arrays are NULL and {LEGACY_PRICES_TABLE} has no rows for them"
+            )
 
         for auction_id in ids:
             if auction_id not in solutions:
@@ -860,8 +961,15 @@ def load_usd_rates(
     reference = usd_reference_tokens(network)
     token_bytes = [bytes.fromhex(token) for token in reference]
     per_auction: dict[int, list[Decimal]] = {}
+    unpriced = unpriced_auctions(conn, auction_ids)
     for chunk in chunked(list(auction_ids), chunk_size):
-        rows = fetch(conn, USD_PRICES_SQL, {"ids": list(chunk), "tokens": token_bytes})
+        ids = list(chunk)
+        rows = fetch_prices(
+            conn,
+            USD_PRICES_SQL,
+            {"ids": ids, "tokens": token_bytes},
+            unpriced.intersection(ids),
+        )
         for row in rows:
             per_auction.setdefault(row["auction_id"], []).append(
                 usd_per_native(as_int(row["price"]), reference[row["token"]])
