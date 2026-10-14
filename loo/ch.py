@@ -45,6 +45,7 @@ the request-less ones, so the stream is prod."""
 NETWORK_CHAIN_IDS = {
     "mainnet": 1,
     "bnb": 56,
+    "base": 8453,  # prod requests from 2026-09-01 16:00
 }
 
 STATEMENT_TIMEOUT_SECONDS = 300

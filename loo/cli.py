@@ -137,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
             "would be and how often no quote would exist at all, and charge the "
             "price-improvement fee of the affected orders against the replacement "
             "quote so the protocol-fee delta includes the quote effect. Needs the "
-            "CLICKHOUSE_* credentials and a network with quote data (mainnet, bnb)"
+            "CLICKHOUSE_* credentials and a network with quote data (mainnet, bnb, base)"
         ),
     )
     analyse.add_argument(

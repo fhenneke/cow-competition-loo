@@ -112,8 +112,10 @@ uv run loo analyse --network mainnet \
 - A full month per chain takes minutes and re-imports `loo/` on each invocation — do not
   edit `loo/` while a run is in flight, and check `REPORT_FORMAT` (currently 13) matches
   the reports; `compare` refuses stale ones.
-- **`--quotes` where the chain has quote data** (mainnet, bnb): it removes the solver from
-  the quote competition too. It changes the meaning of a column the page already has — see
+- **`--quotes` where the chain has quote data** (mainnet, bnb, base): it removes the solver
+  from the quote competition too. On bnb, do not take the quote rows from `compare` until
+  the quote-side price guard is two-sided — mispriced orders dominate its volume weights
+  (docs/quotes.md, trap 14). It changes the meaning of a column the page already has — see
   "The quote side" below — so a page built from quote-enabled reports and one built without
   are not diffable on the fee column.
 

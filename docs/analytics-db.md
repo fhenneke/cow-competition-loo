@@ -493,6 +493,21 @@ this count: **16,431 of 16,431 settled trades match exactly**, and the policy-li
 agrees with the model's fee count on every one of them. `loo.fees.fee_split` implements
 it.
 
+### `partner_fee_cut` is NULL on older rows
+
+`int_backend_data__fees_per_trade.partner_fee_cut` is the protocol's share of a partner
+fee: per-recipient config, else 0.25. The model is incremental with
+`on_schema_change='append_new_columns'`, and rows built before the column was added were
+never rebuilt. Measured 2026-10-14, every partner row is NULL below auction
+**26,089,387 on bnb** and **29,403,168 on base** (about 2026-10-06). Every row after that is
+populated.
+
+So `coalesce(partner_fee_cut, 1)` counts those partner fees as entirely the DAO's, and
+`fee_amount_native * partner_fee_cut` drops them. Fill it the way the model does, with
+`coalesce(partner_fee_cut, pc1.partner_fee_cut, pc2.partner_fee_cut, 0.25)`, joining
+`stg_partner_fees_config` on `processed_fee_recipient` (with `app_code`, then without).
+On bnb orders created 2026-10-05..12 the configured cuts average 16% of gross, not 25%.
+
 ## JIT orders are recorded only when the batch settles
 
 `stg_backend_data__jit_orders` is populated from settlements, so the JIT orders of

@@ -1511,3 +1511,18 @@ Quote rewards (CIP-72) — the counterfactual quote's eligibility is not evaluat
 conversion — there is no counterfactual for an order nobody placed, at a 0.13% conversion
 rate; and the limit-price/fillability channel, which needs the solve counterfactual re-run
 with perturbed limits.
+
+### Base enabled (2026-10-14)
+
+`gold_quotes` has held base since 2026-09-01 and, by October, every chain. Base is now in
+`ch.NETWORK_CHAIN_IDS`. Its first run (2026-10-05..12, `--all-solvers`) linked 17,108 of
+17,110 orders and reproduced the recorded pick on 99.19% of requests. That run also showed
+two open issues:
+- **The price guard is one-sided.** On bnb, mispriced orders that pass it carried 28.68M of
+  28.70M BNB of the quote window's volume, so bnb's `window_bps` is unusable from `compare`
+  (docs/quotes.md, trap 14).
+- **The order↔quote link is still the heuristic above.** An exact `quote_id` join exists
+  from 2026-09-29.
+
+Both are the next quote-side milestone. The other chains stay disabled until their
+reproduction rate and match coverage are measured.

@@ -42,7 +42,11 @@ class TestQuoteLiterals:
 
 class TestChainId:
     def test_supported_networks(self):
-        assert (ch.chain_id("mainnet"), ch.chain_id("bnb")) == (1, 56)
+        assert (ch.chain_id("mainnet"), ch.chain_id("bnb"), ch.chain_id("base")) == (
+            1,
+            56,
+            8453,
+        )
         assert ch.has_quote_data("mainnet") and not ch.has_quote_data("xdai")
 
     def test_an_unsupported_network_is_its_own_error_and_still_a_key_error(self):

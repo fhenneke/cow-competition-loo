@@ -128,8 +128,8 @@ clear the limit the replacement quote implies; would the winner set move if ever
 carried the limit change) are counted and reported so that assumption is tested rather than
 held.
 
-It needs the `CLICKHOUSE_*` credentials and a network with quote data (mainnet, bnb, from
-2026-07-22); the quote window is clamped forward to the first day of that data and both
+It needs the `CLICKHOUSE_*` credentials and a network with quote data (mainnet and bnb from
+2026-07-22, base from 2026-09-01); the quote window is clamped forward to the first day of that data and both
 windows are reported. Orders are linked to their competition through the gold request
 table and, where that table never received the competition, through the raw estimates —
 about 99.9% of a day's orders, every raw-layer match corroborated by the winning
@@ -145,7 +145,7 @@ where the rule changed. See [docs/quotes.md](docs/quotes.md).
 | `--all-solvers` | one scenario per solver that bid in the window; excludes `--solver` |
 | `--outcome-rule` | `inherited` (default) or `assume-settled`, repeatable — all rules share the extraction pass; see below |
 | `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus |
-| `--quotes` | also remove the solver from the quote competition (mainnet, bnb) |
+| `--quotes` | also remove the solver from the quote competition (mainnet, bnb, base) |
 | `--quote-ranking` | `effective-sell` (default) or `autopilot` |
 | `--limit N` | only the first N auctions — start here |
 | `--out report.json` | per-auction records, including both sides' reference scores and rewards; `{solver}` in the path becomes each solver's slug, `{rule}` the outcome rule |

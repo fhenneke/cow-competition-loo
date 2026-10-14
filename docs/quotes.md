@@ -20,12 +20,27 @@ over plain HTTP with `CLICKHOUSE_URL` / `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD
 Both are `ReplicatedReplacingMergeTree` fed from `raw_quotes.{quote_requested,
 price_estimates, winning_price_estimates, quote_computed}`.
 
-### Coverage is two networks and starts 2026-07-22
+### Coverage started with two networks on 2026-07-22
 
 Measured 2026-09-01: prod requests run **2026-07-22 15:28 .. now**, and only for
 **mainnet (chain 1)** and **bnb (chain 56)**. There is no `TTL` in the DDL and the start
 has not moved, so this is the backfill boundary rather than a rolling window — but
 `ch.Client.coverage` queries it rather than assuming, because it moved once already.
+
+**Base (chain 8453) followed on 2026-09-01 16:00**, and by 2026-10 `gold_quotes` held prod
+requests for every chain the protocol runs on. Base is enabled in `NETWORK_CHAIN_IDS` since
+2026-10-14. The others are not yet, because nothing has checked their reproduction rate or
+match coverage. `raw_quotes.price_estimates` carries base with a `request_id` on every row,
+as on the other two. Base's first run, 2026-10-05..12 with `--all-solvers`:
+
+| | base | bnb, same window |
+| --- | --- | --- |
+| orders linked to a competition | 17,108 of 17,110 (1,588 via the raw layer) | 28,373 of 28,374 (3,114 via the raw layer) |
+| pick reproduces the recorded winner | **99.19%** (16,952 / 17,091) | 98.55% (27,599 / 28,004) |
+| verified-class rule, mixed requests | 8,554 of 8,554 | 13,355 of 13,355 |
+| price-suspect orders | 4 | 325 |
+
+bnb's rate is down from 100.0% on 2026-08-10..16 and not yet explained.
 
 `loo.ch.NETWORK_CHAIN_IDS` is the support test: a network absent from it has no quote
 data, and `analyse --quotes` refuses it instead of reporting empty quote columns, which
@@ -591,3 +606,23 @@ delta up.
     competition priced an order. `price_quality != 'fast'` is the one filter that belongs:
     `order_quotes` never holds a fast quote, and a fast request sharing the amount is the
     UI's poll, not the order's quote.
+14. **The quote side's price guard is one-sided, and on bnb that breaks every bps
+    figure.** `price_suspect_orders` compares the api's `sell_token_price` with the
+    auctions' median price for the *same* sell token. When both feeds carry the same
+    wrong price, it passes. bnb 2026-10-05..12: 26 orders, all valued above 1,000 BNB
+    and most from Trust Wallet (token `0x4078920b…` at 0.1006 BNB in both feeds), carried
+    28.68M of the window's 28.70M BNB "executed volume". The solve side's whole week was
+    16,988 BNB. They pushed every solver's `window_bps` toward zero (Rizzolver −0.01
+    raw vs −11.40 cleaned) and put two of them into Nexroute's numerator (−62.6 bps raw vs
+    −3.8 cleaned). The solve side's two-sided rule, applied per order (sold value vs
+    bought value at auction medians, 2x), flags 1,444 traded orders (5.2%), holding 99.94%
+    of that volume. That leaves 17,492 BNB, close to the solve side's total. Base had
+    nothing to flag. Until the guard is two-sided in `loo/`, do not read bnb's quote rows
+    from `compare`. Rebuild them instead: reload the window's orders with
+    `load_recorded_quotes`, check that the non-suspect sum reproduces
+    `window_volume_native` exactly, drop the orders that fail the two-sided rule from
+    both the numerator and the denominator, and recompute from the report's per-order
+    `diffs`. The fix in `loo/` should use the **per-auction** prices of the auctions an
+    order traded in, not window medians, because medians over-exclude tokens whose price
+    moved during the window. USDT→`0xfb4f81f5…` (225 bnb orders) failed at medians, while
+    its per-auction values matched the trade-implied rate at 1.00x.
