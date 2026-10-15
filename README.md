@@ -128,24 +128,29 @@ clear the limit the replacement quote implies; would the winner set move if ever
 carried the limit change) are counted and reported so that assumption is tested rather than
 held.
 
-It needs the `CLICKHOUSE_*` credentials and a network with quote data (mainnet and bnb from
-2026-07-22, base from 2026-09-01); the quote window is clamped forward to the first day of that data and both
-windows are reported. Orders are linked to their competition through the gold request
-table and, where that table never received the competition, through the raw estimates —
-about 99.9% of a day's orders, every raw-layer match corroborated by the winning
-estimate's own amount. Fast quotes are not candidates: `order_quotes` never holds one. `--quote-ranking` chooses how the pick is re-run: `effective-sell`
-(default) nets the gas cost in the sell token at the order's own recorded prices and
-reproduces the recorded winner on 99.6% of mainnet requests from the record alone;
-`autopilot` uses the protocol's own out-token rule and needs the buy token's native
-price. Every run reports its own reproduction rate — a window where it falls is a window
-where the rule changed. See [docs/quotes.md](docs/quotes.md).
+It needs the `CLICKHOUSE_*` credentials and a network with quote data — mainnet and bnb
+from 2026-07-22, base, arbitrum-one, xdai, polygon, avalanche, ink, plasma and linea from
+2026-09-01; the quote window is clamped forward to the first day of that data and both
+windows are reported. An order created from 2026-09-29 17:20 UTC is linked to its
+competition **by quote id**, exactly; an earlier one by a heuristic over the gold request
+table and the raw estimates, corroborated where the winning estimate reproduces the stored
+amount. Unwraps (quote solver `0x0`) had no competition and are linked by neither. Orders
+whose prices fail a check — the api's against the auction's, or sold against bought value,
+both at the prices of the auctions the order traded in — leave every quote figure.
+`--quote-ranking` chooses how the pick is re-run: `effective-sell` (default) nets the gas
+cost in the sell token at the order's own recorded prices, truncated as prod truncates —
+the protocol's own rule since services#4846, reproducing the recorded winner on ≥ 99.8% of
+requests on every chain; `autopilot` is the out-token rule from before it and needs the buy
+token's native price. Every run reports its own reproduction rate and link rate — a window
+where the first falls is a window where the rule changed, or a tie-break is being missed.
+See [docs/quotes.md](docs/quotes.md).
 
 | flag | |
 | --- | --- |
 | `--all-solvers` | one scenario per solver that bid in the window; excludes `--solver` |
 | `--outcome-rule` | `inherited` (default) or `assume-settled`, repeatable — all rules share the extraction pass; see below |
 | `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus |
-| `--quotes` | also remove the solver from the quote competition (mainnet, bnb, base) |
+| `--quotes` | also remove the solver from the quote competition (every chain but lens and sepolia) |
 | `--quote-ranking` | `effective-sell` (default) or `autopilot` |
 | `--limit N` | only the first N auctions — start here |
 | `--out report.json` | per-auction records, including both sides' reference scores and rewards; `{solver}` in the path becomes each solver's slug, `{rule}` the outcome rule |

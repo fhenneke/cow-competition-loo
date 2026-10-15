@@ -477,6 +477,8 @@ def _quote_payload(analysis: QuoteAnalysis) -> dict[str, Any]:
             "delta_bps": diff.delta_bps,
             "volume_native": diff.volume_native,
             "partially_fillable": diff.partially_fillable,
+            "streamed": diff.streamed,
+            "commit_dependent": diff.commit_dependent,
         }
         for diff in analysis.diffs
     ]
@@ -496,6 +498,20 @@ def _quote_window_payload(quote_window: QuoteWindow) -> dict[str, Any]:
         "orders": len(quote_window.orders),
         "orders_dropped": quote_window.orders_dropped,
         "orders_before_coverage": quote_window.orders_before_coverage,
+        "trivial_orders": quote_window.trivial_orders,
+        "links": [
+            {
+                "link": stats.link,
+                "orders": stats.orders,
+                "linked": stats.linked,
+                "corroborated": stats.corroborated,
+                "requoted": stats.requoted,
+                "streamed": stats.streamed,
+                "streamed_early": stats.streamed_early,
+                "unlinked": dict(stats.unlinked),
+            }
+            for stats in quote_window.links
+        ],
         "matched": len(quote_window.matches),
         "matched_corroborated": sum(
             1 for m in quote_window.matches if m.tier == "corroborated"
@@ -504,6 +520,9 @@ def _quote_window_payload(quote_window: QuoteWindow) -> dict[str, Any]:
         "volume_native": quote_window.window_volume_native,
         "quoted_volume_native": quote_window.window_quoted_volume_native,
         "price_suspects": len(quote_window.price_suspects),
+        "price_suspects_one_sided": quote_window.one_sided_suspects,
+        "price_suspects_two_sided": quote_window.two_sided_suspects,
+        "price_suspect_volume_native": quote_window.suspect_volume_native,
         "coverage_by_app": [
             {"app_code": app, "orders": n, "matched": m}
             for app, n, m in quote_window.coverage_by_app()[:25]
@@ -515,6 +534,10 @@ def _quote_window_payload(quote_window: QuoteWindow) -> dict[str, Any]:
         "pick_mixed_class": validation.mixed_class,
         "pick_mixed_class_correct": validation.mixed_class_correct,
         "pick_tied": validation.tied,
+        "pick_tie_mismatches": validation.tie_mismatches,
+        "pick_streams": validation.streams,
+        "pick_streams_reproduced": validation.streams_reproduced,
+        "pick_stream_disagreements": validation.stream_disagreements[:20],
         "pick_unpriced": validation.unpriced,
         "pick_price_suspect": validation.price_suspect,
         "pick_disagreements": validation.disagreements[:20],

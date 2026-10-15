@@ -56,7 +56,7 @@ stays in the sections and docs each row links to; the milestone sections cite th
 | D24 | The coverage count gets a **window-level second reading**: only-with executions over every user-order execution the recorded winners traded in the window, **partially fillable included** — both sides counted per auction-order execution — with a distinct-order decomposition beneath it whose share exists for the fill-or-kill part only ([§12](#12-m10--coverage-share-of-all-traded-orders--done)) | quoting "of N compared" alone — it is relative to the solver's own auctions and overstates window-level dependence for a selective bidder (measured 35.2% vs under 1% for a solver bidding in 5.7% of auctions); a fill-or-kill-only share reusing D23's count — built first to avoid a format bump, revised in review: partially fillable orders dominate coverage exactly where coverage matters (xdai July: 5,316 of 5,698 distinct only-with orders) and the extraction already sees every execution, so the fuller denominator was judged worth format 5 and a sweep re-run; a distinct-order share for partially fillable orders — no window-wide distinct count exists and one would understate them exactly where they trade most | `counterfactual.recorded_executed_volume`, `Analysis.window_order_executions_base`, `aggregate.Report.coverage_share`, `coverage_share_fok` | — |
 | D26 | `--all-solvers` derives the scenario list from the **window**: one per catalogue name (rotated addresses together, D9) and one per uncatalogued address. A solver left with no analysed auction is then **reported and skipped**, not fatal — nobody named it, so there is no misreading to guard against, unlike D25's named groups ([§15](#15-m14--fee-aware-scoring--done)) | naming every solver by hand — a 26-entry command line that goes stale as solvers come and go, and the reason the July run had to be assembled from an ad-hoc catalogue query first; defaulting to all solvers with no flag — silently expensive, and `--solver` typos would stop failing fast | `extract.all_solvers`, `cli.resolve_scenarios` | — |
 | D25 | A comma-separated `--solver` entry is a **removal group**: one counterfactual with every member absent at once, whose deltas describe the joint scenario and are **never attributed to individual members** ([§13](#13-m11--joint-removal-of-multiple-solvers--done)) | summing single-solver runs — wrong in both directions, removed solvers stop replacing each other; per-member attribution (Shapley-style) — needs 2^n scenario runs and answers a different question; rejecting overlapping scenarios (the pre-M11 shared-address rule) — would forbid exactly the single-vs-joint comparison the feature exists for, so only *identical* address sets are rejected as duplicates | `run.analyse_window` (group resolution), `counterfactual.leave_one_out` (already set-based), `run.absent_members` + `Analysis.addresses_seen` (a member absent from every analysed auction fails the run rather than padding the label) | the reader combines scenarios; to attribute, run the subsets as separate groups |
-| D27 | The quote counterfactual re-runs the **protocol's own pick** — the verified class first, then an effective amount netted for the estimator's own gas — and `--quote-ranking` chooses the currency: `effective-sell` (default) nets in the sell token at the order's recorded `gas_price / sell_token_price`, `autopilot` in the out token at its native price ([§16](#16-m15--the-quote-competition--done), [measured](docs/quotes.md#the-two-ranking-rules-and-why-the-default-is-not-the-protocols-own)) | `argmax out_amount` — reproduces 51.6% of a day's mainnet picks and 61.5% of order-creating ones, so a gap metric on it is wrong about *who wins* in a third of cases; the autopilot rule as default — it needs the buy token's native price, which is not recorded per quote, where `effective-sell` reproduces 99.6% (mainnet) / 100.0% (bnb) from the record alone and is the same quantity the fee is charged against | `quotes.rank_key`, `quotes.pick`, `quotes.RANKING` | `--quote-ranking` exists; a third rule is a new branch in `rank_key` |
+| D27 | The quote counterfactual re-runs the **protocol's own pick** — the verified class first, then an effective amount netted for the estimator's own gas — and `--quote-ranking` chooses the currency: `effective-sell` (default) nets in the sell token at the order's recorded `gas_price / sell_token_price`, `autopilot` in the out token at its native price. Since services#4846 (merged 2026-09-02) `effective-sell` *is* the protocol's rule and `autopilot` the one before it; M16 added prod's clamp, truncation and arrival-order tie-break to both (D40) ([§16](#16-m15--the-quote-competition--done), [measured](docs/quotes.md#the-two-ranking-rules-and-how-the-default-became-the-protocols-own)) | `argmax out_amount` — reproduces 51.6% of a day's mainnet picks and 61.5% of order-creating ones, so a gap metric on it is wrong about *who wins* in a third of cases; the autopilot rule as default — it needs the buy token's native price, which is not recorded per quote, where `effective-sell` reproduces 99.6% (mainnet) / 100.0% (bnb) from the record alone and is the same quantity the fee is charged against | `quotes.rank_key`, `quotes.pick`, `quotes.RANKING` | `--quote-ranking` exists; a third rule is a new branch in `rank_key` |
 | D28 | The quote effect on revenue goes **into the existing protocol-fee delta**, not into a column beside it: the counterfactual side values the affected orders' `priceimprovement` fee against the replacement quote, through the same `fees.py` path, while the baseline keeps the recorded quote ([§16](#16-m15--the-quote-competition--done)) **Revised 2026-09-07:** the fee deltas are computed with the **recorded quotes on both sides** — what the removal does through who executes — and the quote's own fee effect (the price-improvement fee the counterfactual executions pay against the replacement quotes minus against the recorded ones, `quote_fee_recharge`) is a **separate quote-side figure**, never added to them: a worse quote raises the fee baseline mechanically, and folding it in read as the protocol gaining from losing a good quoter | a separate quote-side fee figure — the price-improvement reference *is* the effective amount of the best quote, so a second number would be the same money counted twice and reconciled by hand; recomputing solution scores from the counterfactual quote — that is what D1 refuses, and it would make the quote change who *wins*; an elasticity model (users leave once the quote is ~2 bps worse, so less volume, less fee) — a demand curve nobody could defend, and the plain split is more legible | `counterfactual.analyse_auction` (`counterfactual_quotes`), `quotes.QuoteAnalysis.counterfactual_quotes`, `Analysis.quote_substituted_orders` | — |
 | D29 | An order↔request match is **corroborated** when the winning estimate's `out_amount` reproduces the amount stored on the order, and only corroborated matches feed the headline figures or move a fee; the heuristic tier is counted and carried as an `_all` companion ([data](docs/quotes.md#the-order--request-join-is-a-heuristic-with-an-exact-corroborator)) | one match rate and one number — on a heuristic match the recorded quote is not the ladder's winner, so a runner-up can beat the baseline and the degradation comes out *positive* (2 of 82 wins in a one-day test); dropping the heuristic tier entirely — its size is the honest measure of the match's uncertainty | `quotes.MatchTier`, `quotes.match_orders`, `QuoteAnalysis.add` | the tier test is one comparison in `match_orders` |
 | D30 | A **class flip** — removing the only verified estimator — is its own leaf with its own count and volume, and is excluded from both bps figures | netting it in: the replacement's nominal amount can be *higher* while the quote is worse in kind, and one such flip supplied the entire conditional figure of a one-day test (+70 bps on 5 ETH against 81 degraded orders) | `quotes.diff_quote` leaf, `QuoteAnalysis.class_flips` | — |
@@ -66,6 +66,11 @@ stays in the sections and docs each row links to; the milestone sections cite th
 | D34 | Holding executions and ranking fixed under a replaced quote is **checked per auction, not assumed**: `quote_limit_unclearable_orders` counts recharged orders whose execution would not clear the limit the replacement quote implies (possible only on a class flip — a worse quote weakens the limit), and `auctions_quote_shift_would_change_winners` re-arbitrates with every score shifted by its substituted orders' measured-surplus change and counts the auctions where the winner set moves, over `auctions_quote_checked`, with the flagged ids in `quote_shift_auctions` ([§16](#16-m15--the-quote-competition--done)) | asserting both from the direction argument alone — the class-flip exception is real; applying the shift to the reported ranking — that is what D1 refuses, and a shift that moved winners would be a finding about the design rather than a correction | `quotes.shifted_limit`, `counterfactual._limit_checks`, `counterfactual._shift_moves_winners` | the wedge (signed limit rate over the recorded effective quote rate) is the one model in the check |
 | D35 | Orders are linked to competitions from **both layers**: the gold request table without the `quote_id` filter, and, for the orders that leaves unplaced, `raw_quotes.price_estimates` grouped by `request_id` — the gold tables are built off the `quote_requested` event and hold none of the competitions whose event never arrived (0.6% of requests, the competitions behind a quarter of a day's orders). `fast` requests stay excluded: `order_quotes` never holds a fast quote, so the quote an order carries is always a non-fast competition ([measured](docs/quotes.md#the-gold-tables-do-not-hold-every-competition--link-through-the-raw-layer)) | filtering candidates on `quote_id is not null` — the recovered competitions have no `quote_computed` either; matching fast requests — the Trust Wallet poll shares the amount but not the stored quote (0.45% gap, heuristic tier) while the order's real, non-fast competition sits in the raw layer exact to the atom; calling the gold-unmatched orders unquoted — they were quoted, in competitions the gold layer never received | `quotes.load_raw_candidates`, `quotes.load_ladders` (raw branch), `quotes.with_ladder`, `QuoteWindow.matched_raw` | — |
 | D36 | A replacement quote more than **2x off the recorded quote's rate, in either direction**, is the `implausible` leaf: counted with its volume, out of the bps and fee figures. The factor is D14's `PRICE_IMBALANCE_THRESHOLD`, so both guards call a number broken at the same point ([measured](docs/quotes.md#what-the-quote-side-computes)) | leaving it in — one buy order's three-atom replacement read as +1.16e15 bps and 1.45 billion bps of a window figure; guarding only the improvement direction — the −9,7xx bps orders on the other side were 86–99% of the concentrated rows and are the same kind of estimate; a tighter factor — a 2x-worse runner-up is a bad quote, not a broken one, and the reader should see it | `quotes.IMPLAUSIBLE_QUOTE_FACTOR`, `diff_quote`, `QuoteAnalysis.implausible` | the factor is one constant |
+| D37 | An order created from **2026-09-29 17:20 UTC** (`QUOTE_ID_LINK_START`) is linked to its competition **by quote id** — `order_quotes.quote_id` (read from `raw_prod_<chain>`) → the raw estimate carrying that id → its request — and the link holds only when that estimate is the competition's **recorded winner** and reproduces the order's stored amount **to the atom**; an ethflow order whose stored quote the backend recomputed at indexing links to that request-less re-quote instead, found by the same exact amount; an earlier order keeps the heuristic (D29, D35). Per order, so a straddling window uses both and reports each ([§17](#17-m16--the-quote-id-link-and-a-two-sided-price-check--done), [measured](docs/quotes.md#quote-ids-link-an-order-to-its-competition-exactly--from-2026-09-29)) | the heuristic everywhere — it put 5.7% (mainnet) / 4.8% (bnb) of its *corroborated* matches on a different competition; per-window choice — a September month would lose the id link for its last two days; linking a streamed order to its competition anyway — the winner is not who priced it, and who would have is a function of when the user clicked, which nothing records; `stg_backend_data__order_quotes.quote_id` — NULL on rows built before ~2026-10-06 | `quotes.link_by_quote_id`, `quotes.QUOTE_ID_LINK_START`, `quotes.ORDERS_SQL`, `QuoteWindow.links` | the cut-over is one constant |
+| D38 | An order whose recorded quote solver is the **zero address** had no competition — every one seen is a wrapped-native→native unwrap answered identically by every estimator — and is linked by **neither** link; it stays in the window's population and denominators, contributing zero like any unmoved order ([§17](#17-m16--the-quote-id-link-and-a-two-sided-price-check--done)) | matching it (M15) — each counted as a quote win of whoever answered first, and the derived estimator map learnt the zero address for `baseline`, which then showed no quote wins at all on bnb | `quotes.TRIVIAL_QUOTE_SOLVER`, `RecordedQuote.trivial`, `load_quote_window` | — |
+| D39 | The quote side's price guard is **two checks per order, each at the prices of the auctions the order traded in**: one-sided (api `sell_token_price` against the auction's price of the same token, sell-amount weighted over the order's trades; the window median only for an untraded order, which weighs nothing) and two-sided (sold against bought value, trade by trade — `price_imbalanced` per order). Failing either takes the order out of every figure ([§17](#17-m16--the-quote-id-link-and-a-two-sided-price-check--done), [why](docs/quotes.md#two-price-checks-both-at-the-orders-own-auctions)) | one-sided only (M15) — passed 26 bnb orders carrying 28.68 M of 28.70 M BNB because both feeds priced their token the same wrong way; window medians — a token that moved inside the week fails honestly: 225 bnb orders of a two-sided and 238 of a one-sided median check whose per-auction ratios were 1.00x | `quotes.price_suspect_orders`, `quotes.imbalanced_orders`, `quotes.traded_sell_prices`, `quotes.ORDER_TRADES_SQL` | `PRICE_IMBALANCE_THRESHOLD`; a pair both mispriced by one factor passes both, as on the solve side |
+| D40 | The re-run pick is **prod's arithmetic to the discontinuity**: a sell estimate under water is worth zero, every effective amount is truncated to an integer before comparing, and equal keys go to the **first to arrive** — ladders are loaded in `nats_seq` order (raw) or `estimate_timestamp` order (gold) ([§17](#17-m16--the-quote-id-link-and-a-two-sided-price-check--done), [why](docs/quotes.md#why-bnbs-reproduction-fell-to-9855-and-what-it-was)) | the unclamped, untruncated key in ClickHouse's return order (M15) — fine while ties were rare; bnb's rate fell to 98.55% once unwraps and dust requests made them common, and every one of the disagreements was a tie prod broke by arrival order | `quotes.rank_key`, `quotes.load_ladders`, `quotes.Arrival`, `PickValidation.tie_mismatches` | — |
+| D41 | An order placed from a **streamed quote** is decided by the answer it took, not by the competition's recorded winner: removing anyone else leaves it unaffected, and removing that estimator gives the best remaining answer that had arrived by the user's commit — placed at the **latest moment the record allows** (just before the next answer the stream sent, or before the order's creation), waiting for the next answer the stream would send if none had; a stream dropped before that answer is the `unrecorded` leaf. The stream's `quote_computed` rows are the record of what it sent, and `replay_stream` must reproduce them ([§17](#17-m16--the-quote-id-link-and-a-two-sided-price-check--done), [why](docs/quotes.md#streamed-quotes-the-order-takes-what-the-stream-showed-not-the-winner)) | leaving them unlinked (M16's first cut) — 308 bnb orders a week out of every figure, and the 11,957 that took the final answer still judged against answers the user may never have seen; the full ladder — what one-shot requests get, but here it assumes the user saw answers that arrived after their commit; the earliest commit (the moment their answer was sent) as the scenario — no more defensible than the latest, and it would change the 11,957 orders that took the final answer as well; both as a bracket — a spread of two scenarios is not a figure anyone should quote, so the earliest is a count (`commit_dependent`) instead | `quotes.StreamTake`, `quotes._stream_take`, `quotes.stream_replacement`, `quotes.replay_stream`, `PickValidation.streams` | the commit is one rule in `_stream_take` |
 ## 2. Two valuations, deliberately separate
 
 Decisions D1 and D2. The competition ranks on **score** = user surplus + protocol fees.
@@ -1525,4 +1530,162 @@ two open issues:
   from 2026-09-29.
 
 Both are the next quote-side milestone. The other chains stay disabled until their
-reproduction rate and match coverage are measured.
+reproduction rate and match coverage are measured. (All three done in
+[§17](#17-m16--the-quote-id-link-and-a-two-sided-price-check--done).)
+
+## 17. M16 — the quote-id link and a two-sided price check — **done**
+
+M15 shipped the quote side on two chains with a heuristic link and a one-sided price
+guard. A quote-enabled run over bnb and base for 2026-10-05..12 found four problems, all
+on the quote side; this milestone fixes them and enables every chain the data supports.
+The durable facts are in [docs/quotes.md](docs/quotes.md); the decisions are D37–D40.
+
+### 1. The order↔quote link is a join from 2026-09-29 (D37)
+
+The backend now records the link on both sides: `order_quotes.quote_id` (from 2026-09-22)
+and a per-estimate id with the estimator's settlement address (`price_estimates.quote_id`
+and `solver`, from **2026-09-29 17:16 UTC** on every chain at once). `link_by_quote_id`
+joins them, keeps a link only when the linked estimate is its competition's recorded
+winner and reproduces the stored amount to the atom, and reads the estimator→address map
+instead of deriving it. Orders created from `QUOTE_ID_LINK_START` (17:20) use it; earlier
+ones keep the heuristic, so a window straddling the deploy reports both links. Measured
+against the ids, the heuristic had put 5.7% / 4.8% of its *corroborated* mainnet / bnb
+matches on a different competition.
+
+Every order the id cannot place is accounted for (table in
+[docs/quotes.md](docs/quotes.md#every-order-accounted-for)); none is left unexplained:
+
+- **Trivial unwraps** (D38) — quote solver `0x0`, every estimator answering identically.
+  The heuristic matched them and taught its estimator map the zero address for whoever
+  answered first: bnb's `baseline` wins 141 real quotes in the window and M15 reported
+  none. Not linked.
+- **Ethflow orders the backend re-quoted at indexing** — the id names the UI quote (or is
+  `0`), while the stored quote came from a competition the backend ran itself, with no
+  request id. A second pass links them to it by the stored amount (`_link_requotes`): all
+  25 that week, 18 of them on mainnet.
+- **Orders placed from a streamed quote** (D41) — since services#4957 the streaming
+  endpoint records every answer it sends as a `quote_computed` row and its *final* best
+  as the winner, while the user commits to whatever was on screen: 44% of bnb's orders
+  that week came through a stream, 308 of them from an answer before the final one, and
+  72 arbitrum `minimal-2` orders from streams dropped before a winner was recorded. They
+  are linked with a `StreamTake`, and their counterfactual follows the stream: what the
+  user would have been shown by their commit without the removed solver.
+
+Unwraps aside, every order on every chain is now linked: 100% of non-trivial orders on all
+ten chains over 2026-10-05..12 (table in the docs).
+
+### 2. The price guard is two-sided, per order, per auction (D39)
+
+The one-sided guard passed tokens both feeds priced the same wrong way: 26 bnb orders
+carried 28.68 M of the 28.70 M BNB it let through. Every order is now also checked
+sold-against-bought, trade by trade, at
+the prices of the auction each trade settled in (`imbalanced_orders`, the solve side's
+`price_imbalanced` per order). The one-sided check moved to per-auction prices as well,
+because a window median excludes honest orders of any token that moved inside the window
+(238 bnb orders, 63 BNB, at 1.00x per auction).
+
+### 3. bnb's pick reproduction fell to 98.55% because of ties (D40)
+
+Not link errors and not a rule change: trivial unwraps and dust requests, where prod's
+clamp of underwater quotes to zero and its truncation to integer atoms make estimates
+equal, and arrival order decides. Arrival order is recorded (`nats_seq`); the pick now
+clamps, truncates and keeps the first of equal keys over ladders loaded in arrival order.
+bnb: **26,991 of 26,991**, 196 ties. Reading the Rust for this also showed that since
+services#4846 (merged 2026-09-02) the protocol ranks on the sell-token netting —
+`effective-sell` is now the protocol's own rule, and `autopilot` the one before it. The
+`autopilot` cross-check had divided gas by a native price still scaled by 1e18, so gas
+never counted on its sell orders; fixed.
+
+### 4. Coverage by chain
+
+Every chain in `gold_quotes` was measured before being enabled, quote-id link over
+2026-10-05..12 and heuristic over 2026-09-22..29 (docs/quotes.md has the reasons per chain):
+
+| network (chain) | quote-id link, 10-05..12 (non-trivial orders) | pick reproduced | heuristic link, 09-22..29 (corroborated) | pick reproduced |
+| --- | --- | --- | --- | --- |
+| mainnet (1) | 25,881 / 25,881 (100%) | 25,722 / 25,723 (100.00%) | 34,198 / 34,217 (99.9%; 23,341) | 24,277 / 24,319 (99.83%) |
+| bnb (56) | 28,102 / 28,102 (100%) | 26,991 / 26,991 (100.00%) | 44,095 / 44,115 (100.0%; 18,424) | 22,275 / 22,276 (100.00%) |
+| base (8453) | 17,068 / 17,068 (100%) | 17,057 / 17,057 (100.00%) | 24,524 / 24,528 (100.0%; 22,854) | 23,684 / 23,695 (99.95%), 2 ms-tie |
+| arbitrum-one (42161) | 12,097 / 12,097 (100%) | 12,018 / 12,018 (100.00%) | 15,710 / 15,710 (100.0%; 14,035) | 14,934 / 14,939 (99.97%), 2 ms-tie |
+| xdai (100) | 9,301 / 9,301 (100%) | 9,298 / 9,298 (100.00%) | 13,013 / 13,013 (100.0%; 12,854) | 12,991 / 13,008 (99.87%), 16 ms-tie |
+| polygon (137) | 2,403 / 2,403 (100%) | 2,363 / 2,363 (100.00%) | 2,823 / 2,824 (100.0%; 1,644) | 1,868 / 1,868 (100.00%) |
+| avalanche (43114) | 797 / 797 (100%) | 797 / 797 (100.00%) | 933 / 933 (100.0%; 611) | 734 / 735 (99.86%) |
+| ink (57073) | 523 / 523 (100%) | 522 / 522 (100.00%) | 517 / 517 (100.0%; 515) | 510 / 510 (100.00%) |
+| plasma (9745) | 119 / 119 (100%) | 119 / 119 (100.00%) | 148 / 148 (100.0%; 146) | 148 / 148 (100.00%) |
+| linea (59144) | 24 / 24 (100%) | 24 / 24 (100.00%) | 21 / 21 (100.0%; 19) | 19 / 19 (100.00%) |
+
+All ten are enabled. linea (24 orders that week, two estimators) and plasma (119) are
+enabled on thin evidence that holds; the heuristic's corroborated share is low on polygon
+(58%) and avalanche (65%), so pre-cut-over figures there rest on a smaller headline tier.
+
+### Validation
+
+`analyse --all-solvers --quotes`, both outcome rules, over 2026-10-05..12 — the window of
+the M15 run that found the problems — on bnb (9 min), base (5 min) and mainnet (6 min),
+one at a time; reports in `out/quotes-2026-10-05-m16/` (gitignored), with `run.sh`.
+
+| | bnb | base | mainnet |
+| --- | --- | --- | --- |
+| orders with a recorded quote | 28,386 | 17,115 | 26,061 |
+| trivial unwraps | 284 | 47 | 180 |
+| linked (unwraps aside) | 28,102 / 28,102 | 17,068 / 17,068 | 25,881 / 25,881 |
+| … through a stream (before it finished) | 12,265 (308) | 513 (30) | 4,406 (174) |
+| … to the ethflow re-quote | 1 | 5 | 18 |
+| pick reproduced | 26,991 / 26,991, 196 ties | 17,057 / 17,057, 113 ties | 25,722 / 25,723, 185 ties |
+| stream replay reproduced | 11,523 / 11,523 | 512 / 512 | 4,343 / 4,344 |
+| price checks: one-sided / two-sided / either | 11 / 1,106 / 1,111 | 1 / 10 / 10 | 1 / 158 / 158 |
+| executed volume left (native) | 20,287 | 14,652 | 256,458 |
+
+Nexroute, against the references the brief gave (hand-cleaned with a two-sided check at
+window medians):
+
+| Nexroute | bnb M16 | bnb reference | base M16 | base reference |
+| --- | --- | --- | --- | --- |
+| Δquote, window | **−6.62 bps** | −3.80 bps (raw −62.6) | **−0.13 bps** | −0.12 bps |
+| largest single order | 37% (`55c121d7…`, −455 bps, unchanged) | 75% (`55c121d7…`) | 68% | 69% |
+| corroborated quote wins | 7,676 | 7,099 | 5,222 | 3,848 |
+
+Every other bnb solver above 0.15 bps reads 0.85–0.94 of its hand-cleaned figure, which is
+the ratio of the two denominators (17,492 / 20,287 = 0.86): the numerators agree, and the
+denominator gained the honest trades of tokens that moved during the week, which the
+median checks had excluded. Nexroute differs for a different reason — 341 of its orders sat in M15's
+excluded heuristic tier and are now linked exactly (−6.08 BNB of the −13.43 BNB
+numerator); one of them, a 3.75 M-token sale into USDT where the runner-up quoted 10.5%
+less, is −4.95 BNB alone. Its `no quote` count is 77 where the reference says 10 —
+M15's raw report already had 76; the hand-cleaning had removed 61 of them as
+USDT→0xfb4f81f5…, the volatile token the median check failed. Baseline goes from no quote
+wins to 260 (D38; 141 of them before the streamed orders were linked). On base the win counts rise because 27% of M15's base matches were in
+the heuristic tier (12,500 of 17,108 corroborated); the figures barely move.
+
+`compare` renders all of it without hand cleaning: the window row names the price-check
+exclusions and the volume they removed (295 G BNB on bnb, 973 G ETH on mainnet, each
+nearly all one or two orders), the new `order↔competition link` row the link and its
+misses, the pick row its ties. One mainnet auction (13971086, two negative-surplus bids)
+is abandoned in valuation in every scenario — solve side, unchanged here.
+
+**Open: a pair mispriced by one factor passes both checks.** The heuristic week
+2026-09-22..29 on bnb holds an order (`5d8534d8…`) whose two tokens both feeds price
+~1e8 too high; it alone is 1.34e12 BNB, 98% of what the checks pass, and zeroes that
+week's bnb `window_bps`. The solve side has the same hole. A third reference — a per-order
+value cap or a native-price ceiling, on both sides — is the next piece of work here.
+
+### What was built
+
+- `loo/quotes.py` — `link_by_quote_id` and its re-quote pass `_link_requotes`, `LinkStats`, `QUOTE_ID_LINK_START`,
+  the streamed counterfactual (`StreamTake`, `_stream_take`, `stream_replacement`,
+  `replay_stream`, the `unrecorded` leaf, `PickValidation.streams`),
+  `TRIVIAL_QUOTE_SOLVER` and `RecordedQuote.trivial`/`quote_id`/`out_atoms`;
+  `heuristic_link` (the M15 path, now one of two); `OrderTrade`, `load_order_trades`,
+  `load_trade_prices`, `imbalanced_orders`, `traded_sell_prices` and the per-auction
+  `price_suspect_orders`; `rank_key` with prod's clamp and truncation; ladders in arrival
+  order (`Arrival`); `PickValidation.tie_mismatches`.
+- `loo/db.py` — `raw_schema(network)`.
+- `loo/ch.py` — eight more networks in `NETWORK_CHAIN_IDS`, each measured first.
+- `loo/run.py`, `loo/aggregate.py` — report **format 14**: `quote_window.links`,
+  `trivial_orders`, the per-check price-suspect counts and removed volume, the tie counts;
+  `compare` gains the `order↔competition link` row, the price-check detail on the
+  window row, and a link warning over the linkable (non-trivial) orders.
+- `loo/cli.py` — the supported networks in `--quotes`' help come from `ch`.
+- Tests for the clamp and truncation ties, arrival order on both layers, the id link
+  against a fake ClickHouse, the trivial rule, both price checks, the format-14 round
+  trip.

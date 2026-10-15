@@ -267,13 +267,13 @@ class TestQuoteSide:
     def test_a_network_without_quote_data_is_refused(self, stubbed: Calls):
         from loo import ch
 
-        with pytest.raises(ch.NoQuoteDataError, match="xdai"):
+        with pytest.raises(ch.NoQuoteDataError, match="sepolia"):
             run.analyse_window(
                 CONN,
                 ["TestSolver"],
                 "2026-07-01",
                 "2026-08-01",
-                network="xdai",
+                network="sepolia",
                 with_quotes=True,
             )
 

@@ -1002,7 +1002,13 @@ class TestQuoteSideRoundTrip:
         from loo import run as run_module
         from loo.counterfactual import Analysis, AuctionCounterfactual, OrderDiff
         from loo.fees import Quote
-        from loo.quotes import PickValidation, QuoteAnalysis, QuoteDiff, QuoteWindow
+        from loo.quotes import (
+            LinkStats,
+            PickValidation,
+            QuoteAnalysis,
+            QuoteDiff,
+            QuoteWindow,
+        )
 
         fee_only = AuctionCounterfactual(
             auction_id=9,
@@ -1074,9 +1080,33 @@ class TestQuoteSideRoundTrip:
             estimator_map={"w": "aa"},
             buy_token_prices={},
             validation=PickValidation(
-                ranking="effective-sell", requests=5, with_recorded_winner=5, reproduced=5
+                ranking="effective-sell",
+                requests=5,
+                with_recorded_winner=5,
+                reproduced=5,
+                tied=2,
+                streams=3,
+                streams_reproduced=3,
             ),
             coverage_start="2026-07-22 15:28:03",
+            links=(
+                LinkStats(
+                    link="quote-id",
+                    orders=8,
+                    linked=5,
+                    corroborated=5,
+                    requoted=1,
+                    streamed=2,
+                    streamed_early=1,
+                    unlinked={
+                        "stored quote not reproduced": 1,
+                        "placed from a non-winning estimate": 2,
+                    },
+                ),
+            ),
+            price_suspects=frozenset({"ee", "ff"}),
+            one_sided_suspects=1,
+            two_sided_suspects=2,
         )
         window = run_module.WindowAnalysis(
             network="mainnet",
@@ -1124,6 +1154,23 @@ class TestQuoteSideRoundTrip:
         assert (quote.quote_wins, quote.degraded, quote.matched) == (2, 2, 2)
         assert quote.orders_total == 0  # the fixture's window holds no orders
         assert quote.pick_rate == Decimal(1)
+        assert (quote.pick_tied, quote.pick_tie_mismatches) == (2, 0)
+        assert (quote.pick_streams, quote.pick_streams_reproduced) == (3, 3)
+        assert (quote.stream_wins, quote.commit_dependent, quote.unrecorded) == (0, 0, 0)
+        assert (
+            quote.price_suspects,
+            quote.price_suspects_one_sided,
+            quote.price_suspects_two_sided,
+        ) == (2, 1, 2)
+        (link,) = quote.links
+        assert (link.link, link.orders, link.linked, link.rate) == (
+            "quote-id", 8, 5, Decimal(5) / 8
+        )
+        # Reasons come back largest first, whatever order the file holds them in.
+        assert link.unlinked == (
+            ("placed from a non-winning estimate", 2),
+            ("stored quote not reproduced", 1),
+        )
         assert (quote.start, quote.end) == ("2026-08-01", "2026-08-02")
         # The D33 fee-only auction: one recharged order, one auction, none bid in.
         assert quote.substituted_orders == 1
@@ -1158,7 +1205,13 @@ class TestQuoteSideRoundTrip:
             "in 0 of 1 auctions holding a replacement quote"
         )
         assert rows["  quote pick reproduced the recorded winner"][0] == (
-            "100.000% of 5 requests (effective-sell)"
+            "100.000% of 5 requests (effective-sell; 2 ties decided by arrival order); "
+            "stream replay 3 of 3"
+        )
+        assert rows["  order↔competition link"][0] == (
+            "quote-id: 5 of 8 (62.5%), 1 via the backend's re-quote, 2 through a stream "
+            "(1 before it finished); 2 placed from a non-winning estimate; 1 stored quote "
+            "not reproduced"
         )
         assert rows["Δprotocol fee from the quote recharge"][0].startswith(
             "+0.0000 ETH to the DAO, 0.0000 ETH to partners — not added to the fee rows"

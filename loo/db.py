@@ -52,6 +52,14 @@ def database_name(network: str) -> str:
         raise KeyError(f"unknown network {network!r}; known networks: {known}") from None
 
 
+def raw_schema(network: str) -> str:
+    """The schema holding the backend's own tables, mirrored unmodelled, for a network:
+    `raw_prod_<network>` with `-` as `_` (`raw_prod_arbitrum_one`). Read only where a
+    staging model lags its source — `order_quotes.quote_id` is the case (docs/quotes.md)."""
+    database_name(network)  # refuse an unknown network by the same message
+    return "raw_prod_" + network.replace("-", "_")
+
+
 def connect(network: str = "mainnet", *, connect_timeout: int = 20) -> Connection:
     """Open a read-only connection to one network's analytics database."""
     load_dotenv()

@@ -12,57 +12,80 @@ resulting counterfactual quote to the fee path that already exists (`fees.py`).
 `services/crates/price-estimation/src/competition/quote.rs`:
 
 ```
-is_reasonable          (:191)  drop any estimate with gas == 0 or out_amount == 0
-compare_quote_result   (:203)  a verified estimate beats an unverified one at any amount
-compare_quote          (:226)  otherwise rank on effective_eth_out
-effective_eth_out      (:276)  out_amount × native_price(out_token) ∓ gas × gas_price
-                               sell: minus fees, maximise;  buy: plus fees, minimise
+is_reasonable          drop any estimate with gas == 0 or out_amount == 0
+compare_quote_result   a verified estimate beats an unverified one at any amount
+compare_quote          otherwise rank on the effective out amount:
+effective_out_amount   gas cost in the sell token = gas × gas_price / native(sell)
+                       sell: out − cost × out/in, maximise;  buy: out + cost, minimise
+                       clamped at zero, truncated to an integer
+results.sort_by        stable, over the answers in arrival order — a tie goes first-come
 ```
 
-Two facts make that reproducible from recorded data, and both are measured
-(docs/quotes.md):
+That is the rule since services#4846 (merged 2026-09-02); before it, `effective_eth_out`
+valued the out amount at the *out* token's native price and netted gas in wei. Three facts
+make it reproducible from recorded data, all measured (docs/quotes.md):
 
 1. The **verified class is a hard first key.** Over 5,041 requests carrying both
    verified and unverified estimates, a verified one won all 5,041.
-2. Neither `native_price` nor `gas_price` is in ClickHouse, but they enter only through
-   a ratio that is *common to every estimator of one request*. Netting the gas cost in
-   the **sell** token instead — at `order_quotes.gas_price / sell_token_price`, both
-   recorded per order — reproduces the recorded winner on **99.6%** of mainnet and
-   **100.0%** of bnb order-creating requests. Ranking on the gross `out_amount` alone
-   reproduces 61.5% / 90.2%.
+2. `gas_price` and `native(sell)` are the order's own `order_quotes.gas_price` and
+   `sell_token_price`, so the rule needs nothing that is not recorded per order. Even
+   before #4846 they entered only through a ratio common to every estimator of one
+   request, and the sell-token netting reproduced the recorded winner on **99.6%** of
+   mainnet and **100.0%** of bnb order-creating requests (2026-08-10..16); the gross
+   `out_amount` alone reproduces 61.5% / 90.2%.
+3. **Arrival order is recorded** — `nats_seq` on the raw layer — so the clamp and the
+   truncation, which make ties common on dust requests, are reproducible too.
 
 So there are two ranking rules, and `RANKING` names them:
 
-- `effective-sell` (default) — the effective quote netted in the sell token. Needs
-  nothing that is not recorded on the order, and is the same quantity the
-  price-improvement fee is charged against, so pick and fee cannot disagree.
-- `autopilot` — the protocol's own out-token rule, which needs the *buy* token's native
-  price for sell orders. Kept as the cross-check: it measures how far the two differ,
-  which is exactly the quote's own pricing error, since `in × sell_price ≈ out ×
+- `effective-sell` (default) — the effective quote netted in the sell token. The
+  protocol's own rule since #4846, and the same quantity the price-improvement fee is
+  charged against, so pick and fee cannot disagree.
+- `autopilot` — the out-token rule from before #4846, which needs the *buy* token's
+  native price for sell orders. Kept as the cross-check: it measures how far the two
+  differ, which is exactly the quote's own pricing error, since `in × sell_price ≈ out ×
   buy_price` is what a quote asserts. For a **buy** order the out token *is* the sell
-  token, so the two rules are identical there by construction.
+  token, so the two rules differ there only in the unit they truncate in.
+
+## Linking an order to its competition
+
+Two ways, chosen per order by when it was created (`QUOTE_ID_LINK_START`):
+
+- **By quote id** (`link_by_quote_id`), from 2026-09-29 17:16 UTC: the order records the
+  id of the quote it was placed with, every estimate records its own id and its
+  estimator's settlement address, so the link is a join and the estimator map is read
+  rather than derived.
+- **By the heuristic** (`match_orders`) before that: tokens, kind, amount and time, with
+  the winning estimate's amount as corroboration.
+
+An order whose recorded quote solver is the zero address had no competition at all — a
+wrapped-to-native unwrap, answered identically by every estimator — and is linked by
+neither (`RecordedQuote.trivial`).
 
 ## What is exact and what is not
 
-Amounts in `gold_quotes` are `Float64`, so nothing derived from the ladder is
-integer-exact — see `ch.as_float`. The recorded quote, its fee and every solve-side
-number stay exact, because they come from Postgres: the ladder supplies only the
-*counterfactual*, never the baseline (Q-D5). A match failure therefore degrades the
-counterfactual and can be counted; it can never corrupt a recorded number.
+Amounts in `gold_quotes` are `Float64`, so nothing derived from a gold ladder is
+integer-exact — see `ch.as_float`. The raw layer stores them as exact decimal strings, and
+the quote-id link reads only the raw layer, so its ladders are exact ints. Either way the
+recorded quote, its fee and every solve-side number stay exact, because they come from
+Postgres: the ladder supplies only the *counterfactual*, never the baseline (Q-D5). A link
+failure therefore degrades the counterfactual and can be counted; it can never corrupt a
+recorded number.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import TYPE_CHECKING, Literal
 
 from . import ch
-from .db import Connection, as_int, chunked, fetch
+from .db import Connection, as_int, chunked, fetch, raw_schema
 from .extract import fetch_prices, unpriced_auctions
 from .fees import FeeError, Quote, quote_fee
-from .primitives import ONE_ETH
+from .primitives import ONE_ETH, as_erc20, price_in_eth, wrapped_native_token
 
 if TYPE_CHECKING:  # only `shifted_limit` needs the type; `valuation` imports `fees` too
     from .valuation import Order
@@ -72,25 +95,54 @@ QuoteRanking = Literal["effective-sell", "autopilot"]
 RANKING: dict[QuoteRanking, str] = {
     "effective-sell": (
         "the effective quote netted in the sell token, at the order's recorded "
-        "gas_price / sell_token_price — the same quantity the price-improvement fee is "
-        "charged against, and reproducible from the record alone"
+        "gas_price / sell_token_price, truncated to whole atoms — the protocol's own rule "
+        "since services#4846 (merged 2026-09-02), the same quantity the price-improvement "
+        "fee is charged against, and reproducible from the record alone"
     ),
     "autopilot": (
-        "the protocol's own rule (competition/quote.rs:276): out_amount valued in the "
-        "out token's native price less gas x gas_price, with the buy token's native "
-        "price taken from the window's auction prices for sell orders"
+        "the protocol's rule before services#4846: out_amount valued in wei at the out "
+        "token's native price less gas x gas_price, with the buy token's native price "
+        "taken from the window's auction prices for sell orders"
     ),
 }
 
 PRICE_IMBALANCE_THRESHOLD = 2.0
-"""D14 on the quote side. Two independent feeds price the order's sell token: the api's,
-recorded per order as `order_quotes.sell_token_price` (wei per atom), and the autopilot's,
-in the auction's own price vector (the same quantity scaled by 1e18). They agree to four
-decimals on real tokens — measured 1.0000 for WETH, 0.9999 for USDC, 1.0004 for USDT — and
-disagree by factors of 1e7 to 1e18 where one of them is broken. An order past this
-threshold is excluded from every quote figure and counted, because the same wrong price
-sets both its weight and its gas cost: one such order carried 6.9 M ETH of apparent
-executed volume, 90% of a corrected window."""
+"""D14 on the quote side, applied by two checks that catch different breakages.
+
+**One-sided** (`price_suspect_orders`): two independent feeds price the order's sell
+token — the api's, recorded per order as `order_quotes.sell_token_price` (wei per atom),
+and the autopilot's, in the auction's own price vector (the same quantity scaled by
+1e18). They agree to four decimals on real tokens — measured 1.0000 for WETH, 0.9999 for
+USDC, 1.0004 for USDT — and disagree by factors of 1e7 to 1e18 where one of them is
+broken. The same wrong price sets both the order's weight and its gas cost: one such
+order carried 6.9 M ETH of apparent executed volume, 90% of a corrected window.
+
+**Two-sided** (`imbalanced_orders`): when both feeds carry the *same* wrong price the
+first check passes, so the order's sold value is also compared with its bought value,
+trade by trade at the prices of the auction each trade settled in — the solve side's
+`counterfactual.price_imbalanced`, per order. On bnb 2026-10-05..12, 26 orders priced
+that way passed the one-sided check and carried 28.68 M of the 28.70 M BNB of executed
+volume it let through (the solve side's whole week was 16,988 BNB).
+
+An order failing either is excluded from every quote figure and counted."""
+
+QUOTE_ID_LINK_START = "2026-09-29 17:20:00"
+"""Orders created from here on are linked to their competition by quote id
+(`link_by_quote_id`); earlier ones by the heuristic (`match_orders`). Per-estimate ids
+(`raw_quotes.price_estimates.quote_id`, services#4925/#4966) appear on **every chain at
+2026-09-29 17:16 UTC** — one deploy; measured from `winning_price_estimates`, none before
+and ≥ 99.8% of winners from 2026-09-30. The four minutes on top cover an order placed
+from a quote computed just before the deploy: on bnb 2026-10-08 the linked estimate
+preceded its order by 2.3 s at the median and 119 s at most. `order_quotes.quote_id`
+itself is populated from 2026-09-22."""
+
+TRIVIAL_QUOTE_SOLVER = "00" * 20
+"""`order_quotes.solver` of an order whose quote no competition decided: every one seen
+is a wrapped-native-to-native unwrap (WETH→ETH, WBNB→BNB) — 10 on mainnet 2026-07-25, 29
+on 2026-10-08, 22 on bnb that day, no other pair. Every estimator answers such a request
+identically and arrival order picks the winner, so it is excluded from both links: under
+the heuristic it was matched, its first answerer counted as a quote win, and the
+estimator map could learn the zero address for an estimator that answered first often."""
 
 BUY_AMOUNT_TOLERANCE = 0.005
 """A buy order's quoted amount carries a slippage buffer, so the request it came from
@@ -130,6 +182,7 @@ class Pricing:
     are exact for every order-creating request. `buy_token_price` is only consulted by
     the `autopilot` rule on sell orders and is `None` when the window's auctions never
     priced that token — in which case the request is reported unpriced, not guessed.
+    All three are wei per atom; the auction feed's 1e18 scaling is divided out first.
     """
 
     gas_price: float
@@ -160,10 +213,14 @@ class QuoteRequest:
     carrier of the field — is what is missing; those ladders run 7–10 estimators deep,
     which a fast (early-return) ladder never does."""
     source: Literal["gold", "raw"] = "gold"
-    """`gold` for `gold_quotes.fct_quote_requests`; `raw` for a competition the gold
-    tables do not hold, reconstructed from `raw_quotes.price_estimates` grouped by
-    request id (see `load_raw_candidates`)."""
+    """`gold` for `gold_quotes.fct_quote_requests`; `raw` for a competition read from
+    `raw_quotes.price_estimates` grouped by request id — one the gold tables do not hold
+    (`load_raw_candidates`), or any competition the quote-id link reached."""
     estimates: tuple[Estimate, ...] = ()
+    """In **arrival order** — `nats_seq` on the raw layer, `estimate_timestamp` (to the
+    millisecond) on the gold one. Prod breaks an exact tie by arrival (a stable sort over
+    the answers in completion order, `quote.rs:80`) and `pick` keeps the first of equal
+    keys, so the order here is what makes a tie reproducible."""
 
     @property
     def is_sell(self) -> bool:
@@ -206,22 +263,45 @@ def rank_key(
 ) -> float:
     """The comparison key, oriented so that **larger is better** under both order kinds
     and both rules — a buy order's cost is negated rather than compared backwards, so
-    every caller can use plain `max`."""
+    every caller can use plain `max`.
+
+    Each rule is prod's arithmetic, in prod's order of operations, down to its two
+    discontinuities, because both decide winners in practice:
+
+    - **The clamp.** A sell quote whose gas exceeds its value is worth zero, so every
+      underwater estimate ties and arrival order decides. On bnb 2026-10-05..12 the
+      unclamped key named another winner on dust requests — 0.006 USDT against ~330 k
+      gas — where prod had taken the first answer.
+    - **The truncation.** The value is truncated to an integer before comparing
+      (`U256::saturating_from(v.trunc())`) — atoms of the out token under
+      `effective-sell`, wei under `autopilot`. On an out amount of 35 atoms, 32.79 and
+      32.24 are both 32, so again arrival order decides: six bnb requests that week, all
+      of them reproduced once the key truncates.
+
+    The counterfactual is unaffected by either: a replacement under water lands in the
+    `nonpositive` leaf whichever underwater estimate it is, and a tie is between
+    estimates prod itself could not tell apart."""
     if ranking == "effective-sell":
-        value = effective_sell_amount(
-            estimate, is_sell=is_sell, in_amount=in_amount, pricing=pricing
-        )
-        return value if is_sell else -value
+        # `RankingContext::effective_out_amount` (services#4846, merged 2026-09-02).
+        cost = pricing.gas_cost_in_sell_atoms(estimate.gas)
+        if is_sell:
+            value = estimate.out_amount - cost * (estimate.out_amount / in_amount)
+            return float(math.trunc(value)) if value > 0 else 0.0
+        return -float(math.trunc(estimate.out_amount + cost))
     if ranking == "autopilot":
-        # out_amount x native(out) ∓ gas x gas_price, divided by native(out): the
-        # division is common to the request, so it does not move the ordering.
+        # `effective_eth_out` before services#4846: the out amount valued in wei at the
+        # out token's native price, gas at the gas price, truncated in wei.
         price = pricing.sell_token_price if not is_sell else pricing.buy_token_price
         if not price:
             raise UnpricedRequestError(
                 "the autopilot ranking needs the out token's native price"
             )
-        cost = estimate.gas * pricing.gas_price / price
-        return estimate.out_amount - cost if is_sell else -(estimate.out_amount + cost)
+        out_wei = estimate.out_amount * price
+        gas_wei = estimate.gas * pricing.gas_price
+        if is_sell:
+            value = out_wei - gas_wei
+            return float(math.trunc(value)) if value > 0 else 0.0
+        return -float(math.trunc(out_wei + gas_wei))
     raise ValueError(f"unknown quote ranking {ranking!r}")
 
 
@@ -241,8 +321,9 @@ def pick(
 
     Verified beats unverified at any amount (`QuoteVerificationMode::Prefer`, which the
     data confirms is what prod runs), then the ranking key decides. Ties keep the first
-    estimate in the given order, which is the order `fct_quote_estimates` returned —
-    arbitrary, and the reason `Ranking.tied` exists to count them.
+    estimate in the given order — arrival order for a loaded ladder
+    (`QuoteRequest.estimates`), which is prod's own tie-break; `PickValidation.tied`
+    counts the requests where it mattered.
     """
     usable = [e for e in estimates if e.reasonable]
     if not usable:
@@ -278,6 +359,117 @@ def leave_one_out(
     )
 
 
+def replay_stream(
+    estimates: Sequence[Estimate],
+    *,
+    is_sell: bool,
+    in_amount: float,
+    pricing: Pricing,
+    ranking: QuoteRanking = "effective-sell",
+) -> list[str]:
+    """The estimators a stream sends to the client, in order: every reasonable answer
+    that strictly beats the best one so far, on the same verified-first key as `pick`
+    (`estimate_stream`, `beats_best = compare_quote_result(…).is_gt()`) — less the ones
+    the quoter then drops because their gas cost does not fit the sell amount
+    (`SellAmountDoesNotCoverFee` in `OrderQuoter::calculate_quote_stream`). A dropped
+    answer still sets the bar the next one must beat, though nobody saw it. `estimates`
+    must be in arrival order."""
+    forwarded: list[str] = []
+    best: tuple[bool, float] | None = None
+    for estimate in estimates:
+        if not estimate.reasonable:
+            continue
+        key = (
+            estimate.verified,
+            rank_key(
+                estimate, is_sell=is_sell, in_amount=in_amount, pricing=pricing,
+                ranking=ranking,
+            ),
+        )
+        if best is None or key > best:
+            best = key
+            if _sendable(estimate, is_sell=is_sell, in_amount=in_amount, pricing=pricing):
+                forwarded.append(estimate.estimator)
+    return forwarded
+
+
+def _sendable(
+    estimate: Estimate, *, is_sell: bool, in_amount: float, pricing: Pricing
+) -> bool:
+    """Whether the quoter turns a forwarded answer into a quote at all. On bnb
+    2026-10-05..12 the record lacked a forwarded answer in 15 of 11,523 streams, and in
+    every one its gas cost was 1.02–1.70x the sell amount. Only sell orders are checked:
+    no buy-order case has been seen."""
+    return not is_sell or pricing.gas_cost_in_sell_atoms(estimate.gas) < in_amount
+
+
+class UnrecordedStreamError(RuntimeError):
+    """The stream was dropped before the answer the user would have taken arrived."""
+
+
+def stream_replacement(
+    request: QuoteRequest,
+    take: StreamTake,
+    removed: frozenset[str],
+    *,
+    pricing: Pricing,
+    ranking: QuoteRanking = "effective-sell",
+) -> tuple[Estimate | None, bool]:
+    """What the user of a streamed order would have committed to with `removed` absent,
+    given that the answer they took is among them.
+
+    The best remaining answer that had arrived by the commit (`take.horizon`). If none
+    had, the user waits for the stream's next remaining answer and takes that: in a
+    finished stream it is in the ladder; in a dropped one it was cancelled unrecorded,
+    which raises `UnrecordedStreamError`. `None` means the stream never had another
+    usable answer, so no quote at all.
+
+    Also returns whether the commit time mattered: whether a commit the moment the
+    taken answer was forwarded — the earliest the record allows — would have shown a
+    different estimator. A count for the reader, not a second scenario.
+    """
+    remaining = [e for e in request.estimates if e.estimator not in removed]
+
+    def best(upto: int) -> Estimate | None:
+        arrived = [
+            e for e in request.estimates[:upto] if e.estimator not in removed
+        ]
+        return pick(
+            arrived, is_sell=request.is_sell, in_amount=request.in_amount,
+            pricing=pricing, ranking=ranking,
+        )
+
+    def waited(after: int) -> Estimate | None:
+        later = [
+            e for e in request.estimates[after:]
+            if e.estimator not in removed
+            and e.reasonable
+            and _sendable(
+                e, is_sell=request.is_sell, in_amount=request.in_amount, pricing=pricing
+            )
+        ]
+        if not later:
+            if not take.complete:
+                raise UnrecordedStreamError(
+                    "the stream was dropped before another answer arrived"
+                )
+            return None
+        # The first remaining answer to arrive is what the stream would have sent.
+        return later[0]
+
+    if not any(e.reasonable for e in remaining):
+        if not take.complete:
+            raise UnrecordedStreamError("no other answer was recorded")
+        return None, False
+    late = best(take.horizon) or waited(take.horizon)
+    try:
+        early = best(take.position + 1) or waited(take.position + 1)
+    except UnrecordedStreamError:
+        early = None
+    moved = (late.estimator if late else None) != (early.estimator if early else None)
+    return late, moved
+
+
 def counterfactual_quote(
     estimate: Estimate, *, is_sell: bool, in_amount: float, pricing: Pricing
 ) -> Quote:
@@ -306,6 +498,10 @@ def counterfactual_quote(
 
 # --- the recorded orders and their quotes -------------------------------------------
 
+# `quote_id` is read from the backend's own `order_quotes` mirror, not the staging model:
+# `stg_backend_data__order_quotes` is incremental with `append_new_columns`, so its
+# `quote_id` is NULL on every row built before the column was added (~2026-10-06), while
+# the raw table has it from 2026-09-22.
 ORDERS_SQL = """
 with traded as (
     select t.order_uid, sum(t.sell_amount) as executed_sell
@@ -331,9 +527,11 @@ select
     oq.sell_token_price,
     oq.verified                         as quote_verified,
     coalesce(ad.app_code, '(none)')     as app_code,
-    coalesce(t.executed_sell, 0)        as executed_sell
+    coalesce(t.executed_sell, 0)        as executed_sell,
+    rq.quote_id
 from dbt.stg_backend_data__orders o
 join dbt.stg_backend_data__order_quotes oq on oq.order_uid = o.uid
+left join {raw_schema}.order_quotes rq on rq.order_uid = o.uid
 left join dbt.stg_backend_data__app_data ad on ad.contract_app_data = o.app_data
 left join traded t on t.order_uid = o.uid
 where o.creation_timestamp >= %(start)s and o.creation_timestamp < %(end)s
@@ -381,10 +579,30 @@ class RecordedQuote:
     executed_sell: int = 0
     """Sell-side atoms this order actually traded, summed over its trades — 0 for an
     order that never traded."""
+    quote_id: int | None = None
+    """The id of the quote the order was placed with, as the backend's `order_quotes`
+    records it — the key of the quote-id link. `None` before 2026-09-22 and `0` on an
+    ethflow order placed without one; both mean there is nothing to join on."""
 
     @property
     def is_sell(self) -> bool:
         return self.kind == "sell"
+
+    @property
+    def trivial(self) -> bool:
+        """No competition decided this quote (`TRIVIAL_QUOTE_SOLVER`)."""
+        return self.quote_solver == TRIVIAL_QUOTE_SOLVER
+
+    @property
+    def in_atoms(self) -> int:
+        """`in_amount` as the exact integer the order stores — the request's key."""
+        return self.quote.sell_amount if self.is_sell else self.quote.buy_amount
+
+    @property
+    def out_atoms(self) -> int:
+        """`out_amount` as the exact integer the order stores — what the winning estimate
+        of the order's competition must equal to the atom."""
+        return self.quote.buy_amount if self.is_sell else self.quote.sell_amount
 
     @property
     def in_amount(self) -> float:
@@ -422,9 +640,9 @@ class RecordedQuote:
 
 
 def load_recorded_quotes(
-    conn: Connection, start: str, end: str
+    conn: Connection, start: str, end: str, *, network: str
 ) -> tuple[list[RecordedQuote], int]:
-    """Orders created in `[start, end)` that carry a recorded quote.
+    """Orders created in `[start, end)` on `network` that carry a recorded quote.
 
     Returns the orders and the number of rows dropped because their quote could not be
     evaluated — a zero `sell_token_price` makes the gas cost undefined, and an order
@@ -432,7 +650,8 @@ def load_recorded_quotes(
     """
     orders: list[RecordedQuote] = []
     dropped = 0
-    for row in fetch(conn, ORDERS_SQL, {"start": start, "end": end}):
+    sql = ORDERS_SQL.format(raw_schema=raw_schema(network))
+    for row in fetch(conn, sql, {"start": start, "end": end}):
         try:
             fee = quote_fee(row["gas_amount"], row["gas_price"], row["sell_token_price"])
         except FeeError:
@@ -464,6 +683,7 @@ def load_recorded_quotes(
                     sell_token_price=float(row["sell_token_price"]),
                 ),
                 verified=bool(row["quote_verified"]),
+                quote_id=row["quote_id"],
             )
         )
     return orders, dropped
@@ -722,6 +942,12 @@ def _raw_request(row: ch.Row) -> QuoteRequest:
     )
 
 
+Arrival = tuple[int, str]
+"""When an estimate arrived, as a sort key: `(nats_seq, "")` on the raw layer, `(0,
+estimate_timestamp)` on the gold one. One request's ladder comes from one layer, so the
+two shapes are never compared with each other."""
+
+
 def load_ladders(
     client: ch.Client,
     network: str,
@@ -740,6 +966,9 @@ def load_ladders(
     merge collapses it, so a ladder is deduplicated on `(request_id, estimator)`: a
     duplicated winner row would otherwise make `recorded_winner` read as ambiguous and
     silently demote a corroborated match to heuristic.
+
+    Each ladder comes back in arrival order (`QuoteRequest.estimates`): `nats_seq` on the
+    raw layer, `estimate_timestamp` on the gold one.
     """
     from datetime import date, timedelta
 
@@ -748,8 +977,12 @@ def load_ladders(
         by_day.setdefault((request.source, request.timestamp[:10]), []).append(
             request.request_id
         )
-    rows: dict[tuple[str, str], Estimate] = {}
+    rows: dict[tuple[str, str], tuple[Arrival, Estimate]] = {}
     raw_winners: set[tuple[str, str]] = set()
+
+    def keep(request_id: str, arrival: Arrival, estimate: Estimate) -> None:
+        _keep_earliest(rows, request_id, arrival, estimate)
+
     for (source, day) in sorted(by_day):
         after = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
         first, last = _time_bounds(day, after)
@@ -759,17 +992,22 @@ def load_ladders(
             if source == "gold":
                 sql = (
                     f"select request_id, estimator, out_amount, gas, estimate_verified, "
-                    f"is_winner from {ch.DATABASE}.fct_quote_estimates "
+                    f"is_winner, toString(estimate_timestamp) as arrived "
+                    f"from {ch.DATABASE}.fct_quote_estimates "
                     f"where chain_id = {ch.chain_id(network)} and environment = 'prod' "
                     f"and {window} and request_id in ({ids})"
                 )
                 for row in client.fetch(sql):
-                    rows[(row["request_id"], row["estimator"])] = Estimate(
-                        estimator=row["estimator"],
-                        out_amount=ch.as_float(row["out_amount"]),
-                        gas=ch.as_float(row["gas"]),
-                        verified=bool(row["estimate_verified"]),
-                        is_winner=bool(row["is_winner"]),
+                    keep(
+                        row["request_id"],
+                        (0, str(row.get("arrived") or "")),
+                        Estimate(
+                            estimator=row["estimator"],
+                            out_amount=ch.as_float(row["out_amount"]),
+                            gas=ch.as_float(row["gas"]),
+                            verified=bool(row["estimate_verified"]),
+                            is_winner=bool(row["is_winner"]),
+                        ),
                     )
                 continue
             # The raw layer keeps the winner in its own event stream, so two queries:
@@ -782,24 +1020,50 @@ def load_ladders(
             ):
                 raw_winners.add((row["request_id"], row["estimator"]))
             sql = (
-                f"select request_id, estimator, out_amount, gas, verified "
+                f"select request_id, estimator, out_amount, gas, verified, nats_seq "
                 f"from {ch.RAW_DATABASE}.price_estimates "
                 f"where chain_id = {ch.chain_id(network)} and success "
                 f"and request_id is not null and {window} and request_id in ({ids})"
             )
             for row in client.fetch(sql):
-                key = (row["request_id"], row["estimator"])
-                rows[key] = Estimate(
-                    estimator=row["estimator"],
-                    out_amount=ch.as_float(row["out_amount"]),
-                    gas=ch.as_float(row["gas"]),
-                    verified=bool(row["verified"]),
-                    is_winner=key in raw_winners,
+                keep(
+                    row["request_id"],
+                    (int(row.get("nats_seq") or 0), ""),
+                    Estimate(
+                        estimator=row["estimator"],
+                        out_amount=ch.as_float(row["out_amount"]),
+                        gas=ch.as_float(row["gas"]),
+                        verified=bool(row["verified"]),
+                        is_winner=(row["request_id"], row["estimator"]) in raw_winners,
+                    ),
                 )
-    ladders: dict[str, list[Estimate]] = {}
-    for (request_id, _), estimate in rows.items():
-        ladders.setdefault(request_id, []).append(estimate)
-    return {rid: tuple(items) for rid, items in ladders.items()}
+    return _ladders(rows)
+
+
+def _keep_earliest(
+    rows: dict[tuple[str, str], tuple[Arrival, Estimate]],
+    request_id: str,
+    arrival: Arrival,
+    estimate: Estimate,
+) -> None:
+    """One estimate per `(request_id, estimator)` — a `ReplacingMergeTree` can hold a row
+    twice until it merges — keeping the earliest arrival."""
+    key = (request_id, estimate.estimator)
+    if key not in rows or arrival < rows[key][0]:
+        rows[key] = (arrival, estimate)
+
+
+def _ladders(
+    rows: Mapping[tuple[str, str], tuple[Arrival, Estimate]],
+) -> dict[str, tuple[Estimate, ...]]:
+    """Group deduplicated estimates into ladders, each in arrival order."""
+    ladders: dict[str, list[tuple[Arrival, Estimate]]] = {}
+    for (request_id, _), entry in rows.items():
+        ladders.setdefault(request_id, []).append(entry)
+    return {
+        rid: tuple(e for _, e in sorted(items, key=lambda item: item[0]))
+        for rid, items in ladders.items()
+    }
 
 
 def with_ladder(request: QuoteRequest, estimates: tuple[Estimate, ...]) -> QuoteRequest:
@@ -830,6 +1094,37 @@ class MatchedQuote:
     stored on the order to the last float bit — an identity the matcher never used, true
     of 78% of matches. `heuristic` is tokens/kind/amount/time only, which is mostly an
     order created from a later re-quote."""
+    stream: StreamTake | None = None
+    """Set when the order was placed from a streamed quote (`StreamTake`); the
+    counterfactual then follows what the stream would have shown, not the full ladder."""
+
+
+@dataclass(frozen=True)
+class StreamTake:
+    """Which answer of a streamed competition an order took, and what had arrived by the
+    time its user committed.
+
+    `/api/v1/quote/stream` forwards every answer that beats the best one sent so far and,
+    since services#4957, records each forwarded answer as a `quote_computed` row and the
+    final best as the winner. The user commits to whichever forwarded answer is on screen;
+    the order carries its quote id. The commit itself is not recorded, so it is placed at
+    the latest moment the record allows: just before the next forwarded answer arrived,
+    or, for the last one, before the order was created (`horizon`).
+    """
+
+    taken: str
+    """The estimator whose forwarded answer the order carries."""
+    position: int
+    """Its index in the arrival-ordered ladder."""
+    horizon: int
+    """Answers `[0, horizon)` of the ladder may have arrived before the user committed."""
+    complete: bool
+    """The stream reported a winner, so it ran to the end and every answer it received is
+    in the ladder. A stream the client dropped early has no winner, and the answers it
+    cancelled were never recorded."""
+    forwarded: tuple[str, ...] = ()
+    """The estimators of the request's `quote_computed` rows, in order — what the stream
+    forwarded, as recorded; `validate_picks` replays the stream against it."""
 
 
 def _seconds_between(later: str, earlier: str) -> float:
@@ -963,20 +1258,517 @@ def match_orders(
     return matches, estimator_map
 
 
-def price_suspect_orders(
-    orders: Sequence[RecordedQuote], auction_prices: Mapping[str, float]
-) -> frozenset[str]:
-    """Orders whose two native price feeds for the sell token disagree past
-    `PRICE_IMBALANCE_THRESHOLD`.
+# --- the quote-id link --------------------------------------------------------------
 
-    `auction_prices` is the autopilot's feed scaled by 1e18 (`primitives.price_in_eth`
-    divides by it), so the comparison divides it back down. A token the window's auctions
-    never priced cannot be tested and is left alone — the guard excludes what it can prove
-    wrong, never what it cannot check, which is D14's rule.
+QuoteLink = Literal["quote-id", "heuristic"]
+
+
+@dataclass(frozen=True)
+class LinkStats:
+    """How one link fared on the orders it was asked to place."""
+
+    link: QuoteLink
+    orders: int
+    """Non-trivial orders handed to this link — the base its rate is over."""
+    linked: int
+    corroborated: int
+    """Every quote-id link is corroborated by construction: the linked estimate must be
+    its competition's recorded winner and reproduce the stored amount to the atom, or it
+    is not a link. A heuristic match is corroborated only when the winning estimate's
+    amount happens to equal the stored one."""
+    unlinked: Mapping[str, int] = field(default_factory=dict[str, int])
+    """Why the rest were not linked, by reason, for the quote-id link. Empty for the
+    heuristic, whose misses have one reason: no candidate request in the window."""
+    requoted: int = 0
+    """Of `linked`, the orders linked to the backend's own re-quote rather than through
+    their quote id (`_link_requotes`) — ethflow orders whose stored quote was recomputed
+    when the order was indexed."""
+    streamed: int = 0
+    streamed_early: int = 0
+    """Of `linked`, the orders placed from a streamed quote (`StreamTake`), and of those
+    the ones whose answer is not the stream's recorded final best — taken before the
+    stream finished, or from a stream dropped before it reported one."""
+
+    @property
+    def rate(self) -> float | None:
+        return self.linked / self.orders if self.orders else None
+
+
+@dataclass(frozen=True)
+class IdLink:
+    matches: list[MatchedQuote]
+    estimator_map: dict[str, str]
+    """`estimator -> settlement address` as `price_estimates.solver` records it — read,
+    not derived, so it covers every estimator in the loaded ladders, including ones that
+    never won."""
+    stats: LinkStats
+
+
+ID_LADDER_COLUMNS = (
+    "request_id, estimator, solver, quote_id, kind, lower(sell_token) as sell_, "
+    "lower(buy_token) as buy_, in_amount, out_amount, gas, verified, nats_seq, "
+    "toString(event_timestamp) as ts"
+)
+
+
+def _exact(value: object) -> float:
+    """A raw-layer amount — an exact decimal string — as the `int` it is. Typed `float`
+    because an `Estimate` holds either; an int compares and rounds exactly."""
+    text = str(value)
+    try:
+        return int(text)
+    except ValueError:
+        return float(text)
+
+
+def link_by_quote_id(
+    client: ch.Client,
+    network: str,
+    orders: Sequence[RecordedQuote],
+    *,
+    chunk: int = 2000,
+    log: Callable[[str], None] | None = None,
+) -> IdLink:
+    """Link each order to its competition by the id of the quote it was placed with.
+
+    `order_quotes.quote_id` → the `raw_quotes.price_estimates` row carrying that id → its
+    `request_id` → every estimate of that request, with its winner from
+    `winning_price_estimates`. One query per creation day and chunk of ids for each of
+    the two, the ids resolved to request ids by a subquery so the ladder comes back in
+    the same round trip. The raw tables partition by month, so the day bound prunes
+    little; it is what keeps an id from matching an estimate of another day.
+
+    The amounts are exact decimal strings and are kept as ints, so the check that makes a
+    link a link is exact: the linked estimate must be its competition's recorded winner
+    and reproduce the amount stored on the order to the atom. Every order linked is
+    therefore `corroborated`. Two kinds of order fail it, and each is handled for what
+    it is:
+
+    - **An ethflow order whose stored quote was recomputed when it was indexed**, or that
+      was placed with `quote_id = 0`: the id names the UI's quote, or nothing, while the
+      stored one came from a competition the backend ran itself, with no request id. A
+      second pass finds that competition by the stored amount (`_link_requotes`).
+    - **An order placed from a streamed quote**: the id is right, but the answer it names
+      need not be the competition's recorded winner — the stream forwards every
+      improvement and records only its final best, or none if the client dropped it.
+      Such an order is linked with a `StreamTake`, read from the request's
+      `quote_computed` rows, and its counterfactual follows the stream
+      (`stream_replacement`).
+
+    Measured against the heuristic on mainnet 2026-10-07 and bnb 2026-10-08
+    (docs/quotes.md): it puts 5.7% / 4.8% of *corroborated* heuristic matches on a
+    different competition, a later UI poll that returned the same winning amount.
     """
+    from datetime import date, timedelta
+
+    emit: Callable[[str], None] = log or (lambda message: None)
+    chain = ch.chain_id(network)
+    with_id = [o for o in orders if o.quote_id]
+    by_day: dict[str, list[RecordedQuote]] = {}
+    for order in with_id:
+        by_day.setdefault(order.created[:10], []).append(order)
+
+    rows: dict[tuple[str, str], tuple[Arrival, Estimate]] = {}
+    fields_of: dict[str, ch.Row] = {}
+    first_seen: dict[str, str] = {}
+    by_quote_id: dict[int, tuple[str, str]] = {}
+    computed: dict[str, dict[int, int]] = {}
+    ids_of: dict[str, dict[int, str]] = {}
+    arrived_at: dict[tuple[str, str], str] = {}
+    winners: dict[str, set[str]] = {}
+    addresses: dict[str, dict[str, int]] = {}
+    for day in sorted(by_day):
+        after = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+        first, last = _time_bounds(day, after)
+        window = f"event_timestamp >= '{first}' and event_timestamp < '{last}'"
+        ids_of_day = sorted({o.quote_id for o in by_day[day] if o.quote_id})
+        for part in chunked(ids_of_day, chunk):
+            ids = ", ".join(str(int(quote_id)) for quote_id in part)
+            linked = (
+                f"select request_id from {ch.RAW_DATABASE}.price_estimates "
+                f"where chain_id = {chain} and {window} and quote_id in ({ids})"
+            )
+            for row in client.fetch(
+                f"select request_id, estimator from "
+                f"{ch.RAW_DATABASE}.winning_price_estimates "
+                f"where chain_id = {chain} and {window} and request_id in ({linked})"
+            ):
+                winners.setdefault(row["request_id"], set()).add(row["estimator"])
+            # What a stream forwarded: one `quote_computed` row per forwarded answer,
+            # where a one-shot request has a single one (services#4957).
+            for row in client.fetch(
+                f"select request_id, quote_id, nats_seq from "
+                f"{ch.RAW_DATABASE}.quote_computed "
+                f"where chain_id = {chain} and {window} and request_id in ({linked}) "
+                f"and quote_id is not null"
+            ):
+                computed.setdefault(row["request_id"], {})[int(row["quote_id"])] = int(
+                    row["nats_seq"]
+                )
+            for row in client.fetch(
+                f"select {ID_LADDER_COLUMNS} from {ch.RAW_DATABASE}.price_estimates "
+                f"where chain_id = {chain} and success and {window} "
+                f"and request_id in ({linked})"
+            ):
+                request_id: str = row["request_id"]
+                estimator: str = row["estimator"]
+                arrived_at.setdefault((request_id, estimator), str(row["ts"]))
+                if row["quote_id"] is not None:
+                    by_quote_id[int(row["quote_id"])] = (request_id, estimator)
+                    ids_of.setdefault(request_id, {})[int(row["quote_id"])] = estimator
+                if row["solver"]:
+                    address = str(row["solver"]).lower().removeprefix("0x")
+                    seen = addresses.setdefault(estimator, {})
+                    seen[address] = seen.get(address, 0) + 1
+                fields_of.setdefault(request_id, row)
+                stamp = str(row["ts"])
+                if request_id not in first_seen or stamp < first_seen[request_id]:
+                    first_seen[request_id] = stamp
+                _keep_earliest(
+                    rows,
+                    request_id,
+                    (int(row["nats_seq"]), ""),
+                    Estimate(
+                        estimator=estimator,
+                        out_amount=_exact(row["out_amount"]),
+                        gas=_exact(row["gas"]),
+                        verified=bool(row["verified"]),
+                        is_winner=estimator in winners.get(request_id, ()),
+                    ),
+                )
+
+    requests: dict[str, QuoteRequest] = {}
+    for request_id, ladder in _ladders(rows).items():
+        row = fields_of[request_id]
+        named = winners.get(request_id, set())
+        requests[request_id] = QuoteRequest(
+            request_id=request_id,
+            timestamp=first_seen[request_id],
+            kind=row["kind"],
+            sell_token=str(row["sell_"]).removeprefix("0x"),
+            buy_token=str(row["buy_"]).removeprefix("0x"),
+            in_amount=_exact(row["in_amount"]),
+            winner=next(iter(named)) if len(named) == 1 else "",
+            price_quality="unknown",
+            source="raw",
+            estimates=ladder,
+        )
+
+    matches: list[MatchedQuote] = []
+    unlinked = {
+        "no quote id": 0,
+        "id not in the competition record": 0,
+        "not a forwarded answer of its stream": 0,
+        "stored quote not reproduced": 0,
+    }
+    # Orders the id cannot place but a re-quote might have priced, with the reason that
+    # stands if none did.
+    requote_candidates: list[tuple[RecordedQuote, str]] = [
+        (o, "no quote id") for o in orders if not o.quote_id
+    ]
+    for order in with_id:
+        found = by_quote_id.get(order.quote_id or 0)
+        request = requests.get(found[0]) if found else None
+        estimate = (
+            next((e for e in request.estimates if e.estimator == found[1]), None)
+            if found and request
+            else None
+        )
+        if found is None or request is None or estimate is None:
+            requote_candidates.append((order, "id not in the competition record"))
+            continue
+        if estimate.out_amount != order.out_atoms:
+            requote_candidates.append((order, "stored quote not reproduced"))
+            continue
+        estimator_of = ids_of.get(request.request_id, {})
+        forwarded = tuple(
+            estimator_of[qid]
+            for qid, _ in sorted(
+                computed.get(request.request_id, {}).items(), key=lambda item: item[1]
+            )
+            if qid in estimator_of
+        )
+        streamed = len(forwarded) >= 2 or request.winner != found[1]
+        if not streamed:
+            matches.append(MatchedQuote(order=order, request=request, tier="corroborated"))
+            continue
+        if forwarded and found[1] not in forwarded:
+            unlinked["not a forwarded answer of its stream"] += 1
+            continue
+        matches.append(
+            MatchedQuote(
+                order=order,
+                request=request,
+                tier="corroborated",
+                stream=_stream_take(order, request, found[1], forwarded, arrived_at),
+            )
+        )
+
+    streamed = [m for m in matches if m.stream is not None]
+    streamed_early = sum(
+        1 for m in streamed if m.stream and m.stream.taken != m.request.winner
+    )
+    requoted, requote_addresses = _link_requotes(
+        client, chain, [o for o, _ in requote_candidates]
+    )
+    matches.extend(requoted)
+    placed = {m.order.order_uid for m in requoted}
+    for order, why in requote_candidates:
+        if order.order_uid not in placed:
+            unlinked[why] += 1
+    for estimator, seen in requote_addresses.items():
+        mine = addresses.setdefault(estimator, {})
+        for address, n in seen.items():
+            mine[address] = mine.get(address, 0) + n
+
+    estimator_map = {
+        estimator: max(seen.items(), key=lambda item: item[1])[0]
+        for estimator, seen in addresses.items()
+    }
+    ambiguous = sorted(e for e, seen in addresses.items() if len(seen) > 1)
+    agree = sum(
+        1
+        for m in matches
+        if estimator_map.get(m.stream.taken if m.stream else m.request.winner)
+        == m.order.quote_solver
+    )
+    emit(
+        f"quote-id link: {len(matches)} of {len(orders)} orders linked, {len(requoted)} of "
+        f"them to the backend's re-quote at indexing, {len(streamed)} through a stream "
+        f"({streamed_early} of those before it finished) "
+        f"({', '.join(f'{n} {why}' for why, n in unlinked.items() if n) or 'none missed'}); "
+        f"{len(requests)} competitions, {sum(len(r.estimates) for r in requests.values())} "
+        f"estimates; {len(estimator_map)} estimators carry a settlement address"
+        + (f" (several for {', '.join(ambiguous)})" if ambiguous else "")
+        + f"; the address of the answer taken is the order's quote solver on {agree} of "
+        f"{len(matches)}"
+    )
+    return IdLink(
+        matches=matches,
+        estimator_map=estimator_map,
+        stats=LinkStats(
+            link="quote-id",
+            orders=len(orders),
+            linked=len(matches),
+            corroborated=len(matches),
+            unlinked={why: n for why, n in unlinked.items() if n},
+            requoted=len(requoted),
+            streamed=len(streamed),
+            streamed_early=streamed_early,
+        ),
+    )
+
+
+def _stream_take(
+    order: RecordedQuote,
+    request: QuoteRequest,
+    taken: str,
+    forwarded: tuple[str, ...],
+    arrived_at: Mapping[tuple[str, str], str],
+) -> StreamTake:
+    """Where in its stream an order's answer sits, and how far the stream can have got
+    before the user committed: up to the next forwarded answer, which they did not take,
+    or — when theirs was the last one forwarded — up to the order's creation."""
+    order_of = [e.estimator for e in request.estimates]
+    position = order_of.index(taken)
+    later = [order_of.index(f) for f in forwarded if f in order_of]
+    after = [p for p in later if p > position]
+    if after:
+        horizon = min(after)
+    else:
+        horizon = position + 1
+        while horizon < len(order_of) and (
+            arrived_at.get((request.request_id, order_of[horizon]), "") < order.created
+        ):
+            horizon += 1
+    return StreamTake(
+        taken=taken,
+        position=position,
+        horizon=horizon,
+        complete=bool(request.winner),
+        forwarded=forwarded,
+    )
+
+
+REQUOTE_AFTER_CREATION_SECONDS = (-60, 600)
+"""Where the re-quote of an ethflow order lands relative to the order's creation (its
+block time, whole seconds): 1–3 s after it on every case seen, bounded generously."""
+REQUOTE_SIBLING_SECONDS = 5
+REQUOTE_ID_SPAN = 64
+"""A re-quote's estimates arrive within a second and carry quote ids from one block the
+orderbook drew before quoting (1608345417–437 for one 11-estimate mainnet competition), so
+siblings are request-less estimates of the same request key within both bounds of the
+estimate that priced the order."""
+
+REQUOTE_COLUMNS = (
+    "quote_id, estimator, solver, lower(sell_token) as sell_, lower(buy_token) as buy_, "
+    "kind, in_amount, out_amount, gas, verified, nats_seq, "
+    "toString(event_timestamp) as ts"
+)
+
+
+def _link_requotes(
+    client: ch.Client,
+    chain: int,
+    orders: Sequence[RecordedQuote],
+    *,
+    chunk: int = 300,
+) -> tuple[list[MatchedQuote], dict[str, dict[str, int]]]:
+    """Link orders to the competition the backend ran itself when it indexed them.
+
+    An ethflow order is placed on chain with the UI quote's id (or `0`), and the backend,
+    indexing it, re-quotes when that quote cannot be used: a full competition run
+    internally, so with **no `request_id`** — in neither gold table, invisible to
+    `link_by_quote_id`'s request join — and stored on the order while `quote_id` keeps
+    naming the UI's quote. Every ethflow order the id join missed in 2026-10-05..12 (25 on
+    four chains) had one, its winner reproducing the stored amount to the atom 1–3 s after
+    the order's block time.
+
+    So the estimate that priced the order is found by its exact amount among request-less
+    estimates of the order's request key, must be the recorded winner (the winner event
+    carries the winning estimate's quote id), and its competition is the request-less
+    estimates around it (`REQUOTE_SIBLING_SECONDS`, `REQUOTE_ID_SPAN`). Returns the
+    matches and the settlement addresses seen, for the estimator map.
+    """
+    from datetime import date, datetime, timedelta
+
+    def when(stamp: str) -> datetime:
+        return datetime.fromisoformat(stamp)
+
+    by_day: dict[str, list[RecordedQuote]] = {}
+    for order in orders:
+        if order.in_atoms > 0 and order.out_atoms > 0:
+            by_day.setdefault(order.created[:10], []).append(order)
+    matches: list[MatchedQuote] = []
+    addresses: dict[str, dict[str, int]] = {}
+    for day in sorted(by_day):
+        first = datetime.fromisoformat(day) + timedelta(seconds=REQUOTE_AFTER_CREATION_SECONDS[0])
+        last = datetime.fromisoformat(
+            (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+        ) + timedelta(seconds=REQUOTE_AFTER_CREATION_SECONDS[1])
+        window = (
+            f"event_timestamp >= '{first:%Y-%m-%d %H:%M:%S}' "
+            f"and event_timestamp < '{last:%Y-%m-%d %H:%M:%S}'"
+        )
+        for part in chunked(by_day[day], chunk):
+            keys = sorted({(o.sell_token, o.buy_token, o.kind, str(o.in_atoms)) for o in part})
+            tuples = ", ".join(
+                f"('0x{sell}', '0x{buy}', '{kind}', '{amount}')"
+                for sell, buy, kind, amount in keys
+            )
+            key_filter = (
+                f"chain_id = {chain} and request_id is null and {window} "
+                f"and (lower(sell_token), lower(buy_token), kind, in_amount) in ({tuples})"
+            )
+            winning = {
+                int(row["quote_id"])
+                for row in client.fetch(
+                    f"select quote_id from {ch.RAW_DATABASE}.winning_price_estimates "
+                    f"where {key_filter} and quote_id is not null"
+                )
+            }
+            rows = client.fetch(
+                f"select {REQUOTE_COLUMNS} from {ch.RAW_DATABASE}.price_estimates "
+                f"where success and quote_id is not null and {key_filter}"
+            )
+            by_key: dict[tuple[str, str, str, str], list[ch.Row]] = {}
+            for row in rows:
+                key = (
+                    str(row["sell_"]).removeprefix("0x"),
+                    str(row["buy_"]).removeprefix("0x"),
+                    str(row["kind"]),
+                    str(row["in_amount"]),
+                )
+                by_key.setdefault(key, []).append(row)
+            for order in part:
+                created = when(order.created)
+                same_key = by_key.get(
+                    (order.sell_token, order.buy_token, order.kind, str(order.in_atoms)), []
+                )
+                anchors = sorted(
+                    (
+                        row
+                        for row in same_key
+                        if str(row["out_amount"]) == str(order.out_atoms)
+                        and int(row["quote_id"]) in winning
+                        and REQUOTE_AFTER_CREATION_SECONDS[0]
+                        <= (when(str(row["ts"])) - created).total_seconds()
+                        <= REQUOTE_AFTER_CREATION_SECONDS[1]
+                    ),
+                    key=lambda row: abs((when(str(row["ts"])) - created).total_seconds()),
+                )
+                if not anchors:
+                    continue
+                anchor = anchors[0]
+                anchor_id, anchor_at = int(anchor["quote_id"]), when(str(anchor["ts"]))
+                siblings: dict[tuple[str, str], tuple[Arrival, Estimate]] = {}
+                for row in same_key:
+                    if (
+                        abs(int(row["quote_id"]) - anchor_id) > REQUOTE_ID_SPAN
+                        or abs((when(str(row["ts"])) - anchor_at).total_seconds())
+                        > REQUOTE_SIBLING_SECONDS
+                    ):
+                        continue
+                    _keep_earliest(
+                        siblings,
+                        str(anchor_id),
+                        (int(row["nats_seq"]), ""),
+                        Estimate(
+                            estimator=row["estimator"],
+                            out_amount=_exact(row["out_amount"]),
+                            gas=_exact(row["gas"]),
+                            verified=bool(row["verified"]),
+                            is_winner=row["estimator"] == anchor["estimator"],
+                        ),
+                    )
+                    if row["solver"]:
+                        seen = addresses.setdefault(row["estimator"], {})
+                        address = str(row["solver"]).lower().removeprefix("0x")
+                        seen[address] = seen.get(address, 0) + 1
+                ladder = _ladders(siblings).get(str(anchor_id), ())
+                request = QuoteRequest(
+                    request_id=f"requote-{anchor_id}",
+                    timestamp=str(anchor["ts"]),
+                    kind=order.kind,
+                    sell_token=order.sell_token,
+                    buy_token=order.buy_token,
+                    in_amount=order.in_atoms,
+                    winner=str(anchor["estimator"]),
+                    price_quality="unknown",
+                    source="raw",
+                    estimates=ladder,
+                )
+                matches.append(MatchedQuote(order=order, request=request, tier="corroborated"))
+    return matches, addresses
+
+
+def price_suspect_orders(
+    orders: Sequence[RecordedQuote],
+    auction_prices: Mapping[str, float],
+    traded_prices: Mapping[str, float] | None = None,
+) -> frozenset[str]:
+    """The **one-sided** check: orders whose two native price feeds for the sell token
+    disagree past `PRICE_IMBALANCE_THRESHOLD`.
+
+    The auction side is the order's own: `traded_prices[order_uid]`, the sell token's
+    price in the auctions the order traded in (`traded_sell_prices`), where it has one,
+    and the window's median `auction_prices[sell_token]` only for an order that never
+    traded. A median is wrong for a token that moved during the window: on bnb
+    2026-10-05..12 it excluded 238 orders of 0xfb4f81f5… and the like whose api price
+    matches the per-auction one at 1.00x — the volatile token's price had tripled.
+    Untraded orders weigh nothing in the bps figures, so the median only decides whether
+    they count towards `no_quote` and the pick validation.
+
+    Both feeds are scaled by 1e18 (`primitives.price_in_eth` divides by it), so the
+    comparison divides them back down. A token never priced cannot be tested and is left
+    alone — the guard excludes what it can prove wrong, never what it cannot check, which
+    is D14's rule. Blind to a token both feeds price wrong by the same factor, which is
+    what `imbalanced_orders` is for.
+    """
+    traded = traded_prices or {}
     suspect: set[str] = set()
     for order in orders:
-        auction = auction_prices.get(order.sell_token)
+        auction = traded.get(order.order_uid) or auction_prices.get(order.sell_token)
         api = order.pricing.sell_token_price
         if not auction or api <= 0:
             continue
@@ -984,6 +1776,187 @@ def price_suspect_orders(
         if ratio > PRICE_IMBALANCE_THRESHOLD or ratio < 1 / PRICE_IMBALANCE_THRESHOLD:
             suspect.add(order.order_uid)
     return frozenset(suspect)
+
+
+@dataclass(frozen=True)
+class OrderTrade:
+    """One trade of a window order, with the auction whose settlement carried it."""
+
+    order_uid: str
+    auction_id: int
+    sell_amount: int
+    buy_amount: int
+
+
+# A trade belongs to the first settlement after it in its block: the `Trade` events of a
+# settlement precede its `Settlement` event, which is the only one carrying the auction
+# id. That is the rule `int_backend_data__trade_with_tx_hash` applies; it is applied here
+# directly so the result does not depend on the run windows of that incremental model.
+# The lateral probe rides the `(block_number, log_index)` index on settlements: 0.4-0.7 s
+# for a bnb week.
+ORDER_TRADES_SQL = """
+with window_trades as (
+    select t.order_uid, t.block_number, t.log_index, t.sell_amount, t.buy_amount
+    from dbt.stg_backend_data__trades t
+    join dbt.stg_backend_data__orders o on o.uid = t.order_uid
+    where o.creation_timestamp >= %(start)s and o.creation_timestamp < %(end)s
+)
+select encode(wt.order_uid, 'hex') as order_uid, s.auction_id,
+       wt.sell_amount, wt.buy_amount
+from window_trades wt
+cross join lateral (
+    select s.auction_id
+    from dbt.stg_backend_data__settlements s
+    where s.block_number = wt.block_number and s.log_index > wt.log_index
+    order by s.log_index
+    limit 1
+) s
+"""
+
+# Native prices of exactly the (auction, token) pairs the trades need, through the same
+# `{auction_prices}` relation the solve side reads (`extract.fetch_prices`).
+TRADE_PRICES_SQL = """
+select ap.auction_id, encode(ap.token, 'hex') as token, ap.price
+from {auction_prices} ap
+join unnest(%(pair_auctions)s::bigint[], %(pair_tokens)s::bytea[]) as w (auction_id, token)
+  on w.auction_id = ap.auction_id and w.token = ap.token
+"""
+
+
+def load_order_trades(conn: Connection, start: str, end: str) -> list[OrderTrade]:
+    """Every trade of the orders created in `[start, end)`, each with its auction —
+    including trades after `end`, which `executed_sell` counts too. A trade whose
+    settlement is not recorded yet has no auction and is left out: it cannot be priced."""
+    return [
+        OrderTrade(
+            order_uid=row["order_uid"],
+            auction_id=row["auction_id"],
+            sell_amount=as_int(row["sell_amount"]),
+            buy_amount=as_int(row["buy_amount"]),
+        )
+        for row in fetch(conn, ORDER_TRADES_SQL, {"start": start, "end": end})
+    ]
+
+
+def _priced_token(token: str, weth: str) -> str:
+    """The token whose price an auction lists for `token`: the native sentinel is priced
+    as its wrapped ERC20, as the solve side prices it (`primitives.as_erc20`)."""
+    return as_erc20(token, weth)
+
+
+def load_trade_prices(
+    conn: Connection,
+    orders: Sequence[RecordedQuote],
+    trades: Sequence[OrderTrade],
+    *,
+    weth: str,
+    chunk: int = 2000,
+) -> dict[tuple[int, str], int]:
+    """`(auction_id, token) -> native price` for both tokens of every trade, in the auction
+    that trade settled in. Absent pairs stay absent."""
+    tokens = {
+        o.order_uid: (_priced_token(o.sell_token, weth), _priced_token(o.buy_token, weth))
+        for o in orders
+    }
+    pairs = sorted(
+        {
+            (trade.auction_id, token)
+            for trade in trades
+            if trade.order_uid in tokens
+            for token in tokens[trade.order_uid]
+        }
+    )
+    prices: dict[tuple[int, str], int] = {}
+    auction_ids = sorted({auction_id for auction_id, _ in pairs})
+    if not auction_ids:
+        return prices
+    unpriced = unpriced_auctions(conn, auction_ids)
+    for part in chunked(auction_ids, chunk):
+        ids = set(part)
+        wanted = [(a, t) for a, t in pairs if a in ids]
+        for row in fetch_prices(
+            conn,
+            TRADE_PRICES_SQL,
+            {
+                "ids": list(part),
+                "pair_auctions": [a for a, _ in wanted],
+                "pair_tokens": [bytes.fromhex(t) for _, t in wanted],
+            },
+            unpriced & ids,
+        ):
+            if row["price"]:
+                prices[(row["auction_id"], row["token"])] = as_int(row["price"])
+    return prices
+
+
+def imbalanced_orders(
+    orders: Sequence[RecordedQuote],
+    trades: Iterable[OrderTrade],
+    prices: Mapping[tuple[int, str], int],
+    *,
+    weth: str,
+) -> frozenset[str]:
+    """The **two-sided** check: orders whose executed sell value and executed buy value
+    disagree past `PRICE_IMBALANCE_THRESHOLD`, each trade valued at the native prices of
+    the auction it settled in — `counterfactual.price_imbalanced`, per order rather than
+    per solution.
+
+    Per auction and not at window medians, because a median two-sided check excludes a
+    volatile token's honest trades: USDT→0xfb4f81f5… failed at bnb's week medians on 225
+    orders whose per-auction values match the trade-implied rate at 1.00x. A trade
+    missing either price is skipped, and an order with nothing checkable is left alone,
+    as the solve side leaves a solution — D14's rule. Blind, like that check, to a pair
+    whose two tokens are both mispriced by the same factor.
+    """
+    tokens = {
+        o.order_uid: (_priced_token(o.sell_token, weth), _priced_token(o.buy_token, weth))
+        for o in orders
+    }
+    values: dict[str, list[int]] = {}
+    for trade in trades:
+        pair = tokens.get(trade.order_uid)
+        if pair is None:
+            continue
+        sell_price = prices.get((trade.auction_id, pair[0]))
+        buy_price = prices.get((trade.auction_id, pair[1]))
+        if sell_price is None or buy_price is None:
+            continue
+        value = values.setdefault(trade.order_uid, [0, 0])
+        value[0] += price_in_eth(sell_price, trade.sell_amount)
+        value[1] += price_in_eth(buy_price, trade.buy_amount)
+    return frozenset(
+        uid
+        for uid, (sold, bought) in values.items()
+        if sold
+        and bought
+        and (
+            sold > PRICE_IMBALANCE_THRESHOLD * bought
+            or bought > PRICE_IMBALANCE_THRESHOLD * sold
+        )
+    )
+
+
+def traded_sell_prices(
+    orders: Sequence[RecordedQuote],
+    trades: Iterable[OrderTrade],
+    prices: Mapping[tuple[int, str], int],
+    *,
+    weth: str,
+) -> dict[str, float]:
+    """`order_uid -> the sell token's auction price where the order traded`, weighted by
+    each trade's sell amount and scaled by 1e18 like the feed — the one-sided check's
+    reference for every order that traded (`price_suspect_orders`)."""
+    sell_token = {o.order_uid: _priced_token(o.sell_token, weth) for o in orders}
+    sums: dict[str, list[int]] = {}
+    for trade in trades:
+        token = sell_token.get(trade.order_uid)
+        price = prices.get((trade.auction_id, token)) if token else None
+        if price is None or trade.sell_amount <= 0:
+            continue
+        entry = sums.setdefault(trade.order_uid, [0, 0])
+        entry[0] += price * trade.sell_amount
+        entry[1] += trade.sell_amount
+    return {uid: value / amount for uid, (value, amount) in sums.items()}
 
 
 def load_token_prices(
@@ -1013,7 +1986,7 @@ def load_token_prices(
 
 Leaf = Literal[
     "unaffected", "no_quote", "class_flip", "degraded", "unpriced", "nonpositive",
-    "price_suspect", "implausible",
+    "price_suspect", "implausible", "unrecorded",
 ]
 
 IMPLAUSIBLE_QUOTE_FACTOR = PRICE_IMBALANCE_THRESHOLD
@@ -1048,6 +2021,11 @@ class QuoteDiff:
     """The counterfactual quote the fee path should charge against, or `None` where
     there is nothing to charge — an unaffected order keeps its recorded quote and an
     order that would never exist has no fee at all."""
+    streamed: bool = False
+    commit_dependent: bool = False
+    """The order was placed from a streamed quote, and whether its replacement would
+    differ had the user committed the moment their answer was forwarded rather than at
+    the latest moment the record allows (`stream_replacement`)."""
 
     @property
     def delta_bps(self) -> float:
@@ -1105,8 +2083,14 @@ def diff_quote(
     estimate to zero value (`effective_eth_out`, quote.rs:285) and a ratio against it is
     not a price change; the replacement quote is withheld from the fee path too, since
     the same arithmetic is what `fees._adjust_quote_to_order_limits` would refuse.
+
+    An order placed from a streamed quote (`match.stream`) is decided by the answer it
+    took rather than the recorded winner, and its replacement is what the stream would
+    have shown by the user's commit (`stream_replacement`). A replacement the record
+    cannot tell — the stream was dropped before the answer the user would have waited
+    for — is the `unrecorded` leaf.
     """
-    order, request = match.order, match.request
+    order, request, take = match.order, match.request, match.stream
     pricing = order.pricing
     if ranking == "autopilot" and order.is_sell:
         price = (buy_token_prices or {}).get(order.buy_token)
@@ -1115,35 +2099,49 @@ def diff_quote(
     base_effective = _recorded_effective(order)
     # The template every other leaf is a `replace` of, so the fields a leaf does not
     # change are stated once.
+    # Who priced the order: the recorded winner, or the streamed answer it took.
+    taken = take.taken if take else request.winner
     unaffected = QuoteDiff(
         order_uid=order.order_uid,
         leaf="unaffected",
         is_sell=order.is_sell,
         tier=match.tier,
-        winner=request.winner,
+        winner=taken,
         replacement=None,
         effective_base=base_effective,
         effective_loo=base_effective,
         volume_native=order.volume_native,
         partially_fillable=order.partially_fillable,
         quote_loo=None,
+        streamed=take is not None,
     )
-    if request.winner and request.winner not in removed_estimators:
+    if taken and taken not in removed_estimators:
         # Removing a loser cannot move the winner, and cannot change the winner's
         # verified class either: the class is a property of the estimates that remain,
-        # and the winner is in the preferred one by definition.
+        # and the winner is in the preferred one by definition. On a stream the same
+        # holds for the answer taken: nothing that arrived after it before the commit
+        # beat it, and a removal only takes candidates away.
         return unaffected
     if not any(e.estimator in removed_estimators for e in request.reasonable):
         return unaffected
     if order.order_uid in price_suspects:
         return replace(unaffected, leaf="price_suspect", volume_native=0)
 
+    commit_dependent = False
     try:
-        replacement = leave_one_out(
-            request, removed_estimators, pricing=pricing, ranking=ranking
-        )
+        if take is None:
+            replacement = leave_one_out(
+                request, removed_estimators, pricing=pricing, ranking=ranking
+            )
+        else:
+            replacement, commit_dependent = stream_replacement(
+                request, take, removed_estimators, pricing=pricing, ranking=ranking
+            )
     except UnpricedRequestError:
         return replace(unaffected, leaf="unpriced")
+    except UnrecordedStreamError:
+        return replace(unaffected, leaf="unrecorded")
+    unaffected = replace(unaffected, commit_dependent=commit_dependent)
 
     if replacement is None:
         return replace(unaffected, leaf="no_quote", effective_loo=0.0, quote_loo=None)
@@ -1167,8 +2165,10 @@ def diff_quote(
             unaffected, leaf="implausible", replacement=replacement.estimator,
             effective_loo=loo_effective,
         )
-    winner = request.recorded_winner
-    flip = bool(winner and winner.verified and not replacement.verified)
+    priced_by = next(
+        (e for e in request.reasonable if e.estimator == taken), None
+    ) if take else request.recorded_winner
+    flip = bool(priced_by and priced_by.verified and not replacement.verified)
     return replace(
         unaffected,
         leaf="class_flip" if flip else "degraded",
@@ -1329,6 +2329,15 @@ class QuoteAnalysis:
     price_suspect: int = 0
     implausible: int = 0
     implausible_volume_native: int = 0
+    unrecorded: int = 0
+    """Wins on a stream the client dropped before the answer its user would have waited
+    for arrived — cancelled, so never recorded (`stream_replacement`)."""
+    stream_wins: int = 0
+    commit_dependent: int = 0
+    """Wins on orders placed from a streamed quote, and how many of those would have a
+    different replacement had the user committed the moment their answer was forwarded
+    rather than at the latest moment the record allows — the one assumption the stream
+    rule makes, counted."""
     """Wins — orders whose quote the removed solver did win — excluded from every figure
     because the gas cost swallowed the input, because the order's two native price feeds
     disagree (`PRICE_IMBALANCE_THRESHOLD`), or because the replacement quote is more than
@@ -1357,7 +2366,12 @@ class QuoteAnalysis:
             return
         self.quote_wins += 1
         self.quote_wins_corroborated += corroborated
+        self.stream_wins += diff.streamed
+        self.commit_dependent += diff.commit_dependent
         self.diffs.append(diff)
+        if diff.leaf == "unrecorded":
+            self.unrecorded += 1
+            return
         if diff.leaf == "unpriced":
             self.unpriced += 1
             return
@@ -1463,10 +2477,16 @@ class PickValidation:
     the verified-first rule got right. The rule is only *tested* by these."""
     unpriced: int = 0
     tied: int = 0
-    """Requests where another estimate shares the winner's key to the last float bit, so
-    the pick was decided by input order rather than by the rule. In prod the tie goes to
-    whichever estimator answered first (`quote.rs:80`, a stable sort over completion
-    order), which the ladder does not record."""
+    """Requests where another estimate shares the recorded winner's key to the last float
+    bit, so arrival order decided rather than the rule: prod sorts the answers stably in
+    completion order (`quote.rs:80`), and the ladder is loaded in that order — `nats_seq`
+    on the raw layer exactly, `estimate_timestamp` to the millisecond on the gold one.
+    Every sell estimate under water ties at zero (`rank_key`), so dust requests are ties
+    too."""
+    tie_mismatches: int = 0
+    """Ties our arrival order resolved to another estimator — the rule picked an
+    equivalent estimate, so these are not counted as disagreements; on the gold layer two
+    answers in the same millisecond are the expected cause."""
     price_suspect: int = 0
     """Matched orders left out because their recorded `sell_token_price` failed the
     cross-check: the gas weight the ranking needs is the very number that is wrong."""
@@ -1474,12 +2494,26 @@ class PickValidation:
         default_factory=list[tuple[str, str, str]]
     )
     """`(request_id, recorded, ours)` for the first few, so a failure can be opened."""
+    streams: int = 0
+    streams_reproduced: int = 0
+    """Streamed competitions with two or more forwarded answers, and how many of them
+    `replay_stream` reproduces exactly — the same answers forwarded, in the same order,
+    as their `quote_computed` rows record. The stream rule rests on this as the pick
+    rests on `rate`."""
+    stream_disagreements: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = field(
+        default_factory=list[tuple[str, tuple[str, ...], tuple[str, ...]]]
+    )
+    """`(request_id, recorded, replayed)` for the first few."""
 
     @property
     def rate(self) -> float | None:
         if not self.with_recorded_winner:
             return None
         return self.reproduced / self.with_recorded_winner
+
+    @property
+    def stream_rate(self) -> float | None:
+        return self.streams_reproduced / self.streams if self.streams else None
 
 
 def validate_picks(
@@ -1490,13 +2524,37 @@ def validate_picks(
     price_suspects: frozenset[str] = frozenset(),
     keep_disagreements: int = 20,
 ) -> PickValidation:
-    """Re-pick every matched request and compare against the recorded winner."""
+    """Re-pick every matched request and compare against the recorded winner, and replay
+    every streamed competition against the answers it recorded forwarding."""
     result = PickValidation(ranking=ranking)
+    replayed: set[str] = set()
     for match in matches:
         order, request = match.order, match.request
         if order.order_uid in price_suspects:
             result.price_suspect += 1
             continue
+        take = match.stream
+        if (
+            ranking == "effective-sell"
+            and take is not None
+            and len(take.forwarded) >= 2
+            and request.request_id not in replayed
+        ):
+            replayed.add(request.request_id)
+            ours = replay_stream(
+                request.estimates, is_sell=request.is_sell,
+                in_amount=request.in_amount, pricing=order.pricing,
+            )
+            result.streams += 1
+            # A dropped stream recorded only what it forwarded before the drop.
+            if tuple(ours[: len(take.forwarded)]) == take.forwarded and (
+                not take.complete or len(ours) == len(take.forwarded)
+            ):
+                result.streams_reproduced += 1
+            elif len(result.stream_disagreements) < keep_disagreements:
+                result.stream_disagreements.append(
+                    (request.request_id, take.forwarded, tuple(ours))
+                )
         result.requests += 1
         winner = request.recorded_winner
         if winner is None:
@@ -1527,29 +2585,28 @@ def validate_picks(
             continue
         if ours is None:
             continue
-        if ours.estimator == winner.estimator:
-            result.reproduced += 1
-            key = rank_key(
-                winner,
+        # `pick` returned without raising, so every usable estimate has a key.
+        keys = {
+            e.estimator: rank_key(
+                e,
                 is_sell=request.is_sell,
                 in_amount=request.in_amount,
                 pricing=pricing,
                 ranking=ranking,
             )
-            preferred = [e for e in usable if e.verified] if winner.verified else usable
-            if any(
-                e.estimator != winner.estimator
-                and rank_key(
-                    e,
-                    is_sell=request.is_sell,
-                    in_amount=request.in_amount,
-                    pricing=pricing,
-                    ranking=ranking,
-                )
-                == key
-                for e in preferred
-            ):
-                result.tied += 1
+            for e in usable
+        }
+        winner_key = keys[winner.estimator]
+        preferred = [e for e in usable if e.verified] if winner.verified else usable
+        tie = any(
+            e.estimator != winner.estimator and keys[e.estimator] == winner_key
+            for e in preferred
+        )
+        result.tied += tie
+        if ours.estimator == winner.estimator:
+            result.reproduced += 1
+        elif tie and ours.verified == winner.verified and keys[ours.estimator] == winner_key:
+            result.tie_mismatches += 1
         elif len(result.disagreements) < keep_disagreements:
             result.disagreements.append(
                 (request.request_id, winner.estimator, ours.estimator)
@@ -1565,7 +2622,7 @@ class QuoteWindow:
     """The quote side of one window, loaded once for every removal scenario.
 
     Loading is the whole cost here as it is on the solve side: the ClickHouse ladder and
-    the match are scenario-independent, so N solvers cost one load.
+    the link are scenario-independent, so N solvers cost one load.
     """
 
     network: str
@@ -1577,22 +2634,39 @@ class QuoteWindow:
     orders: list[RecordedQuote]
     matches: list[MatchedQuote]
     estimator_map: dict[str, str]
-    """`estimator -> solver address`, derived from corroborated matches on this chain."""
+    """`estimator -> solver address` on this chain: read from the estimates where the
+    quote-id link ran, derived from corroborated matches where the heuristic did, the
+    read one winning where both exist."""
     buy_token_prices: dict[str, float]
     validation: PickValidation
     coverage_start: str
     """The first prod request ClickHouse holds for this network. An order created before
     it can never be matched, so this is reported rather than left to look like a poor
     match rate."""
+    links: tuple[LinkStats, ...] = ()
+    """One entry per link asked to place orders — `heuristic` for orders created before
+    `QUOTE_ID_LINK_START`, `quote-id` from it on — so a window on one side of that
+    instant has one entry and a window straddling it has both."""
     price_suspects: frozenset[str] = frozenset()
-    """Orders whose two native price feeds disagree past `PRICE_IMBALANCE_THRESHOLD`.
-    Out of every quote figure, on both sides of every ratio, and counted."""
+    """Orders failing either price check (`PRICE_IMBALANCE_THRESHOLD`). Out of every
+    quote figure, on both sides of every ratio, and counted."""
+    one_sided_suspects: int = 0
+    two_sided_suspects: int = 0
+    """How many orders each check flagged. An order can fail both, so the two can sum
+    past `price_suspects`."""
     orders_dropped: int = 0
     orders_before_coverage: int = 0
 
     @property
+    def trivial_orders(self) -> int:
+        """Orders no competition priced (`RecordedQuote.trivial`): in the window's
+        population, linked by neither link."""
+        return sum(1 for o in self.orders if o.trivial)
+
+    @property
     def matched_raw(self) -> int:
-        """Matches whose competition the gold tables do not hold."""
+        """Matches whose competition was read from the raw layer — the gold tables'
+        missing competitions under the heuristic, every match under the quote-id link."""
         return sum(1 for m in self.matches if m.request.source == "raw")
 
     @property
@@ -1606,6 +2680,14 @@ class QuoteWindow:
     @property
     def window_quoted_volume_native(self) -> int:
         return sum(o.quoted_volume_native for o in self.clean_orders)
+
+    @property
+    def suspect_volume_native(self) -> int:
+        """Executed volume, at the api's price, that the price checks took out of the
+        denominator — the size of what they caught."""
+        return sum(
+            o.volume_native for o in self.orders if o.order_uid in self.price_suspects
+        )
 
     def coverage_by_app(self) -> list[tuple[str, int, int]]:
         """`(app_code, orders, matched)`, busiest first.
@@ -1624,12 +2706,6 @@ class QuoteWindow:
             ((app, n, m) for app, (n, m) in totals.items()),
             key=lambda row: -row[1],
         )
-
-    @property
-    def matched_share(self) -> float | None:
-        if not self.orders:
-            return None
-        return len(self.matches) / len(self.orders)
 
     def estimators_of(self, addresses: frozenset[str]) -> frozenset[str]:
         """The estimator names belonging to a removal scenario's solver addresses.
@@ -1668,55 +2744,22 @@ class QuoteWindow:
         return analysis
 
 
-def load_quote_window(
+def heuristic_link(
     client: ch.Client,
-    conn: Connection,
     network: str,
-    start: str,
-    end: str,
+    orders: Sequence[RecordedQuote],
     *,
-    ranking: QuoteRanking = "effective-sell",
-    auction_ids: Sequence[int] = (),
     log: Callable[[str], None] | None = None,
-) -> QuoteWindow:
-    """Load the quote competition for `[start, end)` on one network.
+) -> tuple[list[MatchedQuote], dict[str, str], LinkStats]:
+    """The link for orders created before `QUOTE_ID_LINK_START`, when nothing records
+    which competition priced an order.
 
     Candidates come from the gold request table first and, for the orders that leaves
     unplaced, from the raw estimates (`load_raw_candidates`); ladders follow the same
     split. Measured on 2026-07-25 mainnet the two together place 2,935 of 2,937 orders,
     and every raw-layer match is corroborated by the winning estimate's own amount.
-
-    Raises `KeyError` for a network with no quote data at all: reporting empty quote
-    columns would read as "this solver quoted nothing" rather than "there is no quote
-    data here" (Q-D10).
     """
     emit: Callable[[str], None] = log or (lambda message: None)
-    ch.chain_id(network)  # refuse an unsupported network before any query runs
-    coverage = client.coverage(network)
-    if coverage is None:
-        raise ch.NoQuoteDataError(f"no prod quote requests recorded for {network!r}")
-    coverage_start = coverage[0]
-    emit(f"quote data for {network}: {coverage[0]} .. {coverage[1]}")
-
-    # An order created before the quote data begins can never be matched, so it is
-    # excluded from the population rather than counted as unmatched: leaving it in would
-    # deflate every quote share by however much of the window predates the backfill —
-    # two thirds of a July window, at the time of writing.
-    quote_start = max(start, coverage_start[:10])
-    all_orders, dropped = load_recorded_quotes(conn, quote_start, end)
-    orders = [o for o in all_orders if o.created >= coverage_start]
-    before = len(all_orders) - len(orders)
-    emit(
-        f"{len(orders)} orders created in [{quote_start}, {end}) carry a recorded quote "
-        f"({dropped} dropped as unevaluable, {before} created before the quote data "
-        f"begins)"
-        + (
-            f"; the quote side covers [{quote_start}, {end}) of the run's "
-            f"[{start}, {end})"
-            if quote_start != start
-            else ""
-        )
-    )
     requests = load_candidate_requests(client, network, orders, log=log)
     viable = viable_requests(orders, requests)
     unplaced = [o for o in orders if o.order_uid not in viable]
@@ -1743,22 +2786,129 @@ def load_quote_window(
         f"{sum(1 for m in matches if m.request.source == 'raw')} matches rest on "
         f"competitions the gold tables do not hold"
     )
+    stats = LinkStats(
+        link="heuristic",
+        orders=len(orders),
+        linked=len(matches),
+        corroborated=sum(1 for m in matches if m.tier == "corroborated"),
+    )
+    return matches, estimator_map, stats
 
-    # The cross-check runs on every ranking: it is a data guard, not a ranking input.
-    # Sell tokens for the guard, buy tokens too when the autopilot rule needs them.
+
+def load_quote_window(
+    client: ch.Client,
+    conn: Connection,
+    network: str,
+    start: str,
+    end: str,
+    *,
+    ranking: QuoteRanking = "effective-sell",
+    auction_ids: Sequence[int] = (),
+    log: Callable[[str], None] | None = None,
+) -> QuoteWindow:
+    """Load the quote competition for `[start, end)` on one network.
+
+    Orders are linked to their competitions by quote id from `QUOTE_ID_LINK_START` and by
+    the heuristic before it (`link_by_quote_id`, `heuristic_link`); trivial unwraps by
+    neither. Both price checks then run over every order, and the pick is validated on
+    what was linked.
+
+    Raises `KeyError` for a network with no quote data at all: reporting empty quote
+    columns would read as "this solver quoted nothing" rather than "there is no quote
+    data here" (Q-D10).
+    """
+    emit: Callable[[str], None] = log or (lambda message: None)
+    ch.chain_id(network)  # refuse an unsupported network before any query runs
+    coverage = client.coverage(network)
+    if coverage is None:
+        raise ch.NoQuoteDataError(f"no prod quote requests recorded for {network!r}")
+    coverage_start = coverage[0]
+    emit(f"quote data for {network}: {coverage[0]} .. {coverage[1]}")
+
+    # An order created before the quote data begins can never be matched, so it is
+    # excluded from the population rather than counted as unmatched: leaving it in would
+    # deflate every quote share by however much of the window predates the backfill —
+    # two thirds of a July window, at the time of writing.
+    quote_start = max(start, coverage_start[:10])
+    all_orders, dropped = load_recorded_quotes(conn, quote_start, end, network=network)
+    orders = [o for o in all_orders if o.created >= coverage_start]
+    before = len(all_orders) - len(orders)
+    emit(
+        f"{len(orders)} orders created in [{quote_start}, {end}) carry a recorded quote "
+        f"({dropped} dropped as unevaluable, {before} created before the quote data "
+        f"begins)"
+        + (
+            f"; the quote side covers [{quote_start}, {end}) of the run's "
+            f"[{start}, {end})"
+            if quote_start != start
+            else ""
+        )
+    )
+
+    linkable = [o for o in orders if not o.trivial]
+    by_heuristic = [o for o in linkable if o.created < QUOTE_ID_LINK_START]
+    by_id = [o for o in linkable if o.created >= QUOTE_ID_LINK_START]
+    emit(
+        f"{len(orders) - len(linkable)} trivial unwraps (quote solver 0x0) had no "
+        f"competition and are not linked; {len(by_id)} orders link by quote id, "
+        f"{len(by_heuristic)} by the heuristic (quote ids from {QUOTE_ID_LINK_START})"
+    )
+    matches: list[MatchedQuote] = []
+    estimator_map: dict[str, str] = {}
+    links: list[LinkStats] = []
+    if by_heuristic:
+        found, derived, stats = heuristic_link(client, network, by_heuristic, log=log)
+        matches.extend(found)
+        estimator_map.update(derived)
+        links.append(stats)
+    if by_id:
+        id_link = link_by_quote_id(client, network, by_id, log=log)
+        matches.extend(id_link.matches)
+        estimator_map.update(id_link.estimator_map)
+        links.append(id_link.stats)
+
+    # Both checks run on every ranking: they are data guards, not ranking inputs. The
+    # one-sided check needs the window's median per sell token, and the autopilot rule
+    # the buy tokens' too; the two-sided one prices each trade in its own auction.
     guard_tokens = sorted({o.sell_token for o in orders})
     wanted = guard_tokens + (
         sorted({m.order.buy_token for m in matches}) if ranking == "autopilot" else []
     )
     auction_prices = load_token_prices(conn, auction_ids, wanted)
-    buy_token_prices = auction_prices if ranking == "autopilot" else {}
-    suspects = price_suspect_orders(orders, auction_prices)
+    # The auction feed is scaled by 1e18; `Pricing` holds wei per atom, as the api's
+    # `sell_token_price` does.
+    buy_token_prices = (
+        {token: price / ONE_ETH for token, price in auction_prices.items()}
+        if ranking == "autopilot"
+        else {}
+    )
+    weth = wrapped_native_token(network)
+    trades = load_order_trades(conn, quote_start, end)
+    trade_prices = load_trade_prices(conn, orders, trades, weth=weth)
+    one_sided = price_suspect_orders(
+        orders,
+        auction_prices,
+        traded_sell_prices(orders, trades, trade_prices, weth=weth),
+    )
+    two_sided = imbalanced_orders(orders, trades, trade_prices, weth=weth)
+    suspects = one_sided | two_sided
     unpriced_tokens = sum(1 for token in guard_tokens if token not in auction_prices)
+    traded = {o.order_uid for o in orders if o.traded}
+    checked = {
+        t.order_uid
+        for t in trades
+        if t.order_uid in traded
+    }
     emit(
-        f"native price cross-check: {len(suspects)} of {len(orders)} orders excluded "
-        f"(the api's sell_token_price and the auction price disagree past "
-        f"{PRICE_IMBALANCE_THRESHOLD}x); {unpriced_tokens} of {len(guard_tokens)} sell "
-        f"tokens the window's auctions never priced, which the guard cannot test"
+        f"price checks: {len(suspects)} of {len(orders)} orders excluded — "
+        f"{len(one_sided)} one-sided (the api's sell_token_price against the auction "
+        f"price where the order traded, the window median where it did not; "
+        f"{unpriced_tokens} of {len(guard_tokens)} sell tokens never in a median), "
+        f"{len(two_sided)} two-sided (sold against bought value at each trade's auction "
+        f"prices, over {len(trades)} trades of {len(checked)} of {len(traded)} traded "
+        f"orders), both past {PRICE_IMBALANCE_THRESHOLD:g}x; "
+        f"{sum(o.volume_native for o in orders if o.order_uid in suspects)} of "
+        f"{sum(o.volume_native for o in orders)} wei of executed volume removed"
     )
 
     validation = validate_picks(
@@ -1772,9 +2922,10 @@ def load_quote_window(
         f"pick reproduces the recorded winner on "
         f"{validation.reproduced}/{validation.with_recorded_winner}"
         + (f" ({rate:.3%})" if rate is not None else "")
-        + f"; verified-class rule tested on {validation.mixed_class} requests, correct "
-        f"on {validation.mixed_class_correct}; {validation.price_suspect} price-suspect "
-        f"matches left out of the check"
+        + f", {validation.tied} decided by arrival order, {validation.tie_mismatches} "
+        f"ties resolved to an equivalent estimate; verified-class rule tested on "
+        f"{validation.mixed_class} requests, correct on {validation.mixed_class_correct}; "
+        f"{validation.price_suspect} price-suspect matches left out of the check"
     )
     return QuoteWindow(
         network=network,
@@ -1787,7 +2938,10 @@ def load_quote_window(
         buy_token_prices=buy_token_prices,
         validation=validation,
         coverage_start=coverage_start,
+        links=tuple(links),
         price_suspects=suspects,
+        one_sided_suspects=len(one_sided),
+        two_sided_suspects=len(two_sided),
         orders_dropped=dropped,
         orders_before_coverage=before,
     )

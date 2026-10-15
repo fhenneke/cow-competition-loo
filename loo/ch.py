@@ -39,13 +39,23 @@ in neither gold table, while its estimates and winner are complete in the raw la
 on 2026-07-25 mainnet the raw competition count equals the gold prod count plus exactly
 the request-less ones, so the stream is prod."""
 
-# Chain ids as `gold_quotes` records them, for the networks the quote data covers.
+# Chain ids as `gold_quotes` records them, for the networks the quote side is enabled on.
 # Absence from this map is the support test: a network with no entry has no quote data
-# and its quote columns report as unavailable rather than as zero (Q-D10).
+# and its quote columns report as unavailable rather than as zero (Q-D10). A chain is
+# entered only once its link and pick reproduction have been measured on both links
+# (docs/quotes.md, "Coverage"); lens and sepolia have no quote data at all.
 NETWORK_CHAIN_IDS = {
-    "mainnet": 1,
-    "bnb": 56,
-    "base": 8453,  # prod requests from 2026-09-01 16:00
+    "mainnet": 1,  # prod requests from 2026-07-22 15:28
+    "bnb": 56,  # from 2026-07-22 15:28
+    # The rest from 2026-09-01 16:00.
+    "base": 8453,
+    "arbitrum-one": 42161,
+    "xdai": 100,
+    "polygon": 137,
+    "avalanche": 43114,
+    "ink": 57073,
+    "plasma": 9745,
+    "linea": 59144,
 }
 
 STATEMENT_TIMEOUT_SECONDS = 300

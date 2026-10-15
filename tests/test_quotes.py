@@ -167,14 +167,19 @@ class TestRanking:
 
     def test_autopilot_and_effective_sell_agree_on_buy_orders(self):
         """A buy order's out token *is* the sell token, so the two rules are the same
-        rule there — not an approximation of one another."""
+        rule there, differing only in the unit they truncate in: wei for the old rule,
+        sell atoms for the new one — the keys are a common factor apart."""
         estimates = [estimate("a", 1_000_000, 500), estimate("b", 1_001_000, 100)]
-        for e in estimates:
-            assert rank_key(
-                e, is_sell=False, in_amount=1.0, pricing=PRICING, ranking="autopilot"
-            ) == rank_key(
-                e, is_sell=False, in_amount=1.0, pricing=PRICING, ranking="effective-sell"
-            )
+        keys = {
+            ranking: [
+                rank_key(e, is_sell=False, in_amount=1.0, pricing=PRICING, ranking=ranking)
+                for e in estimates
+            ]
+            for ranking in ("autopilot", "effective-sell")
+        }
+        assert keys["autopilot"] == [
+            PRICING.sell_token_price * k for k in keys["effective-sell"]
+        ]
 
     def test_autopilot_shifts_where_effective_sell_scales(self):
         """The two differ on sell orders only through the quote's own pricing error, so
@@ -1004,3 +1009,485 @@ class TestImplausibleReplacement:
         diff = diff_quote(MatchedQuote(order, request, "corroborated"), frozenset({"winner"}))
         assert diff.leaf == "degraded"
         assert diff.delta_bps == pytest.approx((260_000 / 500_000 - 1) * 10_000)
+
+
+class TestProdTieBreaks:
+    """Prod clamps an underwater sell quote to zero and truncates every effective amount
+    to an integer before comparing, then keeps the first of equal answers in arrival
+    order. Both make ties common on dust requests, and both decided real bnb winners."""
+
+    def test_underwater_sell_estimates_tie_and_the_first_arrival_wins(self):
+        # 10 atoms in, gas at 2 atoms each: every estimate costs more than it is worth.
+        first = estimate("first", 1_000, 100)
+        cheaper = estimate("cheaper", 1_000, 50)  # less under water, but still under
+        winner = pick([first, cheaper], is_sell=True, in_amount=10.0, pricing=PRICING)
+        assert winner == first
+        assert pick([cheaper, first], is_sell=True, in_amount=10.0, pricing=PRICING) == cheaper
+
+    def test_amounts_that_truncate_to_the_same_atom_tie(self):
+        """35 atoms out of 2e14 in: 32.79 and 32.24 effective atoms are both 32."""
+        pricing = Pricing(gas_price=55_000_000.0, sell_token_price=1.0)
+        early = estimate("early", 35, 286_090)  # 32.2464 effective
+        late = estimate("late", 35, 229_190)  # 32.794 effective: better, same atom
+        assert pick([early, late], is_sell=True, in_amount=2e14, pricing=pricing) == early
+        unclamped = [
+            effective_sell_amount(e, is_sell=True, in_amount=2e14, pricing=pricing)
+            for e in (early, late)
+        ]
+        assert unclamped[1] > unclamped[0]  # the netting alone would have said `late`
+
+    def test_validation_reproduces_an_arrival_order_tie(self):
+        order = recorded()
+        request = sell_request(
+            estimate("first", 500_000, 1_000, winner=True),
+            estimate("second", 500_000, 1_000),
+            winner="first",
+        )
+        result = validate_picks([MatchedQuote(order, request, "corroborated")])
+        assert (result.reproduced, result.tied, result.tie_mismatches) == (1, 1, 0)
+
+    def test_a_tie_resolved_to_another_estimate_is_not_a_disagreement(self):
+        """Two answers in the same millisecond on the gold layer can come back in the
+        other order; the rule still picked an equivalent estimate."""
+        order = recorded()
+        request = sell_request(
+            estimate("loaded-first", 500_000, 1_000),
+            estimate("recorded", 500_000, 1_000, winner=True),
+            winner="recorded",
+        )
+        result = validate_picks([MatchedQuote(order, request, "corroborated")])
+        assert (result.reproduced, result.tie_mismatches) == (0, 1)
+        assert result.disagreements == []
+
+
+class TestArrivalOrder:
+    class FakeClient:
+        def __init__(self, answers: dict[str, list[dict[str, Any]]]) -> None:
+            self.answers = answers
+
+        def fetch(self, sql: str) -> list[dict[str, Any]]:
+            for needle, rows in self.answers.items():
+                if needle in sql:
+                    return rows
+            return []
+
+    def test_gold_ladders_come_back_in_estimate_timestamp_order(self):
+        from typing import cast
+
+        from loo import ch
+        from loo.quotes import load_ladders
+
+        def row(name: str, arrived: str) -> dict[str, Any]:
+            return {
+                "request_id": "r1", "estimator": name, "out_amount": 1.0, "gas": 1.0,
+                "estimate_verified": 1, "is_winner": 0, "arrived": arrived,
+            }
+
+        client = self.FakeClient({"fct_quote_estimates": [
+            row("late", "2026-07-25 12:00:00.300"), row("early", "2026-07-25 12:00:00.100"),
+        ]})
+        ladders = load_ladders(cast(ch.Client, client), "mainnet", [sell_request()])
+        assert [e.estimator for e in ladders["r1"]] == ["early", "late"]
+
+    def test_raw_ladders_come_back_in_nats_seq_order(self):
+        from typing import cast
+
+        from loo import ch
+        from loo.quotes import load_ladders
+
+        request = QuoteRequest(
+            request_id="r1", timestamp="2026-07-25 12:00:00.000", kind="sell",
+            sell_token="aa", buy_token="bb", in_amount=1.0, winner="", source="raw",
+        )
+        client = self.FakeClient({"from raw_quotes.price_estimates": [
+            {"request_id": "r1", "estimator": "b", "out_amount": "1", "gas": "1",
+             "verified": True, "nats_seq": "20"},
+            {"request_id": "r1", "estimator": "a", "out_amount": "1", "gas": "1",
+             "verified": True, "nats_seq": "3"},
+        ]})
+        ladders = load_ladders(cast(ch.Client, client), "mainnet", [request])
+        assert [e.estimator for e in ladders["r1"]] == ["a", "b"]
+
+
+def id_order(uid: str, quote_id: int | None, *, out: int = 500_000, solver: str = "cc" * 20):
+    from dataclasses import replace
+
+    base = recorded(buy=out)
+    return replace(base, order_uid=uid, quote_id=quote_id, quote_solver=solver,
+                   created="2026-10-08 12:00:30.000")
+
+
+class TestQuoteIdLink:
+    """`link_by_quote_id` against a fake ClickHouse: the order's id finds its estimate,
+    the estimate its request, and the link holds only if the estimate is the recorded
+    winner and reproduces the stored amount to the atom."""
+
+    class FakeClient:
+        def __init__(
+            self,
+            winners: list[dict[str, Any]],
+            estimates: list[dict[str, Any]],
+            requote_winners: list[dict[str, Any]] | None = None,
+            requote_estimates: list[dict[str, Any]] | None = None,
+            computed: list[dict[str, Any]] | None = None,
+        ):
+            self.winners, self.estimates = winners, estimates
+            self.requote_winners = requote_winners or []
+            self.requote_estimates = requote_estimates or []
+            self.computed = computed or []
+            self.sql: list[str] = []
+
+        def fetch(self, sql: str) -> list[dict[str, Any]]:
+            self.sql.append(sql)
+            head = sql.split(" where ")[0]
+            if "quote_computed" in head:
+                return self.computed
+            if "request_id is null" in sql:  # the re-quote pass
+                if "winning_price_estimates" in head:
+                    return self.requote_winners
+                return self.requote_estimates
+            return self.winners if "winning_price_estimates" in head else self.estimates
+
+    @staticmethod
+    def est(request: str, name: str, quote_id: int | None, out: str, seq: int,
+            solver: str | None = None) -> dict[str, Any]:
+        return {
+            "request_id": request, "estimator": name, "quote_id": str(quote_id) if quote_id else None,
+            "solver": solver if solver is not None else "0x" + name[0] * 40,
+            "kind": "sell", "sell_": "0xaa", "buy_": "0xbb", "in_amount": "1000000",
+            "out_amount": out, "gas": "1000", "verified": True, "nats_seq": str(seq),
+            "ts": f"2026-10-08 12:00:{seq:02d}.000",
+        }
+
+    def link(self, **requotes: list[dict[str, Any]]):
+        from typing import cast
+
+        from loo import ch
+        from loo.quotes import link_by_quote_id
+
+        estimates = [
+            self.est("r1", "w", 11, "500000", 2),
+            self.est("r1", "s", 12, "499000", 1),
+            self.est("r1", "s", 12, "499000", 1),  # a ReplacingMergeTree duplicate
+            self.est("r2", "w", 21, "500000", 4),
+            self.est("r2", "early", 22, "500000", 3),  # a streamed answer, not the winner
+        ]
+        winners = [{"request_id": "r1", "estimator": "w"}, {"request_id": "r2", "estimator": "w"}]
+        client = self.FakeClient(winners, estimates, **requotes)
+        orders = [
+            id_order("o-linked", 11, solver="w" * 40),
+            id_order("o-streamed", 22),
+            id_order("o-recomputed", 11, out=499_999),
+            id_order("o-no-id", None),
+            id_order("o-ethflow-zero", 0),
+            id_order("o-missing", 99),
+        ]
+        return link_by_quote_id(cast(ch.Client, client), "mainnet", orders), client
+
+    def test_the_answer_must_reproduce_the_stored_amount(self):
+        result, _ = self.link()
+        assert [m.order.order_uid for m in result.matches] == ["o-linked", "o-streamed"]
+        linked, streamed = result.matches
+        assert linked.tier == "corroborated" and linked.request.source == "raw"
+        assert linked.request.winner == "w" and linked.stream is None
+        assert streamed.stream is not None and streamed.stream.taken == "early"
+        assert result.stats.unlinked == {
+            "no quote id": 2,
+            "id not in the competition record": 1,
+            "stored quote not reproduced": 1,
+        }
+        assert (result.stats.orders, result.stats.linked) == (6, 2)
+        assert (result.stats.streamed, result.stats.streamed_early) == (1, 1)
+
+    def test_an_order_carrying_a_non_winning_answer_is_linked_as_streamed(self):
+        """`early` arrived first and was forwarded; `w` beat it and won. The order took
+        `early`, so the stream decides its counterfactual, not the full ladder."""
+        result, _ = self.link(
+            computed=[
+                {"request_id": "r2", "quote_id": "22", "nats_seq": "10"},
+                {"request_id": "r2", "quote_id": "21", "nats_seq": "11"},
+            ]
+        )
+        (streamed,) = [m for m in result.matches if m.order.order_uid == "o-streamed"]
+        assert streamed.stream is not None
+        assert streamed.stream.taken == "early"
+        assert streamed.stream.forwarded == ("early", "w")
+        assert (streamed.stream.position, streamed.stream.horizon) == (0, 1)
+        assert streamed.stream.complete
+
+    def test_ladders_are_exact_deduplicated_and_in_arrival_order(self):
+        result, _ = self.link()
+        match = result.matches[0]
+        ladder = match.request.estimates
+        assert [e.estimator for e in ladder] == ["s", "w"]  # nats_seq 1, then 2
+        assert all(isinstance(e.out_amount, int) for e in ladder)
+        assert match.request.in_amount == 1_000_000 and isinstance(match.request.in_amount, int)
+
+    def test_the_estimator_map_is_read_from_every_estimate(self):
+        """Including `early` and `s`, which won nothing a match could derive them from."""
+        result, _ = self.link()
+        assert result.estimator_map == {
+            "w": "w" * 40, "s": "s" * 40, "early": "e" * 40,
+        }
+
+    def test_ids_resolve_to_requests_inside_one_bounded_query_per_table(self):
+        _, client = self.link()
+        id_queries = [sql for sql in client.sql if "request_id is null" not in sql]
+        assert len(id_queries) == 3  # winners, forwarded answers, the ladder
+        for sql in id_queries:
+            assert "request_id in (select request_id from raw_quotes.price_estimates" in sql
+            assert "quote_id in (11, 22, 99)" in sql
+            assert "event_timestamp >= '2026-10-07 23:30:00'" in sql
+
+    @staticmethod
+    def requote(quote_id: int, name: str, out: str, at: str) -> dict[str, Any]:
+        return {
+            "quote_id": str(quote_id), "estimator": name, "solver": "0x" + name[0] * 40,
+            "sell_": "0xaa", "buy_": "0xbb", "kind": "sell", "in_amount": "1000000",
+            "out_amount": out, "gas": "1000", "verified": False, "nats_seq": str(quote_id),
+            "ts": f"2026-10-08 12:00:{at}",
+        }
+
+    def test_an_order_the_backend_requoted_links_to_that_competition(self):
+        """The ethflow case: the id names the UI quote, the stored quote is the backend's
+        own request-less re-quote at indexing — found by its exact amount, confirmed as
+        the recorded winner, its siblings bounded in time and quote id."""
+        result, client = self.link(
+            requote_winners=[{"quote_id": "501"}],
+            requote_estimates=[
+                self.requote(501, "kipseli", "499999", "32.500"),  # the stored amount
+                self.requote(503, "fractal", "499000", "32.100"),
+                self.requote(505, "dfusion", "499500", "32.300"),
+                self.requote(900, "far", "499998", "32.200"),  # another id block
+                self.requote(504, "late", "499998", "45.000"),  # another time
+            ],
+        )
+        (requoted,) = [m for m in result.matches if m.order.order_uid == "o-recomputed"]
+        assert requoted.tier == "corroborated"
+        assert requoted.request.winner == "kipseli"
+        assert requoted.request.request_id == "requote-501"
+        assert [e.estimator for e in requoted.request.estimates] == [
+            "kipseli", "fractal", "dfusion",
+        ]  # in quote-id order here, which the fake rows use as `nats_seq`
+        assert result.stats.requoted == 1
+        assert "stored quote not reproduced" not in result.stats.unlinked
+        assert result.estimator_map["kipseli"] == "k" * 40
+        (sql,) = [
+            q
+            for q in client.sql
+            if "request_id is null" in q and "winning" not in q.split(" where ")[0]
+        ]
+        assert "('0xaa', '0xbb', 'sell', '1000000')" in sql
+
+    def test_a_requote_that_did_not_win_is_not_a_link(self):
+        result, _ = self.link(
+            requote_winners=[{"quote_id": "503"}],
+            requote_estimates=[self.requote(501, "kipseli", "499999", "32.500")],
+        )
+        assert result.stats.requoted == 0
+        assert result.stats.unlinked["stored quote not reproduced"] == 1
+
+
+class TestTrivialOrders:
+    def test_a_zero_solver_quote_had_no_competition(self):
+        from dataclasses import replace
+
+        assert replace(recorded(), quote_solver="00" * 20).trivial
+        assert not recorded().trivial
+
+
+class TestTwoSidedGuard:
+    """`imbalanced_orders`: sold against bought value at each trade's own auction prices
+    — what catches a token both feeds price wrong by the same factor."""
+
+    WETH = "ee" * 19 + "ef"  # any address; only its role as the native token's ERC20 matters
+
+    def order(self, uid: str = "o1", sell: str = "aa", buy: str = "bb"):
+        from dataclasses import replace
+
+        return replace(recorded(), order_uid=uid, sell_token=sell, buy_token=buy)
+
+    def test_a_token_both_feeds_misprice_is_caught_by_the_other_side(self):
+        from loo.quotes import OrderTrade, imbalanced_orders, price_suspect_orders
+
+        order = self.order()
+        # Sold 1,000 atoms of `aa`, bought 1,000 of `bb`; `aa` is priced 1,000x too high
+        # in the auction *and* by the api (100 wei/atom recorded, so the one-sided check
+        # agrees with it and passes).
+        prices = {(7, "aa"): 100 * 10**18, (7, "bb"): 10**17}
+        trades = [OrderTrade("o1", 7, 1_000, 1_000)]
+        assert price_suspect_orders([order], {"aa": 100.0 * 10**18}) == frozenset()
+        assert imbalanced_orders([order], trades, prices, weth=self.WETH) == {"o1"}
+
+    def test_each_trade_is_valued_in_its_own_auction(self):
+        """A token that tripled over the window: per auction the two sides agree, so
+        nothing is excluded — a window median would have flagged the late trade."""
+        from loo.quotes import OrderTrade, imbalanced_orders
+
+        early, late = self.order("early"), self.order("late")
+        prices = {
+            (1, "aa"): 10**18, (1, "bb"): 10**18,
+            (2, "aa"): 3 * 10**18, (2, "bb"): 3 * 10**18,
+        }
+        trades = [OrderTrade("early", 1, 100, 100), OrderTrade("late", 2, 100, 100)]
+        assert imbalanced_orders([early, late], trades, prices, weth=self.WETH) == frozenset()
+
+    def test_a_trade_missing_a_price_is_not_checked(self):
+        from loo.quotes import OrderTrade, imbalanced_orders
+
+        trades = [OrderTrade("o1", 7, 1_000, 1)]
+        assert imbalanced_orders([self.order()], trades, {(7, "aa"): 10**18}, weth=self.WETH) == frozenset()
+
+    def test_the_native_token_is_priced_as_its_wrapped_erc20(self):
+        from loo.primitives import NATIVE_TOKEN
+        from loo.quotes import OrderTrade, imbalanced_orders
+
+        order = self.order(buy=NATIVE_TOKEN)
+        prices = {(7, "aa"): 10**18, (7, self.WETH): 10**15}
+        trades = [OrderTrade("o1", 7, 1_000, 1_000)]  # 1,000 aa for 1,000 wei-worth: off
+        assert imbalanced_orders([order], trades, prices, weth=self.WETH) == {"o1"}
+
+    def test_the_one_sided_check_uses_the_orders_own_auctions_where_it_traded(self):
+        from loo.quotes import OrderTrade, price_suspect_orders, traded_sell_prices
+
+        order = self.order()  # api: 100 wei per atom
+        trades = [OrderTrade("o1", 7, 500, 1), OrderTrade("o1", 8, 500, 1)]
+        prices = {(7, "aa"): 90 * 10**18, (8, "aa"): 110 * 10**18}
+        traded = traded_sell_prices([order], trades, prices, weth=self.WETH)
+        assert traded == {"o1": 100.0 * 10**18}
+        # A window median 3x away (the token moved) would have excluded it.
+        median = {"aa": 300.0 * 10**18}
+        assert price_suspect_orders([order], median) == {"o1"}
+        assert price_suspect_orders([order], median, traded) == frozenset()
+
+
+class TestStream:
+    """The streamed counterfactual: the answer an order took decides whether a removal
+    touches it, and a replacement is what the stream would have shown by the commit."""
+
+    def request(self, *estimates: Estimate, winner: str = "") -> QuoteRequest:
+        return sell_request(*estimates, winner=winner)
+
+    def take(self, taken: str, position: int, horizon: int, *, complete: bool = True,
+             forwarded: tuple[str, ...] = ()):
+        from loo.quotes import StreamTake
+
+        return StreamTake(taken=taken, position=position, horizon=horizon,
+                          complete=complete, forwarded=forwarded)
+
+    def diff(self, request: QuoteRequest, take: Any, removed: str, *, buy: int = 500_000):
+        order = recorded(buy=buy)
+        return diff_quote(
+            MatchedQuote(order, request, "corroborated", stream=take), frozenset({removed})
+        )
+
+    def test_removing_the_recorded_winner_leaves_an_earlier_answer_standing(self):
+        """The order took `a`; that `w` won later does not matter to it."""
+        request = self.request(
+            estimate("a", 500_000, 1_000), estimate("w", 510_000, 1_000, winner=True),
+            winner="w",
+        )
+        diff = self.diff(request, self.take("a", 0, 1), removed="w")
+        assert diff.leaf == "unaffected" and diff.streamed and diff.winner == "a"
+
+    def test_the_replacement_is_the_best_answer_arrived_by_the_commit(self):
+        """Commit before `w` was forwarded: `b` (arrived after `a`, never forwarded) is in
+        reach, `w` is not."""
+        request = self.request(
+            estimate("c", 480_000, 1_000), estimate("a", 500_000, 1_000),
+            estimate("b", 490_000, 1_000), estimate("w", 510_000, 1_000, winner=True),
+            winner="w",
+        )
+        diff = self.diff(request, self.take("a", 1, 3), removed="a")
+        assert diff.leaf == "degraded" and diff.replacement == "b"
+        # Committing the moment `a` was forwarded would have shown `c`, not `b`.
+        assert diff.commit_dependent
+
+    def test_with_nothing_else_arrived_the_user_waits_for_the_next_answer(self):
+        request = self.request(
+            estimate("a", 500_000, 1_000), estimate("late", 495_000, 1_000, winner=True),
+            winner="late",
+        )
+        diff = self.diff(request, self.take("a", 0, 1), removed="a")
+        assert diff.leaf == "degraded" and diff.replacement == "late"
+        assert not diff.commit_dependent
+
+    def test_a_dropped_stream_cannot_say_what_the_user_would_have_waited_for(self):
+        request = self.request(estimate("a", 500_000, 1_000))
+        diff = self.diff(request, self.take("a", 0, 1, complete=False), removed="a")
+        assert diff.leaf == "unrecorded"
+
+    def test_a_finished_stream_with_no_other_answer_leaves_no_quote(self):
+        request = self.request(estimate("a", 500_000, 1_000, winner=True), winner="a")
+        diff = self.diff(request, self.take("a", 0, 1), removed="a")
+        assert diff.leaf == "no_quote"
+
+    def test_the_replay_forwards_strict_improvements_only(self):
+        from loo.quotes import replay_stream
+
+        ladder = [
+            estimate("a", 500_000, 1_000), estimate("tie", 500_000, 1_000),
+            estimate("worse", 400_000, 1_000), estimate("u", 900_000, 1_000, verified=False),
+            estimate("b", 510_000, 1_000),
+        ]
+        forwarded = replay_stream(ladder, is_sell=True, in_amount=1_000_000.0, pricing=PRICING)
+        # An unverified answer never beats a verified one, however large.
+        assert forwarded == ["a", "b"]
+
+    def test_an_answer_whose_fee_exceeds_the_input_sets_the_bar_unseen(self):
+        """The quoter drops it (`SellAmountDoesNotCoverFee`), but the stream already
+        counted it as its best, so the next answer must still beat it."""
+        from loo.quotes import replay_stream
+
+        ladder = [
+            estimate("under", 600_000, 600_000),  # gas cost 1.2 M atoms > 1 M input
+            estimate("ok", 500_000, 1_000),
+        ]
+        forwarded = replay_stream(ladder, is_sell=True, in_amount=1_000_000.0, pricing=PRICING)
+        assert forwarded == ["ok"]
+
+    def test_validation_replays_each_stream_against_its_record(self):
+        order = recorded()
+        request = self.request(
+            estimate("a", 500_000, 1_000), estimate("b", 510_000, 1_000, winner=True),
+            winner="b",
+        )
+        good = MatchedQuote(order, request, "corroborated",
+                            stream=self.take("a", 0, 1, forwarded=("a", "b")))
+        result = validate_picks([good])
+        assert (result.streams, result.streams_reproduced) == (1, 1)
+        bad_request = replace_request(request, "r9")
+        bad = MatchedQuote(order, bad_request, "corroborated",
+                           stream=self.take("a", 0, 1, forwarded=("b", "a")))
+        result = validate_picks([bad])
+        assert (result.streams, result.streams_reproduced) == (1, 0)
+        assert result.stream_disagreements == [("r9", ("b", "a"), ("a", "b"))]
+
+
+def replace_request(request: QuoteRequest, request_id: str) -> QuoteRequest:
+    from dataclasses import replace
+
+    return replace(request, request_id=request_id)
+
+
+class TestStreamHorizon:
+    def test_the_commit_lies_before_the_next_forwarded_answer_or_the_order(self):
+        from loo.quotes import _stream_take  # pyright: ignore[reportPrivateUsage]
+
+        request = sell_request(
+            estimate("a", 1, 1), estimate("b", 1, 1), estimate("w", 1, 1),
+            estimate("after", 1, 1), winner="w",
+        )
+        order = recorded()  # created 12:00:30.000
+        arrived = {
+            ("r1", "a"): "2026-07-25 12:00:20.000",
+            ("r1", "b"): "2026-07-25 12:00:20.100",
+            ("r1", "w"): "2026-07-25 12:00:20.200",
+            ("r1", "after"): "2026-07-25 12:00:31.000",
+        }
+        # Took `a`; `w` was forwarded next, so the commit came before `w` arrived.
+        early = _stream_take(order, request, "a", ("a", "w"), arrived)
+        assert (early.position, early.horizon) == (0, 2)
+        # Took the last forwarded answer: everything that arrived before the order counts.
+        last = _stream_take(order, request, "w", ("a", "w"), arrived)
+        assert (last.position, last.horizon) == (2, 3)

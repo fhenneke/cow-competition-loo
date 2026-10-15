@@ -89,6 +89,20 @@ Both are read-only references here. Do not modify them.
     `missing_data` collector
     ([details](docs/analytics-db.md#jit-orders-are-recorded-only-when-the-batch-settles)).
     The M1 window had zero of these — do not calibrate on it.
+14. An order's quote competition is a **join by quote id** for orders created from
+    2026-09-29 17:20 UTC, and a heuristic before. Read `quote_id` from
+    `raw_prod_<chain>.order_quotes`: the staging model's copy is NULL on every row built
+    before ~2026-10-06. Even linked, a streamed quote's order can carry a *non-winning*
+    estimate, an ethflow order's stored quote can come from a request-less re-quote the
+    backend ran at indexing, and `order_quotes.solver = 0x0` is an unwrap with no
+    competition at all
+    ([details](docs/quotes.md#quote-ids-link-an-order-to-its-competition-exactly--from-2026-09-29)).
+15. A price sanity check that compares two feeds for the **same** token passes a token
+    both feeds price wrong: on bnb 2026-10-05..12, 26 orders carried 28.68 M of 28.70 M
+    BNB of quote-side volume that way. Compare what was sold with what was bought, at the
+    prices of the auction each trade settled in — not at window medians, which fail
+    honest trades of any token that moved during the window
+    ([details](docs/quotes.md#two-price-checks-both-at-the-orders-own-auctions)).
 14. Native prices come from the `price_tokens` / `price_values` arrays of
     `stg_backend_data__competition_auctions`. Those arrays are **NULL before
     2026-09-15**, so the deprecated `stg_backend_data__auction_prices` (frozen 2026-09-21

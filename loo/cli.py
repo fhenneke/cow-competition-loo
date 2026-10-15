@@ -137,7 +137,8 @@ def main(argv: list[str] | None = None) -> int:
             "would be and how often no quote would exist at all, and charge the "
             "price-improvement fee of the affected orders against the replacement "
             "quote so the protocol-fee delta includes the quote effect. Needs the "
-            "CLICKHOUSE_* credentials and a network with quote data (mainnet, bnb, base)"
+            "CLICKHOUSE_* credentials and a network with quote data "
+            f"({', '.join(sorted(ch.NETWORK_CHAIN_IDS))})"
         ),
     )
     analyse.add_argument(
@@ -146,10 +147,10 @@ def main(argv: list[str] | None = None) -> int:
         default="effective-sell",
         help=(
             "how the quote competition is re-run: on the effective quote netted in the "
-            "sell token at the order's own recorded prices (default, reproduces the "
-            "recorded winner on 99.6%% of mainnet requests and needs nothing that is "
-            "not recorded), or on the autopilot's own out-token rule, which needs the "
-            "buy token's native price and is the cross-check"
+            "sell token at the order's own recorded prices (default; the protocol's own "
+            "rule since services#4846, needs nothing that is not recorded), or on the "
+            "out-token rule from before it, which needs the buy token's native price "
+            "and is the cross-check"
         ),
     )
     analyse.add_argument("--max-winners", type=int, default=MAX_WINNERS)
@@ -661,8 +662,16 @@ def report_quote_side(analysis: quotes.QuoteAnalysis) -> None:
         )
     excluded = [
         (analysis.nonpositive, "the gas cost swallowed the input"),
-        (analysis.price_suspect, "the order's two native price feeds disagree"),
+        (
+            analysis.price_suspect,
+            "the order failed a price check (its two feeds, or its sold and bought "
+            "values, disagree)",
+        ),
         (analysis.unpriced, "the ranking had no native price for the out token"),
+        (
+            analysis.unrecorded,
+            "the stream was dropped before the answer its user would have waited for",
+        ),
         (
             analysis.implausible,
             f"the replacement quote is more than {quotes.IMPLAUSIBLE_QUOTE_FACTOR:g}x off "
