@@ -157,7 +157,9 @@ See [docs/quotes.md](docs/quotes.md).
 
 Exit code is 0 normally, 1 if the window has no auctions, 2 if any auction could not be
 valued, 4 if a `--solver` did not resolve (or the flags are inconsistent, or a named
-solver bid in no analysed auction), 5 if the settlement source does not cover the window.
+solver bid in no analysed auction), 5 if the settlement source does not cover the window,
+6 if the analytics-DB connection was lost or a statement ran past the 30-minute
+`statement_timeout` (every subcommand uses 6 for these; [below](#long-runs-go-under-caffeinate--i)).
 
 A month of mainnet with every solver removed in turn — 84,767 auctions, 26 scenarios —
 has taken between 12 and 25 minutes on different days. The process itself is idle for
@@ -182,6 +184,23 @@ for solver_run in window.runs:
 ```
 
 An entry `"Fractal,Sector"` would instead remove both in one joint counterfactual.
+
+#### Long runs go under `caffeinate -i`
+
+A Mac that sleeps mid-run loses the DB session: the server drops a client it has not
+heard from for about six minutes. `loo` notices within about two minutes of the line
+going quiet and exits 6 with `ERROR: lost the connection to the analytics DB … This is
+the network, not the data` — rerun the window as it was. (Until 2026-10-22 it waited on
+the dead socket forever instead; one run sat 7.5 hours with an empty log.) `caffeinate -i`
+keeps the machine from idle-sleeping for exactly as long as the command runs — closing
+the lid still sleeps a laptop:
+
+```bash
+caffeinate -i uv run loo analyse --all-solvers --start 2026-07-01 --end 2026-08-01 --out "reports/{solver}.json"
+```
+
+How the connection is guarded and what the server does on its side:
+[docs/analytics-db.md](docs/analytics-db.md#dead-connections-and-long-statements).
 
 #### The outcome rule
 
@@ -339,7 +358,7 @@ uv run loo validate-rewards --start 2026-08-01 --end 2026-08-04
 Reproduces the recorded competition — winners, fairness filter, reference scores — and
 accounts for every difference. Exit code is 0 when every difference has a named cause,
 1 if the window has no auctions, 2 when something is unexplained, 3 on a bad
-cross-check window.
+cross-check window, 6 on a lost DB connection or statement timeout.
 
 | flag | |
 | --- | --- |
@@ -364,7 +383,8 @@ inputs — winning solutions, settlement flags, caps, reference scores — and d
 against `fct_solver_rewards_per_auction`, row by row. Unlike `validate` there is no
 accepted-difference category: nothing in this path is approximated, so anything but an
 exact match on every row exits non-zero. Exit code 0 when every row matches, 1 on an
-empty window, 2 on a mismatch, 3 when the mart does not cover the window.
+empty window, 2 on a mismatch, 3 when the mart does not cover the window, 6 on a lost
+DB connection or statement timeout.
 
 ### Reading a validate run
 

@@ -32,6 +32,46 @@ conn = psycopg2.connect(
 
 The user is `<db-user>`. Treat the DB as read-only.
 
+`loo.db.connect(network)` does the parsing and adds the two guards below; ad-hoc scripts
+get them by calling it instead of the snippet above.
+
+### Dead connections and long statements
+
+psycopg2 sets no read timeout and libpq no keepalives, so a query whose connection dies
+under it waits forever. After a sleep the client's kernel still holds the socket as
+ESTABLISHED while the server dropped the session long ago. A `loo analyse` sat 7.5 hours
+that way on 2026-10-22, at 0.6 s of CPU and with an empty log. `connect()` now sets:
+
+- **TCP keepalives**: 60 s idle, then 6 probes 10 s apart, so a dead peer raises about
+  two minutes after the line goes quiet. A live server's kernel answers the probes
+  however long its query runs, so slow is never taken for dead: a `pg_sleep(130)`
+  returned normally through two probe rounds. With the server unplugged mid-query (two
+  Linux containers), a client with these settings raised about 100 s after the line went
+  silent, and one without them was still blocked 450 s later. `tcp_user_timeout=120000`
+  covers data sent and never acknowledged, on Linux only. libpq accepts it on macOS but
+  skips it, because the socket option does not exist there; the kernel's retransmission
+  limit gives up after minutes instead.
+- **`statement_timeout = 30min`**. The server default is `0`, no limit. The slowest
+  statement measured on the default analyse path is the quote side's `ORDERS_SQL`, which
+  grows with the window: 81 s for 310,567 rows over mainnet 2026-08-01..10-20, measured
+  2026-10-22. On the same window the session's first `SOLVER_SQL` took 23 s cold, and
+  every chunked extraction query (200 auctions) took at most 0.6 s. Not timed: the
+  `--quote-ranking autopilot` token-price median, which runs over every auction in the
+  window at once.
+
+`fetch` and `run` re-raise the failures as `loo.db.ConnectionLostError` and
+`loo.db.StatementTimeoutError` instead of the `OperationalError` psycopg2 uses for both.
+The test for a lost connection is `conn.closed`, not the message, whose wording depends
+on SSL and the OS. The CLI prints the cause and exits 6.
+
+The server's own settings bear on this. `tcp_keepalives_idle=300`,
+`tcp_keepalives_interval=30` and `tcp_keepalives_count=2` mean it drops a client that has
+been silent for about six minutes, which is exactly what a sleeping laptop is. So a run
+that sleeps longer than that is lost either way; the client-side keepalives only make
+it fail fast instead of hang. `idle_in_transaction_session_timeout=1d`: a run's read
+transaction stays open through the hours of ClickHouse work on the quote side and is
+well inside that.
+
 ## Databases and schema
 
 **One database per network.** Models live in schema `dbt` in each.

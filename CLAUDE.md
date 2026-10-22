@@ -161,6 +161,11 @@ Both are read-only references here. Do not modify them.
   takes ~5 minutes and each invocation re-imports from disk, so a background run that
   started before an edit picks up half of it and dies on an `AttributeError`. Finish the
   edit first, or wait — a lost run costs five minutes and reads like a data problem.
+- **Launch long runs under `caffeinate -i`** (`caffeinate -i uv run loo analyse ...`). A
+  Mac that sleeps for more than ~6 minutes loses the DB session. That now fails within
+  ~2 minutes, with exit 6 and `ConnectionLostError`, instead of hanging forever, but
+  the run is lost either way. Exit 6 is the network, never the data: rerun the run
+  unchanged ([details](docs/analytics-db.md#dead-connections-and-long-statements)).
 
 ## Committing and merging
 

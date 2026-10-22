@@ -190,7 +190,13 @@ def main(argv: list[str] | None = None) -> int:
     compare.set_defaults(func=run_compare)
 
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (db.ConnectionLostError, db.StatementTimeoutError) as error:
+        # Neither says anything about the data. A traceback ending in psycopg2 reads
+        # like a query or data bug, so the cause is printed instead, under its own code.
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 6
 
 
 def run_validate(args: argparse.Namespace) -> int:
