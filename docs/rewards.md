@@ -6,6 +6,7 @@ Transcribed from the dbt models at `~/Work/Code/cow-dagster`:
 
 - `cow_dagster/cow_dbt/models/solver_accounting/marts/fct_solver_rewards_per_auction.sql`
 - `cow_dagster/cow_dbt/models/solver_accounting/intermediary/backend_data/int_backend_data__solution_data.sql`
+- `cow_dagster/cow_dbt/models/solver_accounting/intermediary/backend_data/int_backend_data__penalty_caps.sql`
 
 ## Per-auction, per-solver
 
@@ -31,7 +32,9 @@ all 9,809 (auction, solver) rows built from the window's 10,301 winning solution
 `fct_solver_rewards_per_auction.uncapped_reward` to the wei (`loo/rewards.py` is the
 transcription). Uncapped rewards are routinely negative — a solver that won and failed to
 settle is charged `−reference_score` uncapped, which only the lower cap turns into the
-real −0.01 ETH penalty — so uncapped sums must never be read as payouts.
+real penalty (a flat −0.01 ETH before 2026-09-08, the failed orders' CIP-87 caps since,
+[below](#since-2026-09-08-the-lower-cap-is-per-order-cip-87)) — so uncapped sums must
+never be read as payouts.
 
 ```
 capped_reward(s) = 0                                   if auction is excluded
@@ -45,8 +48,15 @@ upper_reward_cap(s) = scaling_factor(block_deadline)
                       × Σ over s's winning solutions of
                         max(protocol_fee_native − partner_fee_native, 0)
 
-lower_reward_cap    = −reward_config.batch_reward_cap_lower
-                    = 0 inside a no_penalties_auctions window
+lower_reward_cap(s) = 0                            inside a no_penalties_auctions window
+                    = −Σ over s's winning solutions that did not settle in time
+                        of penalty_cap_native        if every winning solution of s has one
+                    = −reward_config.batch_reward_cap_lower
+                                                     otherwise — every auction before 2026-09-08
+
+penalty_cap_native(solution) = Σ over its user orders of the order's CIP-87 cap,
+                               scaled to the executed fraction for partially fillable orders
+                               (JIT orders have no cap); NULL when the solution has none
 ```
 
 - `scaling_factor` comes from `protocol_fees_scaling_cap_config`, keyed by block time;
@@ -56,6 +66,48 @@ lower_reward_cap    = −reward_config.batch_reward_cap_lower
   the cap actually applied; the applied cap is the fee-derived quantity above.
 - `consistency_budget_contribution = upper_reward_cap − capped_reward` feeds
   `fct_consistency_rewards_per_solver_and_accounting_period`.
+
+### Since 2026-09-08 the lower cap is per order (CIP-87)
+
+The flat `−batch_reward_cap_lower` is now only the fallback. The backend records a
+**per-order penalty cap** in `competition_auctions.penalty_caps_native`, an array parallel
+to `order_uids` (services#4785, migration `V122`). Each cap is a fraction of the order's
+volume, bounded by an absolute USD amount, with smaller factors for orders whose two tokens
+fall in one "correlated" bucket (`crates/configs/src/autopilot/penalty_cap.rs`; the factors
+and buckets are deployment config, not in the repo). On mainnet the arrays begin at auction
+**13,763,364 (2026-09-08 08:46 UTC)**, and none is NULL after it.
+
+Where the rule lives matters for anyone reading the models:
+
+- It is computed in `fct_solver_rewards_per_auction`, **not** in
+  `int_backend_data__solution_data.lower_reward_cap`, which still carries the flat value
+  (or 0 in a no-penalties window) on every row. The per-solution input is
+  `int_backend_data__solution_data.penalty_cap_native`.
+- **NULL and 0 differ.** NULL means the solution has no cap and sends its solver back to
+  the flat floor; 0 is a real cap that waives the penalty (fast-path auctions are written
+  with caps of 0). cow-dagster#1058 (2026-10-16) separated the two; before it, the model
+  coalesced NULL to 0 and sniffed "has caps" from `max(cap > 0)` per auction.
+- The test is **per solver**: one of its solutions without a cap sends that solver to the
+  flat floor, not the auction. A solver whose wins all settled has a floor of 0, which its
+  non-negative reward never reaches.
+- The mart's own `lower_reward_cap` column is NULL on rows built before the column existed
+  (all of 2026-08-01..04, for instance), so `validate-rewards` compares the floor where the
+  mart recorded one and otherwise checks it only through `batch_reward_native`.
+
+The caps are small. Over 2026-10-12 on mainnet, 865 of the day's 5,443 winning solutions
+missed the deadline, every one with a cap, and the median failed cap was **0.000069 ETH**.
+Together they summed to 0.44 ETH, against the 8.65 ETH the flat floor would allow. So a
+failed win now usually costs a small fraction of the flat 0.01 ETH.
+
+`loo` follows the mart: `rewards.lower_reward_cap` is the rule above, fed by
+`penalty_cap_native` per winning solution (`extract.REWARD_INPUTS_SQL`). `loo
+validate-rewards` reproduces `batch_reward_native` and the mart's `lower_reward_cap` on
+**every** row of 2026-10-12 (4,981 of 4,981), and still on every row of 2026-08-01..04
+(9,809 of 9,809), measured 2026-10-22. The code before this change, which floored at the
+flat value, failed 445 of the 2026-10-12 rows: −1.91 ETH of capped penalties against the
+mart's −0.39 ETH, overstating one day's mainnet penalties by 1.52 ETH. Capped Δrewards
+reported before 2026-10-22 for any window after 2026-09-08 carry that overstatement. The
+four focus measures (surplus, fees, coverage, price) never read the cap.
 
 ## Why the cap is hard counterfactually
 
@@ -80,12 +132,25 @@ settlement inheritance for free — `int_backend_data__solution_data.upper_rewar
 is 0 for a batch that never settled (unrealised fees are no fees), so a replacement of
 a reverted slot inherits cap 0 exactly where it inherits the revert.
 
+The CIP-87 penalty cap is inherited by the same rule: a replacement takes the summed
+`penalty_cap_native` of the slots it displaced, or none if any of them had none (so its
+solver falls back to the flat floor, as in the mart). Under the `inherited` outcome rule a
+replacement of a reverted slot therefore reverts **and** is charged that slot's penalty
+cap — the same orders, the same charge. Unlike the upper cap, the penalty cap does not
+need the batch to land: it is set per order before the auction runs, so a replacement's
+*own* cap could in principle be computed from `competition_auctions.penalty_caps_native`
+over its proposed executions. `loo` does not do that; inheriting keeps both caps and the
+settlement on one slot rule.
+
 Facts that make the estimate cheap, measured on the same window:
 
 - every winning solution has a cap row — 10,301 of 10,301, no NULLs;
 - the 16 late-landed winners have positive caps (their trades happened) but
   `is_settled_in_time = false`, consistent with earning nothing;
-- `lower_reward_cap` and `is_excluded` are auction-level constants riding on every row.
+- `lower_reward_cap` (the flat value) and `is_excluded` are auction-level constants
+  riding on every row;
+- `penalty_cap_native` is NULL on every row of that window (pre-CIP-87). On 2026-10-12 it
+  is NULL on none of 5,443.
 
 One implementation trap: the caps come out of Postgres with ~40 significant digits and
 Python's default `Decimal` context is 28 — per-solver sums silently round and the

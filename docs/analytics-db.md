@@ -69,8 +69,8 @@ Outcomes and ground truth:
 | Table | Notes |
 | --- | --- |
 | `stg_backend_data__reference_scores` | `(auction_id, solver) → reference_score` — winners only |
-| `int_backend_data__solution_data` | **winning solutions only**: `score, reference_score, is_settled_in_time, upper_reward_cap, lower_reward_cap, is_excluded, block_deadline` |
-| `fct_solver_rewards_per_auction` | `competition_score, observed_score, reference_score, uncapped_reward, batch_reward_native, upper_reward_cap` |
+| `int_backend_data__solution_data` | **winning solutions only**: `score, reference_score, is_settled_in_time, upper_reward_cap, lower_reward_cap, penalty_cap_native, is_excluded, block_deadline`. `lower_reward_cap` is the *flat* floor; since CIP-87 the applied one is built in the mart from `penalty_cap_native` (NULL = no cap, 0 = a cap of 0) — [rewards.md](rewards.md#since-2026-09-08-the-lower-cap-is-per-order-cip-87) |
+| `fct_solver_rewards_per_auction` | `competition_score, observed_score, reference_score, uncapped_reward, batch_reward_native, upper_reward_cap, lower_reward_cap` — the last NULL on rows built before it was added (the August 2026 rows) |
 | `pre_stg__orders_per_auction_with_at_least_one_bid` | `(auction_id, block_deadline, order_uid)` — the canonical auction list |
 | `stg_rpc_data__block_timestamp` | `block_number → time` |
 | `dune_data__cow_protocol__solvers` | `address ↔ name`, `active`, `environment` |

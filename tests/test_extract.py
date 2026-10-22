@@ -1,5 +1,5 @@
-"""`load_auctions`, the D17 missing-order policy, the price source, and the
-conversion-rate loader.
+"""`load_auctions`, the D17 missing-order policy, the price source, the
+conversion-rate loader, and the reward-cap loaders.
 
 The DB is faked by monkeypatching `extract.fetch` with canned rows keyed on the module's
 own SQL constants, so the tests exercise exactly the code path the CLI uses.
@@ -320,3 +320,45 @@ class TestConversionRates:
 
         monkeypatch.setattr(extract, "fetch", fake_fetch)
         assert extract.load_conversion_rates(CONN, []) == {}
+
+
+class TestRewardCaps:
+    @pytest.fixture
+    def cap_rows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def row(uid: int, penalty: Decimal | None) -> Row:
+            return {
+                "auction_id": GOOD,
+                "solution_uid": uid,
+                "solver": "cc" * 20,
+                "score": 5,
+                "is_settled_in_time": False,
+                "upper_reward_cap": Decimal(0),
+                "lower_reward_cap": Decimal(-(10**16)),
+                "penalty_cap_native": penalty,
+                "is_excluded": False,
+            }
+
+        def fake_fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
+            assert sql == extract.REWARD_INPUTS_SQL
+            return [row(0, Decimal("28000000000000.5")), row(1, Decimal(0)), row(2, None)]
+
+        monkeypatch.setattr(extract, "fetch", fake_fetch)
+
+    def test_a_missing_penalty_cap_stays_none_and_a_zero_one_stays_zero(
+        self, cap_rows: None
+    ):
+        """NULL means "no cap, use the flat floor"; 0 is a cap that waives the penalty.
+        Collapsing the two is the bug cow-dagster#1058 fixed in the mart."""
+        caps = extract.load_solution_caps(CONN, [GOOD])[GOOD]
+        assert [caps[uid].penalty for uid in (0, 1, 2)] == [
+            Decimal("28000000000000.5"),
+            Decimal(0),
+            None,
+        ]
+        inputs = extract.load_reward_inputs(CONN, [GOOD])[GOOD]
+        assert [win.penalty_cap for win in inputs.wins] == [
+            Decimal("28000000000000.5"),
+            Decimal(0),
+            None,
+        ]
+        assert inputs.lower_cap == -(10**16)

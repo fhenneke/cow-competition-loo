@@ -138,6 +138,12 @@ Both are read-only references here. Do not modify them.
     at ~4% CPU; the same window has measured 2x apart on different days. Quote a range
     and the day it was measured, never one number, and re-measure before planning a
     sweep.
+18. **`int_backend_data__solution_data.lower_reward_cap` is not the floor since
+    2026-09-08.** It still carries the flat −0.01 ETH; the mart floors at the failed
+    solutions' CIP-87 `penalty_cap_native` (median 0.000069 ETH on mainnet 2026-10-12),
+    where NULL means "no cap, use the flat one" and 0 is a real cap. Read both through
+    `rewards.lower_reward_cap`, never the column alone
+    ([rule](docs/rewards.md#since-2026-09-08-the-lower-cap-is-per-order-cip-87)).
 
 ## Environment
 

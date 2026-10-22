@@ -307,35 +307,40 @@ def recorded_caps_by_pair(
     by_uid: Mapping[int, ValuedBid],
     recorded_winner_uids: frozenset[int],
     caps: Mapping[int, SolutionCap],
-) -> dict[Pair, tuple[int, Decimal]]:
-    """Which recorded winner held each token pair, and its upper-cap contribution.
+) -> dict[Pair, tuple[int, SolutionCap]]:
+    """Which recorded winner held each token pair, and its caps.
 
-    The capped-reward estimate reads a replacement's cap off this, the same way the
-    `inherited` outcome rule reads its settlement: the cap is `scaling_factor ×
-    realised fees` and fees follow the orders, so the batch that really traded a
+    The capped-reward estimate reads a replacement's caps off this, the same way the
+    `inherited` outcome rule reads its settlement. Both caps follow the orders: the
+    upper cap is `scaling_factor × realised fees`, so the batch that really traded a
     replacement's pairs is the best available estimate of the fees the replacement
-    would have realised. Self-consistent with settlement inheritance for free: a
-    reverted slot realised no fees, so its cap is 0 exactly where its settlement is a
-    revert."""
-    by_pair: dict[Pair, tuple[int, Decimal]] = {}
+    would have realised, and the CIP-87 penalty cap is a sum over the very orders the
+    slot carried. Self-consistent with settlement inheritance for free: a reverted slot
+    realised no fees, so its upper cap is 0 exactly where its settlement is a revert,
+    and its penalty cap is what that revert is charged."""
+    by_pair: dict[Pair, tuple[int, SolutionCap]] = {}
     for uid in sorted(recorded_winner_uids):
         entry = by_uid.get(uid)
         if entry is None or uid not in caps:
             continue
         for pair in entry.solution.winner_pairs:
-            by_pair[pair] = (uid, caps[uid].upper)
+            by_pair[pair] = (uid, caps[uid])
     return by_pair
 
 
 @dataclass(frozen=True)
 class SideCaps:
-    """Upper-cap contribution per winning solution of one side."""
+    """Upper-cap contribution and penalty cap per winning solution of one side."""
 
     by_uid: dict[int, Decimal | None]
     """`None` marks a replacement with nothing to inherit — its solver's
     `capped_reward` is then `None` rather than a guess."""
+    penalty_by_uid: dict[int, Decimal | None]
+    """The CIP-87 penalty cap, own or inherited like `by_uid`. `None` here is a
+    solution without a cap, not an unknown: a replacement inherits it when any slot it
+    displaced had none, and its solver's floor falls back to the flat one."""
     inherited_solvers: frozenset[str]
-    """Solvers whose cap includes at least one inherited contribution, i.e. whose
+    """Solvers whose caps include at least one inherited contribution, i.e. whose
     capped reward is an estimate rather than a record."""
     double_inherited: int
     """Displaced winners whose cap was inherited by more than one replacement on this
@@ -348,11 +353,13 @@ def winner_caps(
     winners: Iterable[ValuedBid],
     recorded_winner_uids: frozenset[int],
     caps: Mapping[int, SolutionCap],
-    cap_by_pair: Mapping[Pair, tuple[int, Decimal]],
+    cap_by_pair: Mapping[Pair, tuple[int, SolutionCap]],
 ) -> SideCaps:
-    """Assign each winner its upper-cap contribution: its own recorded cap where it
-    won for real, the displaced slot's where it did not (D4's logic applied to fees)."""
+    """Assign each winner its caps: its own recorded ones where it won for real, the
+    displaced slots' summed where it did not (D4's logic applied to fees and
+    penalties)."""
     by_uid: dict[int, Decimal | None] = {}
+    penalty_by_uid: dict[int, Decimal | None] = {}
     inherited: set[str] = set()
     orphans: set[int] = set()
     claimed: dict[int, int] = {}
@@ -361,8 +368,9 @@ def winner_caps(
         uid = entry.bid.uid
         if uid in recorded_winner_uids and uid in caps:
             by_uid[uid] = caps[uid].upper
+            penalty_by_uid[uid] = caps[uid].penalty
             continue
-        displaced: dict[int, Decimal] = {}
+        displaced: dict[int, SolutionCap] = {}
         for pair in entry.solution.winner_pairs:
             found = cap_by_pair.get(pair)
             if found is not None:
@@ -370,19 +378,34 @@ def winner_caps(
                 displaced[displaced_uid] = cap
         if not displaced:
             by_uid[uid] = None
+            penalty_by_uid[uid] = None
             orphans.add(uid)
             continue
-        by_uid[uid] = sum(displaced.values(), Decimal(0))
+        by_uid[uid] = sum((cap.upper for cap in displaced.values()), Decimal(0))
+        penalty_by_uid[uid] = _summed_penalty(displaced.values())
         inherited.add(entry.bid.solver)
         for displaced_uid in displaced:
             claimed[displaced_uid] = claimed.get(displaced_uid, 0) + 1
 
     return SideCaps(
         by_uid=by_uid,
+        penalty_by_uid=penalty_by_uid,
         inherited_solvers=frozenset(inherited),
         double_inherited=sum(1 for count in claimed.values() if count > 1),
         orphans=frozenset(orphans),
     )
+
+
+def _summed_penalty(displaced: Iterable[SolutionCap]) -> Decimal | None:
+    """The penalty cap a replacement inherits from the slots it displaced: their sum,
+    or `None` if any of them had no cap — the mart's "every solution has a cap" test,
+    applied before the sum hides a missing one."""
+    total = Decimal(0)
+    for cap in displaced:
+        if cap.penalty is None:
+            return None
+        total += cap.penalty
+    return total
 
 
 @dataclass(frozen=True)
@@ -1314,9 +1337,9 @@ def analyse_auction(
     cap_double_inherited = 0
     cap_orphans: frozenset[int] = frozenset()
     if mode == "score":
-        # The caps come from the record regardless of the outcome rule: own cap for a
+        # The caps come from the record regardless of the outcome rule: own caps for a
         # recorded winner, the displaced slot's for a replacement. Auction-level cap
-        # facts (lower cap, exclusion) ride on every recorded winner's row.
+        # facts (the flat lower cap, exclusion) ride on every recorded winner's row.
         caps: Mapping[int, SolutionCap] = solution_caps if solution_caps else {}
         any_cap = next(iter(caps.values()), None)
         lower_cap = any_cap.lower if any_cap else None
@@ -1341,6 +1364,7 @@ def analyse_auction(
                     s.total,
                     base.solution_executed[s.solution_uid],
                     base_caps.by_uid[s.solution_uid],
+                    base_caps.penalty_by_uid[s.solution_uid],
                 )
                 for s in baseline.winners
             ],
@@ -1356,6 +1380,7 @@ def analyse_auction(
                     s.total,
                     loo_side.solution_executed[s.solution_uid],
                     loo_caps.by_uid[s.solution_uid],
+                    loo_caps.penalty_by_uid[s.solution_uid],
                 )
                 for s in loo.winners
             ],
@@ -1517,9 +1542,11 @@ class Analysis:
     negative_reward_sum_base: int = 0
     negative_reward_sum_loo: int = 0
     """(count, native sum) of negative uncapped rewards on each side. The real payout
-    clamps these at `lower_reward_cap` (-0.01 ETH on mainnet), and the uncapped penalty
-    for a failed settlement is `-reference_score` — orders of magnitude larger. Reported
-    so the cost of stopping at uncapped rewards stays visible."""
+    clamps these at `lower_reward_cap` — the flat -0.01 ETH on mainnet before CIP-87
+    (2026-09-08), the failed solutions' summed per-order penalty caps since, typically
+    far smaller — and the uncapped penalty for a failed settlement is
+    `-reference_score`, orders of magnitude larger. Reported so the cost of stopping at
+    uncapped rewards stays visible."""
 
     capped_estimate: bool = False
     """Did the caller supply recorded caps? Set by the CLI in score mode. The capped

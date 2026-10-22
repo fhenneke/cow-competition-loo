@@ -19,15 +19,18 @@ reference_score)` — the marginal value s added to the auction. When it does no
 
 **Uncapped is the exact quantity; capped is an estimate.** The real payout is
 `0 if the auction is excluded else clamp(uncapped, lower_reward_cap, Σ upper_reward_cap)`.
-The lower cap is a per-chain constant and the upper cap is `scaling_factor × realised
-protocol fees` of each winning solution — realised, so a batch that never settled has an
-upper cap of 0, and a *counterfactual* winner that never won has no cap of its own at
-all — see docs/rewards.md#why-the-cap-is-hard-counterfactually. The counterfactual
-therefore hands a replacement the cap of the recorded winner(s) whose slot it took
-(D4's logic again, and self-consistent with it: a reverted slot has no fees, so its
-inherited cap is 0 exactly where its inherited settlement is a revert). `Win.upper_cap
-= None` marks a winner whose cap could not even be estimated; the whole solver's
-`capped_reward` is then `None` rather than a guess.
+The upper cap is `scaling_factor × realised protocol fees` of each winning solution —
+realised, so a batch that never settled has an upper cap of 0, and a *counterfactual*
+winner that never won has no cap of its own at all — see
+docs/rewards.md#why-the-cap-is-hard-counterfactually. The lower cap is, since CIP-87
+(2026-09-08), minus the summed per-order penalty caps of the solver's solutions that
+missed the deadline, and before that a per-chain constant (`lower_reward_cap` below).
+The counterfactual therefore hands a replacement both caps of the recorded winner(s)
+whose slot it took (D4's logic again, and self-consistent with it: a reverted slot has
+no fees, so its inherited upper cap is 0 exactly where its inherited settlement is a
+revert, and its penalty cap is what that revert costs). `Win.upper_cap = None` marks a
+winner whose cap could not even be estimated; the whole solver's `capped_reward` is
+then `None` rather than a guess.
 
 Measured over 2026-08-01..04, the caps are not a refinement: 9,809 reward rows sum to
 −410 ETH uncapped and 0.75 ETH capped, with 54% of rows clamped at the upper cap. An
@@ -73,6 +76,11 @@ class Win(NamedTuple):
     value for a recorded winner, the displaced slot's value for a replacement, and
     `None` when there was nothing to inherit — which poisons the solver's
     `capped_reward` to `None` rather than fabricating a cap."""
+    penalty_cap: Decimal | None = None
+    """This solution's CIP-87 penalty cap, sourced like `upper_cap`. `None` means the
+    solution has no cap — the record before 2026-09-08 — and is not an unknown: it
+    sends the solver's floor back to the flat one, as the mart does
+    (`lower_reward_cap`)."""
 
 
 @dataclass(frozen=True)
@@ -87,12 +95,42 @@ class SolverReward:
     upper_cap: Decimal | None = None
     """Σ of the solver's winning solutions' cap contributions; `None` when any of
     them was unknowable, or when no caps were supplied at all."""
+    lower_cap: Decimal | None = None
+    """The floor the clamp applied — `lower_reward_cap` of the solver's wins. `None`
+    when no caps were supplied, and on the mart's side for rows built before the mart
+    recorded its floor (the August 2026 rows)."""
     capped_reward: Decimal | None = None
-    """`0` if the auction is excluded, else `clamp(uncapped, lower, upper_cap)`.
+    """`0` if the auction is excluded, else `clamp(uncapped, lower_cap, upper_cap)`.
     Exact for recorded winners, an estimate wherever `cap_inherited`."""
     cap_inherited: bool = False
-    """True when any of the caps behind `upper_cap` came from a displaced slot rather
-    than this solution's own record — i.e. `capped_reward` is an estimate."""
+    """True when any of the caps behind `upper_cap` and `lower_cap` came from a
+    displaced slot rather than this solution's own record — i.e. `capped_reward` is an
+    estimate."""
+
+
+def lower_reward_cap(wins: Iterable[Win], flat: int) -> Decimal:
+    """One solver's reward floor in one auction, from its winning solutions, the way
+    `fct_solver_rewards_per_auction` computes it:
+
+    - `0` when `flat` is 0, i.e. inside a no-penalties window;
+    - `−Σ penalty_cap` over the solutions that did not settle in time, when **every**
+      solution of the solver has a cap (a cap of 0 is a real cap) — so a solver whose
+      wins all settled has a floor of 0, which its non-negative reward never reaches;
+    - the flat per-chain floor otherwise, which is every auction before CIP-87
+      (2026-09-08), when no solution has a cap.
+
+    `flat` is the auction's `lower_reward_cap` from `int_backend_data__solution_data`,
+    which still carries the flat value (or 0) and not the CIP-87 one.
+    """
+    if flat == 0:
+        return Decimal(0)
+    floor = Decimal(0)
+    for win in wins:
+        if win.penalty_cap is None:
+            return Decimal(flat)
+        if not win.settled:
+            floor -= win.penalty_cap
+    return floor
 
 
 def uncapped_rewards(
@@ -111,17 +149,20 @@ def uncapped_rewards(
     recomputed side by `compute_reference_outcomes`, which produces one entry per
     winning solver.
 
-    The capped side is computed only when `lower_cap` is given: each solver's upper
-    cap is the sum of its wins' `upper_cap` contributions (`None` if any contribution
-    is `None`), and `caps_inherited` names the solvers whose caps are estimates.
+    The capped side is computed only when `lower_cap` — the auction's flat floor — is
+    given: each solver's upper cap is the sum of its wins' `upper_cap` contributions
+    (`None` if any contribution is `None`), its floor is `lower_reward_cap` of its
+    wins, and `caps_inherited` names the solvers whose caps are estimates.
     """
     wins = list(wins)
     winning_score = sum(win.score for win in wins)
 
+    by_solver: dict[str, list[Win]] = {}
     competition: dict[str, int] = {}
     observed: dict[str, int] = {}
     upper: dict[str, Decimal | None] = {}
     for win in wins:
+        by_solver.setdefault(win.solver, []).append(win)
         competition[win.solver] = competition.get(win.solver, 0) + win.score
         observed[win.solver] = observed.get(win.solver, 0) + (
             win.score if win.settled else 0
@@ -150,9 +191,14 @@ def uncapped_rewards(
         )
 
         upper_cap = upper[solver] if lower_cap is not None else None
+        floor = (
+            lower_reward_cap(by_solver[solver], lower_cap)
+            if lower_cap is not None
+            else None
+        )
         capped: Decimal | None = None
-        if lower_cap is not None and upper_cap is not None:
-            clamped = min(max(Decimal(uncapped), Decimal(lower_cap)), upper_cap)
+        if floor is not None and upper_cap is not None:
+            clamped = min(max(Decimal(uncapped), floor), upper_cap)
             capped = Decimal(0) if excluded else clamped
 
         rewards[solver] = SolverReward(
@@ -162,6 +208,7 @@ def uncapped_rewards(
             reference_score=reference_score,
             uncapped_reward=uncapped,
             upper_cap=upper_cap,
+            lower_cap=floor,
             capped_reward=capped,
             cap_inherited=solver in caps_inherited,
         )
@@ -185,18 +232,33 @@ class RewardMismatch:
         "reference_score",
         "uncapped_reward",
         "upper_cap",
+        "lower_cap",
         "capped_reward",
     )
 
     @property
     def differing_fields(self) -> tuple[str, ...]:
-        if self.ours is None or self.theirs is None:
-            return ("missing",)
-        return tuple(
-            name
-            for name in self.COMPARED_FIELDS
-            if getattr(self.ours, name) != getattr(self.theirs, name)
-        )
+        return differing_fields(self.ours, self.theirs)
+
+
+def differing_fields(
+    ours: SolverReward | None, theirs: SolverReward | None
+) -> tuple[str, ...]:
+    """The `RewardMismatch.COMPARED_FIELDS` on which our row and the mart's disagree;
+    empty when they match.
+
+    A mart row with no `lower_cap` has no floor on record to compare — the column was
+    appended after the August 2026 rows were built — so the floor is then checked only
+    through `capped_reward`, which is how it was checked before the mart recorded it.
+    """
+    if ours is None or theirs is None:
+        return ("missing",)
+    return tuple(
+        name
+        for name in RewardMismatch.COMPARED_FIELDS
+        if getattr(ours, name) != getattr(theirs, name)
+        and not (name == "lower_cap" and theirs.lower_cap is None)
+    )
 
 
 @dataclass
@@ -237,7 +299,7 @@ class RewardValidation:
         for solver in sorted(set(ours) | set(theirs)):
             self.rows += 1
             mine, its = ours.get(solver), theirs.get(solver)
-            if mine == its:
+            if not differing_fields(mine, its):
                 self.rows_matched += 1
             else:
                 self.mismatches.append(

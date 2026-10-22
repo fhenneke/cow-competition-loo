@@ -343,9 +343,15 @@ where auction_id = any(%(ids)s)
 # by `loo validate-rewards`, which recomputes both rewards from these and compares
 # against the mart —
 # so the only thing in the comparison's path is the formula transcription itself.
+#
+# `lower_reward_cap` here is still the flat per-chain floor (or 0 in a no-penalties
+# window); since CIP-87 the mart floors at the solver's `penalty_cap_native` instead
+# whenever every one of its solutions has one, so both are read and the rule lives in
+# `rewards.lower_reward_cap` (docs/rewards.md#the-caps).
 REWARD_INPUTS_SQL = """
 select auction_id, solution_uid, encode(solver, 'hex') as solver, score,
-       is_settled_in_time, upper_reward_cap, lower_reward_cap, is_excluded
+       is_settled_in_time, upper_reward_cap, lower_reward_cap, penalty_cap_native,
+       is_excluded
 from dbt.int_backend_data__solution_data
 where auction_id = any(%(ids)s)
 """
@@ -353,7 +359,7 @@ where auction_id = any(%(ids)s)
 FCT_REWARDS_SQL = """
 select auction_id, encode(solver, 'hex') as solver,
        competition_score, observed_score, reference_score, uncapped_reward,
-       upper_reward_cap, batch_reward_native
+       upper_reward_cap, lower_reward_cap, batch_reward_native
 from dbt.fct_solver_rewards_per_auction
 where auction_id = any(%(ids)s)
 """
@@ -801,12 +807,19 @@ class SolutionCap:
     `upper` is that solution's contribution to its solver's upper reward cap —
     `scaling_factor × realised protocol fees`, so genuinely fractional (`Decimal`) and
     **0 for a batch that never settled**, since unrealised fees are no fees. `lower`
-    and `excluded` are auction-level facts that ride along on every row.
+    (the flat floor) and `excluded` are auction-level facts that ride along on every
+    row.
     """
 
     upper: Decimal
     lower: int
     excluded: bool
+    penalty: Decimal | None = None
+    """The solution's CIP-87 penalty cap: the sum of its orders' caps, each scaled to
+    the executed fraction of a partially fillable order. Unlike `upper` it does not
+    depend on the batch landing — it is set from the auction's order list. `None` when
+    the solution has none, which is every solution before 2026-09-08; the solver's
+    floor is then the flat `lower` (`rewards.lower_reward_cap`)."""
 
 
 @dataclass(frozen=True)
@@ -830,7 +843,7 @@ def load_reward_inputs(
     conn: Connection, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
 ) -> dict[int, RewardInputs]:
     """The reward formula's inputs per auction — each winning solution's solver, score,
-    settled-in-time flag and cap — from the same model the dbt rewards mart reads."""
+    settled-in-time flag and caps — from the same model the dbt rewards mart reads."""
     rows_by_auction: dict[int, list[Row]] = {}
     for row in _reward_input_rows(conn, auction_ids, chunk_size):
         rows_by_auction.setdefault(row["auction_id"], []).append(row)
@@ -853,6 +866,7 @@ def load_reward_inputs(
                     score=as_int(r["score"]),
                     settled=bool(r["is_settled_in_time"]),
                     upper_cap=Decimal(r["upper_reward_cap"]),
+                    penalty_cap=_optional_decimal(r["penalty_cap_native"]),
                 )
                 for r in rows
             ),
@@ -876,8 +890,15 @@ def load_solution_caps(
             upper=Decimal(row["upper_reward_cap"]),
             lower=as_int(row["lower_reward_cap"]),
             excluded=bool(row["is_excluded"]),
+            penalty=_optional_decimal(row["penalty_cap_native"]),
         )
     return caps
+
+
+def _optional_decimal(value: Decimal | None) -> Decimal | None:
+    """A nullable `numeric` column as `Decimal`, keeping NULL `None` — for the caps,
+    where a missing value means "no cap" and must not read as a cap of 0."""
+    return None if value is None else Decimal(value)
 
 
 def load_reference_scores(
@@ -908,6 +929,7 @@ def load_fct_rewards(
                 reference_score=as_int(row["reference_score"]),
                 uncapped_reward=as_int(row["uncapped_reward"]),
                 upper_cap=Decimal(row["upper_reward_cap"]),
+                lower_cap=_optional_decimal(row["lower_reward_cap"]),
                 capped_reward=Decimal(row["batch_reward_native"]),
             )
     return rewards

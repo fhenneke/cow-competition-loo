@@ -259,12 +259,14 @@ In score mode `analyse` reports solver rewards on both sides, twice:
 - **Uncapped** — the mechanism's exact accounting. The removed solver's own reward
   drops out, and rivals' rewards grow because their reference scores fall without it.
   Not a payout: a failed settlement's uncapped penalty is `-reference_score` against a
-  real floor of −0.01 ETH, and over the 2026-08-01..04 window uncapped rewards sum to −410 ETH
-  against 0.75 ETH actually paid.
+  real floor of −0.01 ETH before 2026-09-08 and the failed orders' CIP-87 penalty caps
+  since — a median 0.000069 ETH per failed solution on mainnet 2026-10-12. Over the
+  2026-08-01..04 window uncapped rewards sum to −410 ETH against 0.75 ETH actually paid.
 - **Capped (estimate)** — the payout-scale answer, clamping each reward into the
-  recorded caps. A replacement winner inherits the `upper_reward_cap` of the recorded
-  winner whose token pairs it claims — realised fees follow the orders, and a reverted
-  slot's cap is 0 exactly where its settlement is a revert
+  recorded caps. A replacement winner inherits the `upper_reward_cap` and the CIP-87
+  penalty cap of the recorded winner whose token pairs it claims — realised fees and
+  penalised orders follow the pairs, and a reverted slot's upper cap is 0 exactly where
+  its settlement is a revert
   ([details](docs/rewards.md#the-slot-inheritance-estimate-and-why-the-caps-cannot-be-skipped)).
   A winner with nothing to inherit drops its auction from the capped aggregate rather
   than being guessed at; the report counts those.

@@ -19,6 +19,7 @@ from loo.rewards import (
     RewardValidation,
     SolverReward,
     Win,
+    lower_reward_cap,
     uncapped_rewards,
 )
 from loo.valuation import Order
@@ -190,6 +191,73 @@ class TestCappedRewards:
     def test_without_a_lower_cap_the_capped_side_stays_off(self):
         rewards = uncapped_rewards([Win("a", 100, True, upper_cap=Decimal(10))], {"a": 60})
         assert rewards["a"].capped_reward is None
+        assert rewards["a"].lower_cap is None
+
+
+class TestPenaltyCaps:
+    """The CIP-87 floor, as `fct_solver_rewards_per_auction` computes it since
+    2026-09-08: minus the penalty caps of the solver's failed solutions when all of its
+    solutions have one, the flat floor when any has none, 0 in a no-penalties window."""
+
+    def test_a_penalty_cap_replaces_the_flat_floor(self):
+        rewards = uncapped_rewards(
+            [Win("a", 100, False, upper_cap=Decimal(0), penalty_cap=Decimal("0.3"))],
+            {"a": 60},
+            lower_cap=-5,
+        )
+        assert rewards["a"].uncapped_reward == -60
+        assert rewards["a"].lower_cap == Decimal("-0.3")
+        assert rewards["a"].capped_reward == Decimal("-0.3")
+
+    def test_only_the_solutions_that_failed_are_charged(self):
+        wins = [
+            Win("a", 100, True, upper_cap=Decimal(10), penalty_cap=Decimal(2)),
+            Win("a", 50, False, upper_cap=Decimal(0), penalty_cap=Decimal(3)),
+        ]
+        assert lower_reward_cap(wins, -5) == Decimal(-3)
+
+    def test_a_solver_whose_wins_all_settled_has_a_floor_of_zero(self):
+        wins = [Win("a", 100, True, upper_cap=Decimal(10), penalty_cap=Decimal(2))]
+        assert lower_reward_cap(wins, -5) == Decimal(0)
+
+    def test_a_zero_cap_is_a_cap_not_a_missing_one(self):
+        """The bug cow-dagster#1058 fixed: a supplied cap of 0 floors at 0, it does
+        not fall back to the flat penalty."""
+        wins = [Win("a", 100, False, upper_cap=Decimal(0), penalty_cap=Decimal(0))]
+        assert lower_reward_cap(wins, -5) == Decimal(0)
+
+    def test_one_win_without_a_cap_sends_the_solver_to_the_flat_floor(self):
+        wins = [
+            Win("a", 100, False, upper_cap=Decimal(0), penalty_cap=Decimal(2)),
+            Win("a", 50, False, upper_cap=Decimal(0), penalty_cap=None),
+        ]
+        assert lower_reward_cap(wins, -5) == Decimal(-5)
+
+    def test_without_any_caps_the_floor_is_the_flat_one(self):
+        """Every auction before 2026-09-08: the pre-CIP-87 behaviour, unchanged."""
+        rewards = uncapped_rewards(
+            [Win("a", 100, False, upper_cap=Decimal(0))], {"a": 60}, lower_cap=-5
+        )
+        assert rewards["a"].lower_cap == Decimal(-5)
+        assert rewards["a"].capped_reward == Decimal(-5)
+
+    def test_a_no_penalties_window_floors_at_zero_whatever_the_caps(self):
+        wins = [Win("a", 100, False, upper_cap=Decimal(0), penalty_cap=Decimal(2))]
+        assert lower_reward_cap(wins, 0) == Decimal(0)
+
+    def test_the_floor_is_per_solver(self):
+        """One solver's missing cap does not move another solver's floor — the mart
+        groups by solver before testing for caps."""
+        rewards = uncapped_rewards(
+            [
+                Win("a", 100, False, upper_cap=Decimal(0), penalty_cap=Decimal(2)),
+                Win("b", 50, False, upper_cap=Decimal(0), penalty_cap=None),
+            ],
+            {"a": 60, "b": 60},
+            lower_cap=-5,
+        )
+        assert rewards["a"].lower_cap == Decimal(-2)
+        assert rewards["b"].lower_cap == Decimal(-5)
 
 
 class TestRewardValidation:
@@ -237,6 +305,35 @@ class TestRewardValidation:
         validation = RewardValidation()
         validation.check_auction(1, {}, {})
         assert (validation.auctions, validation.auctions_with_winners) == (1, 0)
+        assert validation.gate_met
+
+    def capped(self, lower_cap: Decimal | None) -> SolverReward:
+        return SolverReward(
+            solver="a",
+            competition_score=100,
+            observed_score=0,
+            reference_score=60,
+            uncapped_reward=-60,
+            upper_cap=Decimal(0),
+            lower_cap=lower_cap,
+            capped_reward=Decimal(-2),
+        )
+
+    def test_a_differing_floor_is_a_mismatch(self):
+        validation = RewardValidation()
+        validation.check_auction(
+            1, {"a": self.capped(Decimal(-2))}, {"a": self.capped(Decimal(-3))}
+        )
+        (mismatch,) = validation.mismatches
+        assert mismatch.differing_fields == ("lower_cap",)
+
+    def test_a_mart_row_without_a_recorded_floor_is_compared_on_the_rest(self):
+        """The mart's `lower_reward_cap` is NULL on rows built before it was added (the
+        August 2026 rows): nothing to compare, so the floor is checked through
+        `capped_reward` alone, as before."""
+        validation = RewardValidation()
+        validation.check_auction(1, {"a": self.capped(Decimal(-2))}, {"a": self.capped(None)})
+        assert (validation.rows, validation.rows_matched) == (1, 1)
         assert validation.gate_met
 
 
@@ -416,6 +513,45 @@ class TestCapInheritance:
         assert result.loo_rewards["b"].cap_inherited
         assert result.delta_rewards_capped == Decimal(0)
         assert result.cap_double_inherited == 0 and not result.cap_orphans_loo
+
+    def failed_slot(self, penalty: Decimal | None):
+        """x won and reverted; without x, b takes its slot and c's bid sets b's
+        reference score, so b's inherited revert costs it a real penalty."""
+        return analyse_auction(
+            bundle(
+                [
+                    bid(0, "x", 200, [sell_order("o1", executed_buy=2200)], is_winner=True),
+                    bid(1, "b", 150, [sell_order("o1")]),
+                    bid(2, "c", 100, [sell_order("o1")]),
+                ]
+            ),
+            WETH,
+            frozenset({"x"}),
+            settled={0: NOT_SETTLED},
+            solution_caps={
+                0: SolutionCap(upper=Decimal(0), lower=-5, excluded=False, penalty=penalty)
+            },
+        )
+
+    def test_a_replacement_inherits_the_failed_slots_penalty_cap(self):
+        """The CIP-87 cap follows the slot like the upper cap: x's revert is charged
+        its own penalty cap, and b, inheriting the revert, is charged the same cap
+        rather than the flat floor."""
+        result = self.failed_slot(Decimal(2))
+        assert result.baseline_rewards["x"].uncapped_reward == -150
+        assert result.baseline_rewards["x"].lower_cap == Decimal(-2)
+        assert result.baseline_rewards["x"].capped_reward == Decimal(-2)
+        assert result.loo_rewards["b"].uncapped_reward == -100
+        assert result.loo_rewards["b"].lower_cap == Decimal(-2)
+        assert result.loo_rewards["b"].capped_reward == Decimal(-2)
+        assert result.loo_rewards["b"].cap_inherited
+        assert result.delta_rewards_capped == Decimal(0)
+
+    def test_a_slot_without_a_penalty_cap_passes_on_the_flat_floor(self):
+        result = self.failed_slot(None)
+        assert result.baseline_rewards["x"].capped_reward == Decimal(-5)
+        assert result.loo_rewards["b"].lower_cap == Decimal(-5)
+        assert result.loo_rewards["b"].capped_reward == Decimal(-5)
 
     def test_a_winner_with_nothing_to_inherit_drops_the_capped_estimate(self):
         """b wins a pair no recorded winner held, so its cap cannot be estimated and
