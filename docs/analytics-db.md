@@ -100,7 +100,8 @@ Auction context:
 | `stg_backend_data__competition_auctions` | `order_uids` (array — auction membership), `surplus_capturing_jit_order_owners`, `block_number`, `block_deadline` |
 | `stg_backend_data__competition_auctions` `price_tokens`, `price_values` | parallel arrays: the auction's native prices. **NULL before 2026-09-15** ([source rules](#native-prices-price-arrays-and-the-legacy-table)) |
 | `stg_backend_data__auction_prices` | `(auction_id, token) → price` — **deprecated**, frozen 2026-09-21 ~10:00 UTC, but the only copy of prices before 2026-09-15 |
-| `stg_backend_data__orders` | `uid, kind` (buy/sell), `sell_amount`, `buy_amount`, `partially_fillable`, `owner`, `class` |
+| `stg_backend_data__orders` | `uid, owner, kind` (buy/sell), `sell_token, buy_token, sell_amount, buy_amount`, `partially_fillable`, `app_data`, `signing_scheme`, `creation_timestamp, valid_to`. **No order class column** — market vs limit is not stored here |
+| `stg_backend_data__app_data` | `contract_app_data → app_code, partner_fee_recipients`, joined on `orders.app_data` ([who placed an order](#who-placed-an-order-app-code-owner-token-symbols)) |
 | `stg_backend_data__jit_orders` | same shape for JIT orders |
 | `stg_backend_data__fee_policies` | `(auction_id, order_uid, application_order) → kind, factors` |
 
@@ -759,6 +760,26 @@ The lesson generalises the one above: on this DB a CTE-bounded join is as blind 
 planner as an unindexed table, so give any query that touches a large staging table an
 explicit `auction_id` predicate — a range or an array of ids — and check with `explain`
 that no `Seq Scan on stg_backend_data__…` appears.
+
+## Who placed an order: app code, owner, token symbols
+
+Reading a coverage count ("orders only this solver executed") needs to know what the
+orders were. Three sources, none of them a token table:
+
+- **App code**: `stg_backend_data__app_data.app_code`, joined
+  `orders.app_data = app_data.contract_app_data` — `CoW Swap`, `Trust wallet`,
+  `aave-v3-interface-collateral-swap`, `Jumper CoW` and so on.
+- **The protocol's own orders.** Orders owned by the settlement contract (`9008d19f…`),
+  app code `CoWFeeModule`, presigned and partially fillable, convert fees the protocol
+  collected. They are tiny and they count as coverage like any user order: 84 of the
+  132 orders only Gnosis_0x executed on avalanche over 2026-10-01..29 were these, carrying
+  9% of those orders' surplus. Ethflow orders are owned by `ba3cb449…`
+  ([quotes.md](quotes.md)).
+- **Token symbols are not in this database.** Use ClickHouse
+  `raw_quotes.quote_requested.sell_token_symbol` / `buy_token_symbol` (the backend's own
+  token-info cache, one symbol per address), filtered by `chain_id` and a day-bounded
+  `event_timestamp` so the partitions prune. There is no source for decimals; value
+  amounts through the auction's native prices instead.
 
 ## Reading the dbt model source
 

@@ -394,6 +394,38 @@ orders.
 This is why a leave-one-out run finds orders that execute *only when a solver is removed* —
 14 of them over three days for Fractal — and those are a real coverage effect, not a defect.
 
+### An unexecuted order is lost for its auction only
+
+The counterfactual is per auction. An order the removed solver filled and nobody else
+would have filled counts as **not executed, with its whole surplus lost** — and nothing
+models it being filled by someone else one auction later, because in the record the order
+left the book when the removed solver filled it. Two consequences for reading a coverage
+figure:
+
+- The lost surplus is measured against the user's **limit price**, so for a market order
+  it is roughly the slippage tolerance the user set (50 bps, 4.8% on two of Gnosis_0x's
+  largest such orders on ink, October 2026). It says the user would have had no fill in
+  that auction, not that they would have traded at a worse price.
+- Whether a later fill was plausible can be bounded from the record: did another solver
+  ever bid on the same order in the window, and did other solvers win the same sell/buy
+  pair? For Gnosis_0x over 2026-10-01..29, no other solver bid at any point on 43 of 48 such
+  orders on ink, 119 of 132 on avalanche and 159 of 177 on polygon. But 56%, 94% and 99% of
+  their surplus was on pairs other solvers did win in the window. Both queries join
+  `proposed_trade_executions` to `proposed_solutions` and need the
+  [auction-id bound](analytics-db.md#bound-joins-against-proposed_solutions-to-the-windows-auction-id-range).
+
+**Under `inherited`, a solver's own failed settlement can be credited to it.** Polygon,
+October 2026:
+1. Gnosis_0x won order `9efd830a…` in auction 40811267 and did not settle it. Wraxyn had
+   bid within 0.2% in the same auction.
+2. Gnosis_0x then filled the order alone in auction 40811270.
+3. Removing Gnosis_0x, Wraxyn wins the first auction and inherits the slot's revert. The
+   second auction has no other bidder, so the order is lost in both.
+
+That one order was 66% of Gnosis_0x's polygon Δsurplus. The rule is doing what it says —
+the slot reverted — but a removed solver's largest coverage auction is worth checking
+for a failed win of the same order just before it.
+
 ### A JIT leg can block another solution's execution — and the filter never sees it
 
 The two asymmetries above combine into a mechanism-level quirk. A non-contributing JIT

@@ -24,6 +24,9 @@ from typing import Any
 from loo import aggregate, db, extract
 from loo.primitives import ONE_ETH
 
+# The unit every native amount on the page is printed in. Same networks as
+# `primitives.WRAPPED_NATIVE_TOKEN`, whose verified wrappers name the native token; a
+# network missing here is refused by `native_symbol` rather than printed as "native".
 NATIVE_SYMBOL = {
     "mainnet": "ETH",
     "bnb": "BNB",
@@ -32,7 +35,27 @@ NATIVE_SYMBOL = {
     "arbitrum-one": "ETH",
     "avalanche": "AVAX",
     "polygon": "POL",
+    "ink": "ETH",
+    "linea": "ETH",
+    "plasma": "XPL",
+    "sepolia": "ETH",
 }
+
+
+def native_symbol(network: str) -> str:
+    """The native token's symbol, or a build failure naming the network.
+
+    A missing entry used to fall through to the literal "native", which renders as a
+    plausible page whose amounts carry no unit — the same silent fall-through
+    `usd_contexts` refuses for rates.
+    """
+    try:
+        return NATIVE_SYMBOL[network]
+    except KeyError:
+        raise SystemExit(
+            f"no native symbol for {network}; add it to NATIVE_SYMBOL in "
+            f"scripts/artifact_data.py"
+        ) from None
 
 
 def usd_contexts(
@@ -142,7 +165,9 @@ def row(
     quote = report.quote
     return {
         "chain": report.network,
-        "sym": NATIVE_SYMBOL.get(report.network, "native"),
+        "sym": native_symbol(report.network),
+        # USD per native *atom* (per wei), so it multiplies the wei-denominated volumes
+        # below directly; times 1e18 it is the USD price of one native token.
         "rate": float(context.fallback / ONE_ETH) if context else 0.0,
         # --- the focus four
         "usd_s": _usd_per_auction(moved, context),
