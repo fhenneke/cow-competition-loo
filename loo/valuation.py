@@ -172,34 +172,32 @@ class SolutionValuation:
     """Surplus decomposition of one solution."""
 
     pair_surplus: dict[Pair, int]
-    """Native surplus per **raw** directed token pair, contributing orders only."""
+    """Native surplus per **raw** directed token pair."""
     order_surplus_native: dict[str, int]
-    """Native surplus per contributing order."""
-    order_surplus_atoms: dict[str, int]
-    """Surplus-token surplus per contributing order, for cross-checking against the DB."""
+    """Native surplus per order."""
     winner_pairs: frozenset[Pair]
-    """`as_erc20`-normalised pairs over **all** orders — what `pick_winners` claims."""
+    """`as_erc20`-normalised pairs of the same orders — what `pick_winners` claims."""
     order_uids: frozenset[str]
     order_volume_native: dict[str, int] = field(default_factory=dict[str, int])
-    """Native value of each contributing order's received leg — the denominator for
+    """Native value of each order's received leg — the denominator for
     relative price statements. Same keys as `order_surplus_native`."""
     order_fee_native: dict[str, int] = field(default_factory=dict[str, int])
-    """Native protocol fee per contributing order, **including** partner fees — the
+    """Native protocol fee per order, **including** partner fees — the
     quantity `arbitrator.rs` adds to surplus to reach the score. Absent for orders whose
     policies are not recorded for this auction; those uids are in `fees_unknown`."""
     order_partner_fee_native: dict[str, int] = field(default_factory=dict[str, int])
     """The partners' share of `order_fee_native`. What the DAO keeps is the difference,
     which is non-negative because the native conversion is monotone."""
     pair_fee_native: dict[Pair, int] = field(default_factory=dict[Pair, int])
-    """Native protocol fee per **raw** directed token pair, over the contributing orders
+    """Native protocol fee per **raw** directed token pair, over the orders
     whose fee could be computed. `pair_surplus + pair_fee_native` is the pair's score —
     on the pairs not in `pairs_fees_unknown`."""
     pairs_fees_unknown: frozenset[Pair] = frozenset()
-    """Pairs carrying at least one contributing order with an unrecorded fee, so
+    """Pairs carrying at least one order with an unrecorded fee, so
     `pair_fee_native` is short for them by an unknown amount. Derived from
     `fees_unknown`; kept separately because the filter works per pair, not per order."""
     fees_unknown: frozenset[str] = frozenset()
-    """Contributing orders whose fee could not be computed — their policies are not
+    """Orders whose fee could not be computed — their policies are not
     recorded for this auction. Every order of a solution the arbitrator *kept* is
     recorded, so this is only ever non-empty for solutions that were filtered out."""
 
@@ -217,33 +215,26 @@ class SolutionValuation:
         return sum(self.order_partner_fee_native.values())
 
     @property
-    def protocol_fee_native_net(self) -> int:
-        """What the protocol itself keeps."""
-        return self.fee_native - self.partner_fee_native
-
-    @property
     def fees_complete(self) -> bool:
         return not self.fees_unknown
 
 
 def value_solution(
     orders: Iterable[Order],
-    contributes: dict[str, bool],
     native_prices: dict[str, int],
     weth: str,
     fee_context: FeeContext = EMPTY_FEE_CONTEXT,
 ) -> SolutionValuation:
     """Value one solution (`score_by_token_pair`, `arbitrator.rs:176`).
 
-    Orders that do not contribute to score are skipped for valuation but still claim
-    their token pair in `winner_pairs` — `pick_winners` iterates every order in the
-    solution, not just the contributing ones.
+    `orders` are the auction's orders the solution trades. JIT orders never reach here
+    (`extract.EXECUTIONS_SQL`): the mechanism gives them no score and no pair claim.
 
     `fee_context` is optional: with the default every fee reads as unrecorded, and the
     valuation is the surplus-only one this module has always produced. Passing a real
     one adds the protocol-fee decomposition without changing any surplus number.
 
-    Raises `ValuationError` if any contributing order cannot be valued; the caller must
+    Raises `ValuationError` if any order cannot be valued; the caller must
     then discard the entire solution. A fee that cannot be computed is **not** such a
     failure — `arbitrator.rs` would have discarded the solution, but here the total comes
     from the recorded score either way, so the order is recorded in `fees_unknown` and
@@ -251,7 +242,6 @@ def value_solution(
     """
     pair_surplus: dict[Pair, int] = {}
     native: dict[str, int] = {}
-    atoms: dict[str, int] = {}
     volumes: dict[str, int] = {}
     fee_native: dict[str, int] = {}
     partner_fee_native: dict[str, int] = {}
@@ -267,13 +257,9 @@ def value_solution(
             (as_erc20(order.sell_token, weth), as_erc20(order.buy_token, weth))
         )
 
-        if not contributes.get(order.uid, False):
-            continue
-
         surplus_atoms = order_surplus(order)
         surplus_native = to_native(order, surplus_atoms, native_prices)
 
-        atoms[order.uid] = surplus_atoms
         native[order.uid] = surplus_native
         volumes[order.uid] = order_volume_native(order, native_prices)
         pair = (order.sell_token, order.buy_token)
@@ -308,7 +294,6 @@ def value_solution(
     return SolutionValuation(
         pair_surplus=pair_surplus,
         order_surplus_native=native,
-        order_surplus_atoms=atoms,
         winner_pairs=frozenset(winner_pairs),
         order_uids=frozenset(uids),
         order_volume_native=volumes,
@@ -370,7 +355,7 @@ def pair_score_split(valuation: SolutionValuation, db_score: int) -> PairScores:
     pairs = valuation.pair_surplus
     if len(pairs) <= 1:
         # Cheap, but not free: a single pair whose surplus already exceeds the recorded
-        # score means our contributing-order set disagrees with the autopilot's, and this
+        # score means our order set disagrees with the autopilot's, and this
         # is the one branch with an invariant to check rather than an arithmetic one.
         if any(surplus > db_score for surplus in pairs.values()):
             return PairScores({}, anchor_failed=True)
@@ -439,8 +424,8 @@ def build_solutions(
     """Value every bid in an auction, in `bid` order.
 
     Returns the valued bids and the per-uid valuation failures. A bid whose valuation
-    fails is left out entirely, which is what the Rust does (`arbitrator.rs:155`
-    discards the whole solution when any contributing order cannot be scored). Because
+    fails is left out entirely, which is what the Rust does (`compute_scores_by_solution`
+    discards the whole solution when any of its orders cannot be scored). Because
     the DB only ever stores solutions whose score computation succeeded, any failure
     here is a defect in this reproduction rather than a property of the data, and every
     caller reports rather than swallows it.
@@ -453,9 +438,7 @@ def build_solutions(
 
     for bid in bids:
         try:
-            valuation = value_solution(
-                bid.orders, bid.contributes, native_prices, weth, fee_context
-            )
+            valuation = value_solution(bid.orders, native_prices, weth, fee_context)
             total = solution_total(valuation, mode, bid.score)
         except ValuationError as error:
             failures[bid.uid] = str(error)

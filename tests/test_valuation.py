@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from loo.primitives import NATIVE_TOKEN, Pair, ceil_div, order_owner, price_in_eth
+from loo.primitives import NATIVE_TOKEN, Pair, ceil_div, price_in_eth
 from loo.valuation import (
     Order,
     SolutionValuation,
@@ -66,14 +66,6 @@ class TestPrimitives:
         assert ceil_div(0, 3) == 0
         with pytest.raises(ZeroDivisionError):
             ceil_div(1, 0)
-
-    def test_order_owner_is_the_middle_20_bytes(self):
-        uid = "11" * 32 + "22" * 20 + "33" * 4
-        assert order_owner(uid) == "22" * 20
-
-    def test_order_owner_rejects_wrong_length(self):
-        with pytest.raises(ValueError):
-            order_owner("dead")
 
 
 class TestSellSurplus:
@@ -186,54 +178,37 @@ class TestValueSolution:
             sell_order(1000, 2100, uid="a" * 112),
             sell_order(1000, 2050, uid="c" * 112),
         ]
-        valuation = value_solution(
-            orders, {"a" * 112: True, "c" * 112: True}, {USDC: ONE}, WETH
-        )
+        valuation = value_solution(orders, {USDC: ONE}, WETH)
         assert valuation.pair_surplus == {(WETH, USDC): 150}
         assert valuation.total == 150
         assert valuation.order_volume_native == {"a" * 112: 2100, "c" * 112: 2050}
 
-    def test_non_contributing_orders_are_skipped_but_still_claim_their_pair(self):
-        """`score_by_token_pair` skips them; `pick_winners` does not."""
+    def test_every_order_is_valued_and_claims_its_pair(self):
+        """The pairs `pick_winners` claims are the pairs that are scored: JIT orders,
+        which once claimed a pair without being scored, are not extracted at all."""
         orders = [
             sell_order(1000, 2100, uid="a" * 112),
             sell_order(1000, 2100, uid="c" * 112, sell_token=DAI, buy_token=USDC),
         ]
-        valuation = value_solution(
-            orders, {"a" * 112: True, "c" * 112: False}, {USDC: ONE}, WETH
-        )
-        assert valuation.pair_surplus == {(WETH, USDC): 100}
+        valuation = value_solution(orders, {USDC: ONE}, WETH)
+        assert valuation.pair_surplus == {(WETH, USDC): 100, (DAI, USDC): 100}
         assert valuation.winner_pairs == {(WETH, USDC), (DAI, USDC)}
 
     def test_native_sentinel_is_normalised_only_for_winner_pairs(self):
         """Step 1 keys on the raw token, step 5 on `as_erc20` — an asymmetry that is in
         the Rust and is mirrored rather than tidied up."""
         orders = [sell_order(1000, 2100, sell_token=NATIVE_TOKEN)]
-        valuation = value_solution(
-            orders, {"a" * 112: True}, {USDC: ONE}, WETH
-        )
+        valuation = value_solution(orders, {USDC: ONE}, WETH)
         assert valuation.pair_surplus == {(NATIVE_TOKEN, USDC): 100}
         assert valuation.winner_pairs == {(WETH, USDC)}
 
-    def test_a_failing_contributing_order_fails_the_whole_solution(self):
+    def test_a_failing_order_fails_the_whole_solution(self):
         orders = [
             sell_order(1000, 2100, uid="a" * 112),
             sell_order(1000, 1900, uid="c" * 112),
         ]
         with pytest.raises(ValuationError):
-            value_solution(orders, {"a" * 112: True, "c" * 112: True}, {USDC: ONE}, WETH)
-
-    def test_a_failing_non_contributing_order_is_harmless(self):
-        orders = [
-            sell_order(1000, 2100, uid="a" * 112),
-            sell_order(1000, 1900, uid="c" * 112),
-        ]
-        valuation = value_solution(
-            orders, {"a" * 112: True, "c" * 112: False}, {USDC: ONE}, WETH
-        )
-        assert valuation.total == 100
-        # Volumes track contributing orders exactly, like `order_surplus_native`.
-        assert valuation.order_volume_native == {"a" * 112: 2100}
+            value_solution(orders, {USDC: ONE}, WETH)
 
 
 class TestPairScoreSplit:
@@ -252,7 +227,6 @@ class TestPairScoreSplit:
         return SolutionValuation(
             pair_surplus=pair_surplus,
             order_surplus_native={},
-            order_surplus_atoms={},
             winner_pairs=frozenset(pair_surplus),
             order_uids=frozenset(),
             pair_fee_native=pair_fee_native or {},
@@ -350,7 +324,6 @@ class TestSolutionTotal:
         return SolutionValuation(
             pair_surplus=pair_surplus,
             order_surplus_native={},
-            order_surplus_atoms={},
             winner_pairs=frozenset(pair_surplus),
             order_uids=frozenset(),
         )

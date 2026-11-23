@@ -20,8 +20,6 @@ import psycopg2.errors
 import psycopg2.extras
 from dotenv import load_dotenv
 
-SCHEMA = "dbt"
-
 Connection = psycopg2.extensions.connection
 """The concrete psycopg2 connection type, aliased so callers can annotate against it."""
 
@@ -41,7 +39,6 @@ NETWORK_DATABASES = {
     "ink": "prod_ink",
     "linea": "prod_linea",
     "plasma": "prod_plasma",
-    "lens": "prod_lens",
     "sepolia": "prod_sepolia",
 }
 

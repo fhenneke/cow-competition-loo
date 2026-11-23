@@ -6,6 +6,24 @@ behind each of those claims. The concrete work is in
 [PLAN.md](../PLAN.md#16-m15--the-quote-competition--done); the argument that shaped it is
 in [PROPOSAL-quote-competition.md](../PROPOSAL-quote-competition.md).
 
+## What the code does now
+
+Since 2026-11-23 `loo/quotes.py` holds one way of doing each thing, because `loo` only
+replays windows from 2026-10-28 on:
+
+- **Link:** by quote id only (`link_by_quote_id`), with the re-quote and stream passes
+  described [below](#quote-ids-link-an-order-to-its-competition-exactly--from-2026-09-29).
+  The heuristic link, its candidate queries and its `corroborated` / `heuristic` tiers
+  are gone; every match reproduces the stored amount to the atom or is not a match.
+- **Source:** `raw_quotes` only (`price_estimates`, `winning_price_estimates`,
+  `quote_computed`). `gold_quotes` is not read.
+- **Window:** the run's own. There is no clamp to the start of the quote data and no
+  per-link breakdown; the report carries one `quote_window.link`.
+
+The sections on the heuristic, the gold tables, the candidate routes and float precision
+stay as the record of what was measured and why the id link replaced them. Each is
+marked **Historical** at its top. The git history before 2026-11-23 has the code.
+
 ## Where the data is
 
 The quote competition is in **ClickHouse**, not the analytics DB. `loo/ch.py` connects
@@ -333,6 +351,8 @@ On mainnet the linked estimate's `solver` and `gas` also equal `order_quotes.sol
 
 ### What the heuristic got wrong, measured against the ids
 
+**Historical.** The heuristic link is no longer in the code.
+
 - **The whole `heuristic` tier is the placement-time re-quote.** The order's competition
   ran 0–4 s before creation (median 1 s) and exists only in the raw layer, but
   `load_raw_candidates` is asked only for orders with *no* gold candidate, so an order
@@ -554,6 +574,9 @@ count, which is over every created order, needs the untraded ones too.
 
 ## Matching an order to its quote: every route, and what each is good for
 
+**Historical.** This section, and the ones on the gold tables below it, describe how
+orders created before 2026-09-29 were matched. The code now uses the quote id alone.
+
 The backend never guesses. At order placement `find_quote` either looks the quote up by
 the `quoteId` the placement supplied — for ethflow orders the `quoteId` travels on-chain
 as a field of the order-placement event's auxiliary data, beside the user's `valid_to`
@@ -708,6 +731,9 @@ user, so it is not authority for the ranking here; read it as a possible inconsi
 how quotes are attributed to orders rather than as a second definition of the competition.
 
 ## The order ↔ request join is a heuristic with an exact corroborator
+
+**Historical.** Superseded by the quote-id link; the tiers are gone from the code and
+from the report.
 
 Before 2026-09-22 there is **no `quote_id` on an order** (after it, see
 [the quote-id link](#quote-ids-link-an-order-to-its-competition-exactly--from-2026-09-29)).
@@ -941,6 +967,9 @@ negligible.
 
 ## Precision: the gold ladder is not integer-exact, the raw one is
 
+**Historical for the gold half.** Only the raw layer is read now, so every ladder is
+exact.
+
 Amounts in `gold_quotes` are `Float64`. An 18-decimal amount above ~0.01 tokens is already
 past `2^53`, so **nothing derived from a gold ladder is exact to the atom** — see
 `ch.as_float`, and note that ClickHouse's JSON also returns large `Float64` values as
@@ -957,10 +986,12 @@ delta up.
 
 ## Out of scope, and named as such
 
-- **Quote rewards (CIP-72).** The counterfactual quote's eligibility is not evaluated, so
-  no reward figure includes it. `int_backend_data__orders_with_winning_quotes` carries
-  `is_eligible_for_quote_reward` and quote-redesign reproduces it at 100%, so this is a
-  milestone, not a wall.
+- **Quote rewards.** The counterfactual quote's eligibility is not evaluated, so no
+  reward figure includes it. The rule itself changed on 2026-10-12 (quote rewards v2,
+  CIP-88, cow-dagster#1110): a budget share of protocol revenue split by
+  `int_quote_data__quote_reward_shares`, whose `is_in_scope` is what
+  `fct_data_per_trade.is_eligible_for_quote_reward` now reports. Nothing here has been
+  checked against the v2 models.
 - **Conversion.** A worse quote means some users never place the order, and there is no
   counterfactual for an order nobody created. At a 0.13% conversion rate any elasticity
   proxy would be a number people quote and nobody can defend.

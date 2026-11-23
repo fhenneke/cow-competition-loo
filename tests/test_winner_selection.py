@@ -216,10 +216,9 @@ class TestProxiedUids:
     def test_tested_excludes_solutions_dropped_before_the_filter(self):
         ranking = arbitrate([
             solution("a", 0, 100, {WETH_USDC: 100}),
-            solution("b", 1, 0, {DAI_USDC: 0, WETH_USDC: 0}),
+            solution("b", 1, 0, {}),
         ])
         assert [s.solution_uid for s in ranking.tested] == [0]
-        assert ranking.dropped_uids == {1}
 
 
 class TestFilterGuessCouldMatter:
@@ -278,12 +277,26 @@ class TestFilterGuessCouldMatter:
 
 
 class TestArbitrate:
-    def test_zero_total_solutions_are_dropped(self):
+    def test_solutions_without_a_scoring_order_are_dropped(self):
+        """`partition_unfair_solutions` keeps a solution iff it trades at least one
+        order the mechanism cares about; one with only JIT orders arrives here empty."""
+        ranking = arbitrate([solution("a", 0, 100), solution("b", 1, 0, {})])
+        assert [s.solution_uid for s in ranking.ranked] == [0]
+        assert ranking.filtered_out == ()
+
+    def test_a_zero_score_solution_is_kept_and_can_win(self):
+        """services#4753: an order filled at exactly its limit scores 0 and still
+        trades — the rule before it dropped every zero-score solution."""
         ranking = arbitrate(
             [solution("a", 0, 100), solution("b", 1, 0, {DAI_USDC: 0})]
         )
-        assert ranking.dropped_uids == frozenset({1})
-        assert [s.solution_uid for s in ranking.ranked] == [0]
+        assert ranking.winner_uids == frozenset({0, 1})
+        assert compute_reference_scores(ranking) == {"a": 0, "b": 100}
+
+    def test_a_zero_score_solution_still_loses_a_claimed_pair(self):
+        ranking = arbitrate([solution("a", 0, 100), solution("b", 1, 0, {WETH_USDC: 0})])
+        assert ranking.winner_uids == frozenset({0})
+        assert [s.solution_uid for s in ranking.ranked] == [0, 1]
 
     def test_unfair_solution_is_filtered_not_ranked(self):
         ranking = arbitrate(

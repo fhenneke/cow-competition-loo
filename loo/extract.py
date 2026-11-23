@@ -1,5 +1,11 @@
 """Pull one auction's worth of bids, orders and prices out of the analytics DB.
 
+Written against the **current** DB and mechanism only (`MECHANISM_START`): native prices
+come from the `competition_auctions` price arrays, and solver-provided (JIT) orders are
+left out at the source, because since services#4902 they affect neither score, fairness
+filter nor winner picking. Windows before `MECHANISM_START` are refused rather than
+replayed under rules that no longer match them.
+
 Reads the raw staging tables rather than `int_backend_data__proposed_solution_data`:
 the intermediate model lags the staging tables by 2-3 days and carries no
 `filtered_out` column, which the validation comparison needs. The intermediate model is still
@@ -18,8 +24,6 @@ from decimal import Decimal
 from statistics import median
 from typing import Any
 
-import psycopg2.errors
-
 from .db import Connection, Row, as_int, chunked, fetch
 from .fees import (
     EMPTY_FEE_CONTEXT,
@@ -30,44 +34,66 @@ from .fees import (
     Quote,
     quote_fee,
 )
-from .primitives import order_owner, usd_per_native, usd_reference_tokens
+from .primitives import usd_per_native, usd_reference_tokens
 from .rewards import SolverReward, Win
 from .valuation import Order
 
 CHUNK_SIZE = 200
 
 
-class MissingOrderError(Exception):
-    """A traded order uid is in neither `orders` nor `jit_orders`.
+MECHANISM_START = "2026-10-28"
+"""First day this code replays faithfully. services#4902 (JIT liquidity orders no longer
+claim token pairs in `pick_winners`) went live on mainnet on 2026-10-27 — the first
+auction with two winners on one directed pair is 14118229, 21:34 UTC — and everything
+here assumes it. Two older limits sit behind it and never bind: the staging price arrays
+begin 2026-09-15, and zero-score solutions are kept since services#4753 (August 2026)."""
 
-    Not a data glitch but a systematic gap: `jit_orders` is only populated when a batch
-    settles, so the JIT orders of solutions that never settled — losing bids, and winners
-    that reverted or landed late — are recorded nowhere and their tokens and limits are
-    unrecoverable ([docs](../docs/analytics-db.md#jit-orders-are-recorded-only-when-the-batch-settles)).
-    Callers that pass `missing_data` to `load_auctions` exclude the whole auction
-    transparently instead of dying on it (D17)."""
+
+class UnsupportedWindowError(Exception):
+    """The window starts before `MECHANISM_START`."""
+
+
+def require_current_mechanism(start: str) -> None:
+    """Refuse a window that begins before the rules this code replays were live.
+
+    An older window would still run — and be wrong only in the handful of auctions a
+    day where a JIT order used to block another solution — so it has to fail by name
+    rather than report numbers under the wrong mechanism."""
+    if start[:10] < MECHANISM_START:
+        raise UnsupportedWindowError(
+            f"the window starts {start}, before {MECHANISM_START}: this code replays "
+            f"only the current mechanism (JIT orders ignored, services#4902) and reads "
+            f"prices only from the competition_auctions arrays"
+        )
+
+
+class MissingOrderError(Exception):
+    """A traded auction order is not in `stg_backend_data__orders`.
+
+    Only orders of the auction are read at all — JIT orders are left out by
+    `EXECUTIONS_SQL` — and the staging table holds every proposed order the backend's
+    `orders` table knows, so this cannot happen short of a broken sync. Measured over
+    2026-10-24..11-23 on nine chains: zero."""
 
 
 class MissingAuctionContextError(Exception):
     """An auction has proposed solutions but no `competition_auctions` row.
 
-    Tolerating it would corrupt the run twice over, both times silently: `jit_owners`
-    would come out empty, flipping `contributes` for surplus-capturing JIT orders, and
-    because `EXECUTIONS_SQL` inner-joins the table every execution would vanish — leaving
-    zero-order bids whose empty `winner_pairs` are disjoint from everything, which
-    `pick_winners` therefore always selects."""
+    Tolerating it would corrupt the run silently: `EXECUTIONS_SQL` inner-joins the
+    table, so every execution would vanish and every bid would be dropped as having no
+    order the mechanism cares about."""
 
 
 class MissingPricesError(Exception):
-    """An auction's native prices are recorded nowhere the analytics DB can reach.
+    """An auction with bids has NULL price arrays in `competition_auctions`.
 
     Every real auction has a price vector — the autopilot cannot run one without — so
     this is always a gap in the source, and it comes as a range of auctions, not one:
-    the `competition_auctions` price arrays are NULL before 2026-09-15, and the legacy
-    `stg_backend_data__auction_prices` that covers those auctions is being dropped.
-    Tolerating it would be silent: every such auction becomes a valuation failure, the
-    run reports it as abandoned and exits 0 with numbers over whatever is left
-    ([docs](../docs/analytics-db.md#native-prices-price-arrays-and-the-legacy-table))."""
+    the staging arrays are NULL before 2026-09-15 and no other copy of those prices is
+    left in the analytics DB. Tolerating it would be silent: every such auction becomes
+    a valuation failure, the run reports it as abandoned and exits 0 with numbers over
+    whatever is left
+    ([docs](../docs/analytics-db.md#native-prices-the-competition_auctions-arrays))."""
 
 
 class SolverResolutionError(Exception):
@@ -94,7 +120,6 @@ class Settlement:
     """Did a settlement transaction appear on chain at all (`tx_hash is not null`)?"""
     in_time: bool
     """Did it arrive before its deadline (`is_settled_in_time`)?"""
-    tx_hash: str | None = None
 
     @property
     def counts_as_executed(self) -> bool:
@@ -135,14 +160,13 @@ class Bid:
     is_winner: bool
     filtered_out: bool
     orders: tuple[Order, ...]
-    contributes: dict[str, bool]
-    """Per order uid: does it count toward score (`auction.rs:45`)?"""
+    """The auction's orders this solution trades. JIT orders are not here: they do not
+    count toward score, are ignored by the fairness filter and claim no token pair."""
 
 
 @dataclass(frozen=True)
 class AuctionBundle:
     auction_id: int
-    jit_owners: frozenset[str]
     native_prices: dict[str, int]
     bids: tuple[Bid, ...]
     """Ordered by `uid`, i.e. best-to-worst as the autopilot recorded them."""
@@ -173,55 +197,47 @@ where auction_id = any(%(ids)s)
 order by auction_id, uid
 """
 
-# `partially_fillable` and the order side come from whichever of the two order tables
-# has the uid; `coalesce` on the enums is done via ::text since the two columns are
-# separate enum types.
+# Only executions of the auction's own orders. An order outside `order_uids` is a JIT
+# order — the solver's own liquidity — and the mechanism treats it as if it were an AMM
+# interaction: no score, no say in the fairness filter, no token pair claimed
+# (services#4902). `surplus_capturing_jit_order_owners`, the one exception, has been
+# empty on every chain since the CoW AMMs were retired (measured 2026-10-24..11-23, ten
+# chains, zero auctions with an owner), so it is not read.
 EXECUTIONS_SQL = """
 select
     pte.auction_id,
     pte.solution_uid,
-    encode(pte.order_uid, 'hex')                            as order_uid,
+    encode(pte.order_uid, 'hex')    as order_uid,
     pte.executed_sell,
     pte.executed_buy,
-    encode(coalesce(o.sell_token, j.sell_token), 'hex')     as sell_token,
-    encode(coalesce(o.buy_token, j.buy_token), 'hex')       as buy_token,
-    coalesce(o.sell_amount, j.sell_amount)                  as sell_amount,
-    coalesce(o.buy_amount, j.buy_amount)                    as buy_amount,
-    coalesce(o.kind::text, j.kind::text)                    as kind,
-    coalesce(o.partially_fillable, j.partially_fillable)    as partially_fillable,
-    (pte.order_uid = any(ca.order_uids))                    as in_auction
+    encode(o.sell_token, 'hex')     as sell_token,
+    encode(o.buy_token, 'hex')      as buy_token,
+    o.sell_amount,
+    o.buy_amount,
+    o.kind::text                    as kind,
+    o.partially_fillable
 from dbt.stg_backend_data__proposed_trade_executions pte
 join dbt.stg_backend_data__competition_auctions ca
     on ca.auction_id = pte.auction_id
 left join dbt.stg_backend_data__orders o
     on o.uid = pte.order_uid
-left join dbt.stg_backend_data__jit_orders j
-    on j.uid = pte.order_uid
 where pte.auction_id = any(%(ids)s)
+  and pte.order_uid = any(ca.order_uids)
 """
 
 AUCTIONS_SQL = """
 select
     auction_id,
     block_deadline,
-    array(
-        select encode(owner, 'hex')
-        from unnest(surplus_capturing_jit_order_owners) as owner
-    ) as jit_owners,
-    price_tokens is null as unpriced
+    price_tokens is null             as unpriced,
+    fast_path_quote_id is not null   as fast_path
 from dbt.stg_backend_data__competition_auctions
 where auction_id = any(%(ids)s)
 """
 
 # Native prices, `(auction_id, token) -> price`, come from the parallel `price_tokens` /
-# `price_values` arrays of `competition_auctions`. They replace
-# `stg_backend_data__auction_prices`, which stopped updating on 2026-09-21 ~10:00 UTC
-# (cow-dagster#1016) and is to be dropped. The staging arrays are only populated from
-# 2026-09-15 00:00 UTC, though, so for every earlier auction the legacy table is still
-# the only copy: it is read for exactly the auctions whose arrays are NULL, which means a
-# window from 2026-09-15 on never touches it and keeps working once it is gone. The two
-# agree exactly where both exist
-# ([measured](../docs/analytics-db.md#native-prices-price-arrays-and-the-legacy-table)).
+# `price_values` arrays of `competition_auctions`, populated from 2026-09-15 00:00 UTC.
+# Nothing older is read: the table that held earlier prices was dropped on 2026-11-05.
 #
 # Queries over prices read the relation `{auction_prices}`, restricted to `%(ids)s`, and
 # run through `fetch_prices`, which fills it in.
@@ -230,19 +246,6 @@ _ARRAY_PRICES = """
     from dbt.stg_backend_data__competition_auctions ca
     cross join lateral unnest(ca.price_tokens, ca.price_values) as ap (token, price)
     where ca.auction_id = any(%(ids)s)
-"""
-LEGACY_PRICES_TABLE = "stg_backend_data__auction_prices"
-_LEGACY_PRICES = f"""
-    select auction_id, token, price
-    from dbt.{LEGACY_PRICES_TABLE}
-    where auction_id = any(%(unpriced)s)
-"""
-
-UNPRICED_SQL = """
-select auction_id
-from dbt.stg_backend_data__competition_auctions
-where auction_id = any(%(ids)s)
-  and price_tokens is null
 """
 
 # The valuation itself only needs buy-token prices — `compute_order_score` converts
@@ -253,12 +256,8 @@ PRICES_SQL = """
 with traded as (
     select distinct pte.auction_id, t.token
     from dbt.stg_backend_data__proposed_trade_executions pte
-    left join dbt.stg_backend_data__orders o on o.uid = pte.order_uid
-    left join dbt.stg_backend_data__jit_orders j on j.uid = pte.order_uid
-    cross join lateral (values
-        (coalesce(o.sell_token, j.sell_token)),
-        (coalesce(o.buy_token, j.buy_token))
-    ) as t (token)
+    join dbt.stg_backend_data__orders o on o.uid = pte.order_uid
+    cross join lateral (values (o.sell_token), (o.buy_token)) as t (token)
     where pte.auction_id = any(%(ids)s)
 )
 select ap.auction_id, encode(ap.token, 'hex') as token, ap.price
@@ -332,8 +331,7 @@ select
     auction_id,
     solution_uid,
     (tx_hash is not null)     as landed,
-    is_settled_in_time        as in_time,
-    encode(tx_hash, 'hex')    as tx_hash
+    is_settled_in_time        as in_time
 from dbt.int_backend_data__winning_solutions_with_onchain_status
 where auction_id = any(%(ids)s)
 """
@@ -505,43 +503,14 @@ def auctions_in_window(conn: Connection, start: str, end: str) -> list[int]:
     return [row["auction_id"] for row in rows]
 
 
-def price_query(sql: str, *, legacy: bool) -> str:
-    """`sql` with its `{auction_prices}` relation filled in: the price arrays alone, or
-    the arrays plus the legacy table's rows for the `%(unpriced)s` auctions."""
-    source = f"{_ARRAY_PRICES}union all{_LEGACY_PRICES}" if legacy else _ARRAY_PRICES
-    return sql.format(auction_prices=f"({source})")
+def price_query(sql: str) -> str:
+    """`sql` with its `{auction_prices}` relation filled in from the price arrays."""
+    return sql.format(auction_prices=f"({_ARRAY_PRICES})")
 
 
-def unpriced_auctions(conn: Connection, auction_ids: Sequence[int]) -> set[int]:
-    """The auctions among `auction_ids` whose `competition_auctions` price arrays are NULL."""
-    rows = fetch(conn, UNPRICED_SQL, {"ids": list(auction_ids)})
-    return {row["auction_id"] for row in rows}
-
-
-def fetch_prices(
-    conn: Connection, sql: str, params: dict[str, Any], unpriced: Collection[int]
-) -> list[Row]:
-    """Run a query over `{auction_prices}` for the auctions in `params["ids"]`.
-
-    `unpriced` names those among them whose price arrays are NULL. The legacy table is
-    queried only when there are any, and only for them — so once it is dropped, a window
-    the arrays cover still runs, and one they do not fails here, by name, instead of
-    every auction in it quietly becoming a valuation failure.
-    """
-    if not unpriced:
-        return fetch(conn, price_query(sql, legacy=False), params)
-    try:
-        return fetch(
-            conn, price_query(sql, legacy=True), {**params, "unpriced": sorted(unpriced)}
-        )
-    except psycopg2.errors.UndefinedTable as error:
-        if LEGACY_PRICES_TABLE not in str(error):
-            raise
-        raise MissingPricesError(
-            f"{_auction_span(unpriced)} predate the price arrays in "
-            f"stg_backend_data__competition_auctions, and {LEGACY_PRICES_TABLE}, the only "
-            f"other copy of their native prices, no longer exists"
-        ) from error
+def fetch_prices(conn: Connection, sql: str, params: dict[str, Any]) -> list[Row]:
+    """Run a query over `{auction_prices}` for the auctions in `params["ids"]`."""
+    return fetch(conn, price_query(sql), params)
 
 
 def _auction_span(auction_ids: Collection[int]) -> str:
@@ -554,8 +523,8 @@ def load_auctions(
     conn: Connection,
     auction_ids: Sequence[int],
     chunk_size: int = CHUNK_SIZE,
-    missing_data: list[int] | None = None,
     with_fees: bool = True,
+    fast_path: list[int] | None = None,
 ) -> Iterator[AuctionBundle]:
     """Yield one `AuctionBundle` per auction, in the order given.
 
@@ -566,11 +535,11 @@ def load_auctions(
     is what makes the protocol-fee deltas available. Turning it off leaves every fee
     unrecorded, so those deltas report as unavailable rather than as zero.
 
-    `missing_data` selects the policy for auctions where a traded order is in neither
-    order table (D17): when given, the whole auction is skipped and its id appended —
-    even one such order leaves the solution's pair claims unknowable, so nothing about
-    the auction can be arbitrated faithfully. When `None`, `MissingOrderError`
-    propagates, for callers that would rather die than lose coverage silently.
+    Fast-path auctions are never yielded; their ids go to `fast_path` when it is given.
+    They are not auctions: one order is settled straight from its quote competition,
+    the losing quotes are stored as solutions below the order's limit, and the winner
+    earns no batch reward. Re-running winner selection on them answers nothing
+    ([docs](../docs/winner-selection.md#fast-path-auctions-are-excluded)).
     """
     for chunk in chunked(list(auction_ids), chunk_size):
         ids = list(chunk)
@@ -582,7 +551,7 @@ def load_auctions(
         unpriced = {a for a, context in contexts.items() if context["unpriced"]}
         solution_rows = fetch(conn, SOLUTIONS_SQL, params)
         execution_rows = fetch(conn, EXECUTIONS_SQL, params)
-        price_rows = fetch_prices(conn, PRICES_SQL, params, unpriced)
+        price_rows = fetch_prices(conn, PRICES_SQL, params)
         reference_rows = fetch(conn, REFERENCE_SCORES_SQL, params)
         fee_contexts = (
             _load_fee_contexts(conn, ids, execution_rows, solution_rows)
@@ -610,12 +579,12 @@ def load_auctions(
         for row in solution_rows:
             solutions.setdefault(row["auction_id"], []).append(row)
 
-        lost = sorted(a for a in unpriced if a in solutions and a not in prices)
+        lost = sorted(a for a in unpriced if a in solutions)
         if lost:
             verb = "has" if len(lost) == 1 else "have"
             raise MissingPricesError(
-                f"{_auction_span(lost)} {verb} bids but no native prices: the price "
-                f"arrays are NULL and {LEGACY_PRICES_TABLE} has no rows for them"
+                f"{_auction_span(lost)} {verb} bids but NULL price arrays in "
+                f"stg_backend_data__competition_auctions, which begin 2026-09-15"
             )
 
         for auction_id in ids:
@@ -627,22 +596,18 @@ def load_auctions(
                     f"auction {auction_id} has proposed solutions but no row in "
                     f"stg_backend_data__competition_auctions"
                 )
-            jit_owners = frozenset(context["jit_owners"])
-
-            try:
-                bids = tuple(
-                    _build_bid(row, executions.get((auction_id, row["uid"]), []), jit_owners)
-                    for row in solutions[auction_id]
-                )
-            except MissingOrderError:
-                if missing_data is None:
-                    raise
-                missing_data.append(auction_id)
+            if context["fast_path"]:
+                if fast_path is not None:
+                    fast_path.append(auction_id)
                 continue
+
+            bids = tuple(
+                _build_bid(row, executions.get((auction_id, row["uid"]), []))
+                for row in solutions[auction_id]
+            )
 
             yield AuctionBundle(
                 auction_id=auction_id,
-                jit_owners=jit_owners,
                 native_prices=prices.get(auction_id, {}),
                 bids=bids,
                 reference_scores=references.get(auction_id, {}),
@@ -658,23 +623,17 @@ def _load_fee_contexts(
 
     The coverage set is derived from data already in hand rather than re-queried: an
     auction order's policies are recorded iff it appears in a solution that was not
-    filtered out, and a JIT order never has policies at all, so its fee is a known zero.
-    Anything else is genuinely unrecorded and is reported rather than read as zero.
+    filtered out. Anything else is genuinely unrecorded and is reported rather than
+    read as zero.
     """
-    kept: dict[int, set[str]] = {}
+    known: dict[int, set[str]] = {}
     filtered_out = {
         (row["auction_id"], row["uid"]): bool(row["filtered_out"]) for row in solution_rows
     }
     for row in execution_rows:
         key = (row["auction_id"], row["solution_uid"])
         if not filtered_out.get(key, True):
-            kept.setdefault(row["auction_id"], set()).add(row["order_uid"])
-
-    known: dict[int, set[str]] = {}
-    for row in execution_rows:
-        auction_id, uid = row["auction_id"], row["order_uid"]
-        if not row["in_auction"] or uid in kept.get(auction_id, ()):
-            known.setdefault(auction_id, set()).add(uid)
+            known.setdefault(row["auction_id"], set()).add(row["order_uid"])
 
     # `FEE_POLICIES_SQL` orders by `application_order`, so appending preserves the
     # application sequence, which `policy_fees` then walks in reverse.
@@ -739,9 +698,8 @@ def _load_fee_contexts(
     }
 
 
-def _build_bid(row: Row, execution_rows: list[Row], jit_owners: frozenset[str]) -> Bid:
+def _build_bid(row: Row, execution_rows: list[Row]) -> Bid:
     orders: list[Order] = []
-    contributes: dict[str, bool] = {}
 
     for execution in execution_rows:
         uid = execution["order_uid"]
@@ -749,8 +707,8 @@ def _build_bid(row: Row, execution_rows: list[Row], jit_owners: frozenset[str]) 
             # Nothing can be valued without the order's tokens and limits, and guessing
             # would corrupt the pair decomposition silently. Loud failure instead.
             raise MissingOrderError(
-                f"auction {row['auction_id']} solution {row['uid']}: "
-                f"order {uid} is in neither orders nor jit_orders"
+                f"auction {row['auction_id']} solution {row['uid']}: auction order "
+                f"{uid} is not in stg_backend_data__orders"
             )
 
         orders.append(
@@ -766,7 +724,6 @@ def _build_bid(row: Row, execution_rows: list[Row], jit_owners: frozenset[str]) 
                 partially_fillable=bool(execution["partially_fillable"]),
             )
         )
-        contributes[uid] = bool(execution["in_auction"]) or order_owner(uid) in jit_owners
 
     return Bid(
         auction_id=row["auction_id"],
@@ -776,7 +733,6 @@ def _build_bid(row: Row, execution_rows: list[Row], jit_owners: frozenset[str]) 
         is_winner=bool(row["is_winner"]),
         filtered_out=bool(row["filtered_out"]),
         orders=tuple(orders),
-        contributes=contributes,
     )
 
 
@@ -795,7 +751,6 @@ def load_settlement_outcomes(
             outcomes.setdefault(row["auction_id"], {})[row["solution_uid"]] = Settlement(
                 landed=bool(row["landed"]),
                 in_time=bool(row["in_time"]),
-                tx_hash=row["tx_hash"],
             )
     return outcomes
 
@@ -929,7 +884,7 @@ def load_fct_rewards(
                 reference_score=as_int(row["reference_score"]),
                 uncapped_reward=as_int(row["uncapped_reward"]),
                 upper_cap=Decimal(row["upper_reward_cap"]),
-                lower_cap=_optional_decimal(row["lower_reward_cap"]),
+                lower_cap=Decimal(row["lower_reward_cap"]),
                 capped_reward=Decimal(row["batch_reward_native"]),
             )
     return rewards
@@ -983,15 +938,9 @@ def load_usd_rates(
     reference = usd_reference_tokens(network)
     token_bytes = [bytes.fromhex(token) for token in reference]
     per_auction: dict[int, list[Decimal]] = {}
-    unpriced = unpriced_auctions(conn, auction_ids)
     for chunk in chunked(list(auction_ids), chunk_size):
         ids = list(chunk)
-        rows = fetch_prices(
-            conn,
-            USD_PRICES_SQL,
-            {"ids": ids, "tokens": token_bytes},
-            unpriced.intersection(ids),
-        )
+        rows = fetch_prices(conn, USD_PRICES_SQL, {"ids": ids, "tokens": token_bytes})
         for row in rows:
             per_auction.setdefault(row["auction_id"], []).append(
                 usd_per_native(as_int(row["price"]), reference[row["token"]])

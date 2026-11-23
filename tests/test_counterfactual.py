@@ -87,7 +87,6 @@ def bid(
     *,
     is_winner: bool = False,
     filtered_out: bool = False,
-    contributes: bool = True,
 ) -> Bid:
     return Bid(
         auction_id=1,
@@ -97,14 +96,12 @@ def bid(
         is_winner=is_winner,
         filtered_out=filtered_out,
         orders=tuple(orders),
-        contributes={order.uid: contributes for order in orders},
     )
 
 
 def bundle(bids: list[Bid]) -> AuctionBundle:
     return AuctionBundle(
         auction_id=1,
-        jit_owners=frozenset(),
         native_prices={USDC: ONE},
         bids=tuple(bids),
         reference_scores={},
@@ -124,7 +121,6 @@ def valued(
         valuation=SolutionValuation(
             pair_surplus={A: sum(surplus.values())},
             order_surplus_native=surplus,
-            order_surplus_atoms={},
             winner_pairs=frozenset({A}),
             order_uids=frozenset(o.uid for o in entry_bid.orders),
             order_volume_native=volumes or {},
@@ -375,20 +371,6 @@ class TestSideOutcomes:
         )
         assert side.orders["o1"].volume_native is None
 
-    def test_a_non_contributing_order_is_executed_at_zero_user_surplus(self):
-        """A JIT order outside `surplus_capturing_jit_order_owners`: traded, but its
-        surplus is the market maker's, not a user's."""
-        entry = valued(bid(0, "a", 100, [sell_order("jit")], contributes=False), {})
-        side = side_outcomes(
-            [entry],
-            outcome_rule="assume-settled",
-            settled={},
-            recorded_winner_uids=frozenset(),
-        )
-        assert side.orders["jit"].executed is True
-        assert side.orders["jit"].contributes is False
-        assert side.orders["jit"].surplus_native == 0
-
     def test_two_winners_cannot_share_an_order(self):
         """`pick_winners` gives winners disjoint pairs and an order fixes its own pair, so
         this is unreachable — asserted rather than assumed."""
@@ -404,7 +386,7 @@ class TestSideOutcomes:
 class TestDiffOutcomes:
     def outcome(self, surplus: int | None, executed: bool = True) -> OrderOutcome:
         return OrderOutcome(
-            executed=executed, surplus_native=surplus, contributes=True, solver="a"
+            executed=executed, surplus_native=surplus, solver="a"
         )
 
     def test_union_of_both_sides(self):
@@ -429,35 +411,23 @@ class TestDiffOutcomes:
         assert diff.delta_surplus == -40
         assert not diff.only_with_solver and not diff.only_without_solver
 
-    def test_contributes_is_true_if_either_side_says_so(self):
-        jit = OrderOutcome(
-            executed=True, surplus_native=0, contributes=False, solver="a"
-        )
-        (diff,) = diff_outcomes({"o1": jit}, {"o1": self.outcome(5)})
-        assert diff.contributes
 
     def test_volumes_and_the_partial_flag_are_carried(self):
         base = OrderOutcome(
             executed=True,
             surplus_native=100,
-            contributes=True,
             volume_native=1000,
             partially_fillable=True,
         )
-        loo = OrderOutcome(
-            executed=True, surplus_native=60, contributes=True, volume_native=990
-        )
+        loo = OrderOutcome(executed=True, surplus_native=60, volume_native=990)
         (diff,) = diff_outcomes({"o1": base}, {"o1": loo})
-        assert (diff.volume_base, diff.volume_loo) == (1000, 990)
+        assert diff.volume_base == 1000
         # A property of the order, so whichever side saw it decides.
         assert diff.partially_fillable
 
     def test_an_unexecuted_side_has_no_volume(self):
-        base = OrderOutcome(
-            executed=True, surplus_native=100, contributes=True, volume_native=1000
-        )
-        (diff,) = diff_outcomes({"o1": base}, {})
-        assert (diff.volume_base, diff.volume_loo) == (1000, None)
+        (diff,) = diff_outcomes({}, {"o1": self.outcome(70)})
+        assert diff.volume_base is None
 
 
 class TestFeeDeltas:
@@ -479,7 +449,6 @@ class TestFeeDeltas:
         return OrderOutcome(
             executed=executed,
             surplus_native=surplus,
-            contributes=True,
             solver="a",
             fee_native=fee,
             partner_fee_native=partner,
@@ -491,20 +460,6 @@ class TestFeeDeltas:
             auction_id=1, n_solutions=2, solver_present=True, order_diffs=diffs
         )
 
-    def test_fee_lost_with_the_solver_gone(self):
-        (diff,) = diff_outcomes(
-            {"o1": self.outcome(100, fee=30, partner=10)},
-            {"o1": self.outcome(60, fee=18, partner=6)},
-        )
-        assert diff.delta_protocol_and_partner_fee == -12
-        assert diff.delta_partner_fee == -4
-        assert diff.delta_protocol_fee == -8
-
-    def test_an_order_that_stops_trading_loses_its_whole_fee(self):
-        (diff,) = diff_outcomes({"o1": self.outcome(100, fee=30, partner=10)}, {})
-        assert diff.fee_loo is None
-        assert diff.delta_protocol_and_partner_fee == -30
-        assert diff.delta_protocol_fee == -20
 
     def test_auction_sums_split_partner_from_dao(self):
         result = self.auction(
@@ -624,18 +579,6 @@ class TestRecordedExecutedVolume:
         assert result.executed_orders_base == 0
         assert result.executed_orders_all_base == 1
 
-    def test_jit_orders_are_not_user_volume(self):
-        result = analyse_auction(
-            bundle(
-                [bid(0, "a", 100, [sell_order("o1")], is_winner=True, contributes=False)]
-            ),
-            WETH,
-            frozenset({"x"}),
-            settled={0: SETTLED},
-        )
-        assert result.executed_volume_base == 0
-        assert result.executed_orders_all_base == 0
-
     def test_a_non_winning_bid_contributes_nothing(self):
         result = analyse_auction(
             bundle(
@@ -724,7 +667,7 @@ class TestAnalyseAuction:
         # The received legs at USDC's native price of 1 — the denominator for the
         # relative reading of the same move.
         (diff,) = result.order_diffs
-        assert (diff.volume_base, diff.volume_loo) == (2200, 2100)
+        assert diff.volume_base == 2200
         assert diff.partially_fillable is False
 
     def test_a_reverted_slot_stays_reverted_in_the_counterfactual(self):
@@ -897,7 +840,6 @@ class TestAnalysis:
     def diff(self, **kwargs: Any) -> OrderDiff:
         defaults: dict[str, Any] = dict(
             order_uid="o1",
-            contributes=True,
             executed_base=True,
             executed_loo=True,
             surplus_base=100,
@@ -905,30 +847,6 @@ class TestAnalysis:
         )
         defaults.update(kwargs)
         return OrderDiff(**defaults)
-
-    def test_jit_orders_are_counted_apart_from_user_orders(self):
-        analysis = Analysis()
-        analysis.add(
-            AuctionCounterfactual(
-                auction_id=1,
-                n_solutions=2,
-                solver_present=True,
-                order_diffs=(
-                    self.diff(order_uid="user", executed_loo=False, surplus_loo=None),
-                    self.diff(
-                        order_uid="jit",
-                        contributes=False,
-                        executed_loo=False,
-                        surplus_loo=None,
-                    ),
-                ),
-            )
-        )
-        assert analysis.orders_only_with_solver == 1
-        assert analysis.jit_orders_only_with_solver == 1
-        assert analysis.orders_compared == 1
-        assert analysis.delta_surplus == -100  # the JIT order's surplus is not the user's
-
 
 class TestJointRemoval:
     """Several solvers in `removed` leave in one re-arbitration: the joint
@@ -1004,7 +922,6 @@ def quoted_bundle(
     # legs and the D14 price-imbalance guard has nothing to exclude.
     return AuctionBundle(
         auction_id=auction_id,
-        jit_owners=frozenset(),
         native_prices={USDC: ONE, WETH: 2 * ONE},
         bids=tuple(bids),
         reference_scores={},

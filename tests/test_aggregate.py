@@ -54,9 +54,7 @@ def diff(
     surplus_base: int | None,
     surplus_loo: int | None,
     *,
-    contributes: bool = True,
     volume_base: int | None = None,
-    volume_loo: int | None = None,
     partially_fillable: bool = False,
     order_uid: str | None = None,
 ) -> dict[str, Any]:
@@ -66,17 +64,13 @@ def diff(
     uid twice to model a partially fillable order executing in several auctions."""
     if volume_base is None and surplus_base is not None:
         volume_base = DEFAULT_VOLUME
-    if volume_loo is None and surplus_loo is not None:
-        volume_loo = DEFAULT_VOLUME
     return {
         "order_uid": order_uid if order_uid is not None else f"uid{next(_uids)}",
-        "contributes": contributes,
         "executed_base": surplus_base is not None,
         "executed_loo": surplus_loo is not None,
         "surplus_base": surplus_base,
         "surplus_loo": surplus_loo,
         "volume_base": volume_base,
-        "volume_loo": volume_loo,
         "partially_fillable": partially_fillable,
     }
 
@@ -133,7 +127,7 @@ def payload(
         "outcome_rule": rule,
         "exclude_price_suspect": True,
         "price_suspect_auctions": [900, 901],
-        "missing_data_auctions": [],
+        "fast_path_auctions": [],
         "auctions": 100,
         "auctions_with_solver": 75,
         "auctions_solver_won_baseline": 10,
@@ -172,7 +166,7 @@ def payload(
             1
             for m in changed
             for d in m["order_diffs"]
-            if d["contributes"] and d["executed_base"] and not d["executed_loo"]
+            if d["executed_base"] and not d["executed_loo"]
         ),
         "orders_only_without_solver": 3,
         "window_volume_base": 10_000 * ONE,
@@ -215,14 +209,6 @@ class TestLoadReport:
         with pytest.raises(ValueError, match="re-run analyse"):
             load_report(write_report(tmp_path, "old.json", data))
 
-    def test_missing_data_is_counted_but_stays_out_of_analysed(self, tmp_path: Path):
-        data = payload(missing_data_auctions=[11, 12, 13])
-
-        report = load_report(write_report(tmp_path, "r.json", data))
-
-        assert report.missing_data == 3
-        # unlike price suspects these never entered `auctions`, so `analysed` is unmoved
-        assert report.analysed == 98
 
     def test_surplus_mode_has_no_rewards(self, tmp_path: Path):
         data = payload(
@@ -268,15 +254,14 @@ class TestLoadReport:
 
     def test_derives_only_with_surplus_from_the_order_diffs(self, tmp_path: Path):
         changed = [
-            # One order lost outright, one re-executed at a worse price, and a JIT
-            # (non-contributing) order lost alongside — only the first is coverage.
+            # One order lost outright and one re-executed at a worse price — only the
+            # first is coverage.
             move(
                 7,
                 -3 * ONE,
                 order_diffs=[
                     diff(2 * ONE, None),
                     diff(2 * ONE, ONE),
-                    diff(5 * ONE, None, contributes=False),
                 ],
             ),
             move(8, ONE),
@@ -457,11 +442,6 @@ class TestPriceImpact:
         assert impact.orders_still_traded == 1
         assert impact.orders_moved == 0
 
-    def test_non_contributing_orders_stay_out(self, tmp_path: Path):
-        impact = self.load(
-            tmp_path, [move(7, 0, order_diffs=[diff(2 * ONE, ONE, contributes=False)])]
-        )
-        assert impact.orders_still_traded == 0
 
     def test_overall_spreads_the_moved_delta_over_the_window_volume(
         self, tmp_path: Path
@@ -694,21 +674,19 @@ class TestComparison:
         assert rows["Δpartner fee"][fractal] == "-2.0000 ETH"
         assert rows["Δprotocol fee"][fractal] == "-3.0000 ETH"
 
-    def test_missing_data_exclusions_widen_the_window_total(self, tmp_path: Path):
-        reports = [
-            load_report(
-                write_report(
-                    tmp_path, "a.json", payload(missing_data_auctions=[11, 12, 13])
-                )
-            )
-        ]
 
-        table = comparison(group_reports(reports))
+    def test_fast_path_exclusions_widen_the_window_total(self, tmp_path: Path):
+        data = payload(fast_path_auctions=[21, 22])
+        report = load_report(write_report(tmp_path, "a.json", data))
 
-        rows = dict(table.rows)
+        rows = dict(comparison(group_reports([report])).rows)
+
+        assert report.fast_path == 2
+        assert report.analysed == 98
         assert rows["auctions analysed"][0] == (
-            "98 of 103 (2 price-suspect, 3 missing-data excluded)"
+            "98 of 102 (2 price-suspect, 2 fast-path excluded)"
         )
+
 
     def test_sign_split_keeps_direction_visible(self, tmp_path: Path):
         table = self.build(tmp_path)
@@ -895,17 +873,14 @@ class TestReportRoundTrip:
             order_diffs=(
                 OrderDiff(
                     order_uid="ab",
-                    contributes=True,
                     executed_base=True,
                     executed_loo=True,
                     surplus_base=100,
                     surplus_loo=40,
                     volume_base=600_000,
-                    volume_loo=590_000,
                 ),
                 OrderDiff(
                     order_uid="cd",
-                    contributes=True,
                     executed_base=True,
                     executed_loo=False,
                     surplus_base=40,
@@ -937,7 +912,6 @@ class TestReportRoundTrip:
             start="2026-08-01",
             end="2026-08-02",
             auction_ids=[7],
-            missing_data=[],
             runs=[],
         )
         solver_run = run_module.SolverRun(
@@ -979,14 +953,14 @@ class TestReportRoundTrip:
 
 
 def test_caveats_cover_the_plan_list():
-    """The plan names six caveats, plus the USD one, the missing-data one, the
+    """The plan names six caveats, plus the USD one, the fast-path and JIT one, the
     coverage-denominator one, the relative-price one and the three the quote side adds
     (what it does, quote rewards, conversion); a comparison must carry them all, so
     their disappearance should fail loudly here."""
     assert len(CAVEATS) == 12
     themes = (
         "behavioural", "Settlement", "Filter", "quote side", "Quote rewards",
-        "Conversion", "reward", "Price", "neither order table", "two denominators",
+        "Conversion", "reward", "Price", "Fast-path", "two denominators",
         "relative price", "USD",
     )
     for theme, caveat in zip(themes, CAVEATS, strict=True):
@@ -1021,13 +995,11 @@ class TestQuoteSideRoundTrip:
             order_diffs=(
                 OrderDiff(
                     order_uid="ab",
-                    contributes=True,
                     executed_base=True,
                     executed_loo=True,
                     surplus_base=100,
                     surplus_loo=100,
                     volume_base=600_000,
-                    volume_loo=600_000,
                     fee_base=50,
                     fee_loo=50,
                     partner_fee_base=0,
@@ -1051,7 +1023,6 @@ class TestQuoteSideRoundTrip:
                 order_uid=uid,
                 leaf="degraded",
                 is_sell=True,
-                tier="corroborated",
                 winner="w",
                 replacement="s",
                 effective_base=1000.0,
@@ -1088,21 +1059,16 @@ class TestQuoteSideRoundTrip:
                 streams=3,
                 streams_reproduced=3,
             ),
-            coverage_start="2026-07-22 15:28:03",
-            links=(
-                LinkStats(
-                    link="quote-id",
-                    orders=8,
-                    linked=5,
-                    corroborated=5,
-                    requoted=1,
-                    streamed=2,
-                    streamed_early=1,
-                    unlinked={
-                        "stored quote not reproduced": 1,
-                        "placed from a non-winning estimate": 2,
-                    },
-                ),
+            link=LinkStats(
+                orders=8,
+                linked=5,
+                requoted=1,
+                streamed=2,
+                streamed_early=1,
+                unlinked={
+                    "stored quote not reproduced": 1,
+                    "placed from a non-winning estimate": 2,
+                },
             ),
             price_suspects=frozenset({"ee", "ff"}),
             one_sided_suspects=1,
@@ -1113,7 +1079,6 @@ class TestQuoteSideRoundTrip:
             start="2026-08-01",
             end="2026-08-02",
             auction_ids=[9],
-            missing_data=[],
             runs=[],
             quote_window=quote_window,
         )
@@ -1162,10 +1127,8 @@ class TestQuoteSideRoundTrip:
             quote.price_suspects_one_sided,
             quote.price_suspects_two_sided,
         ) == (2, 1, 2)
-        (link,) = quote.links
-        assert (link.link, link.orders, link.linked, link.rate) == (
-            "quote-id", 8, 5, Decimal(5) / 8
-        )
+        link = quote.link
+        assert (link.orders, link.linked, link.rate) == (8, 5, Decimal(5) / 8)
         # Reasons come back largest first, whatever order the file holds them in.
         assert link.unlinked == (
             ("placed from a non-winning estimate", 2),
@@ -1185,7 +1148,7 @@ class TestQuoteSideRoundTrip:
         assert report.moves[0].quote_fee_recharge == 30
         assert report.moves[0].quote_fee_recharges == (30,)
         assert report.delta_protocol_fees == 0
-        assert (quote.fee_recharge, quote.fee_recharge_protocol) == (30, 30)
+        assert quote.fee_recharge_protocol == 30
         assert quote.fee_recharge_median == Decimal(30)
         assert quote.fee_recharge_largest_share == Decimal(1)
         # Bookkeeping stays out of the file; the counts are what a reader needs.
@@ -1209,7 +1172,7 @@ class TestQuoteSideRoundTrip:
             "stream replay 3 of 3"
         )
         assert rows["  order↔competition link"][0] == (
-            "quote-id: 5 of 8 (62.5%), 1 via the backend's re-quote, 2 through a stream "
+            "5 of 8 (62.5%), 1 via the backend's re-quote, 2 through a stream "
             "(1 before it finished); 2 placed from a non-winning estimate; 1 stored quote "
             "not reproduced"
         )
@@ -1217,5 +1180,5 @@ class TestQuoteSideRoundTrip:
             "+0.0000 ETH to the DAO, 0.0000 ETH to partners — not added to the fee rows"
         )
         assert rows["  quote wins in the window"][0] == (
-            "2 corroborated of 2 in 2 matched orders (0 via the raw layer)"
+            "2 in 2 matched orders"
         )

@@ -44,40 +44,13 @@ WEI = Decimal(10) ** 18
 HEADLINE_RULE = "inherited"
 ALTERNATIVE_RULES = ("assume-settled",)
 
-REPORT_FORMAT = 14
+REPORT_FORMAT = 15
 """Version marker of the `analyse --out` payload, required by `load_report`. Bumped
 when the shape changes, so a stale file fails with "re-run analyse" instead of a
-KeyError deep inside a comparison. Format 14 (M16) links orders by quote id where the
-record allows and says per link how many it placed (`quote_window.links`), leaves trivial
-unwraps unlinked, and adds the two-sided price check with per-check counts — a format-13
-file's bnb quote figures carry orders worth 28.7 M BNB that the new check removes, so the
-two are not comparable. Format 13 splits the fee: the fee deltas are computed
-with the recorded quotes on both sides and the quote's own fee effect is carried apart, per
-auction and per recharged order (`quote_fee_recharge*`, D28 revised). Format 12 links
-orders to the competitions the gold tables do not hold (recovered from the raw layer) and
-carries the per-source match count.
-Format 11 recounts `quote_substituted_orders` as
-distinct executed orders, adds the quote-only auction count and the two limit checks
-(D33, D34), and retains fee-only auctions in `changed` — a format-10 file's per-auction
-fee moves are short by the quote effect wherever nothing else moved. Within format 11
-the optional `quote_shift_auctions` id list was added later and is read with a default,
-so the one file shape that predates it still loads. Format 10 added
-the quote side (M15). Format 8 added
-`auctions_filter_guess_could_matter` — whether a guessed filter verdict could have moved
-an auction's winners, the counterfactual's one filter number with no ground truth behind
-it. Format 7 moved the fairness filter onto per-pair
-**scores** (M14) — a behaviour change rather than a new key, and the reason the marker
-moved: a format-6 report was filtered on user surplus, so tabulating it beside a
-format-7 one would compare two different mechanisms. It also carries the filter's own
-exactness (`multi_pair_solutions`, `multi_pair_filter_proxied`). Format 6 added the
-protocol-fee deltas — total, partner share and the DAO's own revenue (M13). Format 5
-added the window's executed order count
-including partially fillable orders — the denominator of the coverage share (D24).
-Format 4 added the window's recorded executed volume — the denominator of "averaged
-over all traded volume". Format 3 added per-order volumes and `partially_fillable`
-to the order diffs; format 2 derived its keys from the `Analysis` and
-`AuctionCounterfactual` field names; format 1 (unmarked) was the hand-written
-`*_wei`-suffixed shape."""
+KeyError deep inside a comparison. Format 15 is the current-mechanism report: JIT orders
+are not in it, fast-path auctions are listed (`fast_path_auctions`), and the quote side
+carries one link (`quote_window.link`) with no match tiers. A format-14 file excluded
+every auction with an unrecorded JIT order, so the two are not comparable."""
 
 SIGN_CONVENTION_ID = "counterfactual-minus-actual"
 """Written into every `analyse --out` JSON and required by `load_report`, so a report
@@ -125,16 +98,14 @@ CAVEATS = (
     "the quote side, never a surplus recomputed against a limit nobody signed, which "
     "would rise exactly when the user was shown a worse price. Three limits ride "
     "with it. The pick is reproduced, not recorded: the table reports how often "
-    "re-running it returns the recorded winner. The order to request match is a "
-    "heuristic (tokens, kind, amount, time) — placed against the gold request table and, "
-    "for the competitions that table does not hold, against the raw estimates — of which "
-    "about four in five are corroborated by the winning estimate's own amount, and only "
-    "corroborated matches are allowed to move a fee. And holding "
+    "re-running it returns the recorded winner. An order is linked to its competition "
+    "by the id of the quote it was placed with, and only where the linked estimate "
+    "reproduces the stored amount to the atom; the table says how many were. And holding "
     "executions and ranking fixed is checked, not assumed: the "
     "table counts recharged orders whose execution would not have cleared the limit the "
     "replacement quote implies, and auctions where shifting every score by that limit "
     "change would move the winner set.",
-    "Quote rewards (CIP-72) are excluded: the counterfactual quote's eligibility is "
+    "Quote rewards are excluded: the counterfactual quote's eligibility is "
     "not evaluated, so no reward figure on either side includes them.",
     "Conversion is out of scope: a worse quote means some users would not have placed "
     "the order at all, and there is no counterfactual for an order nobody created. The "
@@ -147,11 +118,10 @@ CAVEATS = (
     "table: native token prices in the auction data are occasionally wrong by orders "
     "of magnitude, and one such fabricated price once supplied 82% of a solver's "
     "headline (docs/analytics-db.md#native-prices-can-be-plain-wrong).",
-    "Auctions with a traded order recorded in neither order table are excluded and "
-    "counted in the table: solver-provided (JIT) orders are only recorded for settled "
-    "batches, so an unsettled solution's JIT orders are unrecoverable and its auction "
-    "cannot be replayed faithfully. The exclusions are not random — they are "
-    "JIT-heavy and reverted-winner auctions.",
+    "Fast-path auctions are excluded and counted in the table: one order is settled "
+    "straight from its quote competition, so there is no solver competition to "
+    "replay. Solver-provided (JIT) orders are ignored throughout, as the mechanism "
+    "ignores them: they earn no score and claim no token pair.",
     "Coverage has two denominators, and they answer different questions. \"Of N "
     "compared\" is relative to orders traded in auctions the solver bid in — it "
     "describes the solver's own turf and overstates window-level dependence for a "
@@ -221,17 +191,14 @@ class QuoteSide:
     ranking: str
     start: str
     end: str
-    """The window the quote side covers. Shorter than the run's when the quote data
-    begins later — reported rather than left to look like a thin market."""
     orders_total: int
     """Every order created in the quote window that carries a recorded quote, before the
     price-suspect exclusion."""
     trivial_orders: int
     """Of those, the unwraps no competition priced (`quotes.TRIVIAL_QUOTE_SOLVER`) —
-    linked by neither link, so the link rate is over `orders_total − trivial_orders`."""
-    links: tuple[LinkSummary, ...]
-    """Each link that placed orders in the window: the quote-id join from 2026-09-29
-    17:20 UTC, the heuristic before it."""
+    not linked, so the link rate is over `orders_total − trivial_orders`."""
+    link: LinkSummary
+    """How the quote-id link fared on the window's orders."""
     window_orders: int
     window_volume_native: int
     """Orders created in the window carrying a recorded quote **and** passing both price
@@ -247,15 +214,9 @@ class QuoteSide:
     check failed — either one, then each, then the executed volume they took out of the
     denominator at the api's price, which is the size of what the checks caught."""
     matched: int
-    matched_corroborated: int
-    matched_raw: int
-    """How many orders were linked, how many of those the winning estimate's own amount
-    corroborates (all of them on the quote-id link), and how many rest on competitions
-    read from the raw layer. Everything below is over `matched`."""
+    """How many orders were linked. Everything below is over `matched`."""
     quote_wins: int
-    quote_wins_corroborated: int
     no_quote: int
-    no_quote_all: int
     no_quote_share: Decimal | None
     class_flips: int
     """Wins where the replacement is unverified while the removed winner was verified:
@@ -275,7 +236,6 @@ class QuoteSide:
     """Wins on orders placed from a streamed quote, and how many of their replacements
     depend on when the user committed — the one assumption of the stream rule, counted."""
     window_bps: Decimal | None
-    window_bps_all_tiers: Decimal | None
     conditional_bps: Decimal | None
     """The quote-side price change, spread over the window's whole quoted volume and —
     the conditional reading — over the volume of the orders whose quote moved. Both are
@@ -289,7 +249,6 @@ class QuoteSide:
     was 86.6% of one solver's figure and 84.6% of another's — the same concentration
     check the solve side runs on Δsurplus, and the same reason it exists. Derived from
     the stored diffs at load time, so no re-run is needed to revise the conditioning."""
-    fee_recharge: int
     fee_recharge_partner: int
     fee_recharge_protocol: int
     fee_recharge_median: Decimal | None
@@ -335,12 +294,11 @@ class QuoteSide:
 
 @dataclass(frozen=True)
 class LinkSummary:
-    """One link's share of a quote window (`quotes.LinkStats`, as the report stores it)."""
+    """The quote-id link over a quote window (`quotes.LinkStats`, as the report stores
+    it)."""
 
-    link: str
     orders: int
     linked: int
-    corroborated: int
     requoted: int
     """Of `linked`, the ethflow orders linked to the backend's own re-quote at indexing
     rather than through their quote id."""
@@ -374,9 +332,9 @@ class Report:
     outcome_rule: str
     price_suspects_excluded: bool
     price_suspects: int
-    missing_data: int
-    """Auctions excluded before arbitration for missing order data (D17). Unlike price
-    suspects these are not part of `auctions`; the window total is their sum."""
+    fast_path: int
+    """Fast-path auctions, excluded before arbitration. Unlike price suspects these are
+    not part of `auctions`; the window total is their sum."""
     auctions: int
     auctions_with_solver: int
     auctions_solver_won: int
@@ -549,7 +507,7 @@ def _price_impact(changed: Sequence[Mapping[str, Any]]) -> PriceImpact:
     for row in changed:
         for diff in row["order_diffs"]:
             if not (
-                diff["contributes"] and diff["executed_base"] and diff["executed_loo"]
+                diff["executed_base"] and diff["executed_loo"]
             ):
                 continue
             if diff["partially_fillable"]:
@@ -584,7 +542,7 @@ def _only_with_surplus(order_diffs: Sequence[Mapping[str, Any]]) -> int:
     return sum(
         (diff["surplus_loo"] or 0) - (diff["surplus_base"] or 0)
         for diff in order_diffs
-        if diff["contributes"] and diff["executed_base"] and not diff["executed_loo"]
+        if diff["executed_base"] and not diff["executed_loo"]
     )
 
 
@@ -596,17 +554,13 @@ def _quote_distribution(
     diffs: Sequence[Mapping[str, Any]],
 ) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
     """`(median_bps, largest_share, largest_bps)` over the diffs the headline is built
-    from — degraded, corroborated.
+    from — the degraded ones.
 
     The share is the largest single order's contribution over the signed total, so a row
     whose contributions offset can exceed 100%, exactly as the solve side's
     largest-auction share can. It is a prompt to open the order, not a discount factor.
     """
-    rows = [
-        d
-        for d in diffs
-        if d["leaf"] == "degraded" and d["tier"] == "corroborated"
-    ]
+    rows = [d for d in diffs if d["leaf"] == "degraded"]
     if not rows:
         return None, None, None
     contributions = [
@@ -653,20 +607,15 @@ def _quote_side(payload: Mapping[str, Any]) -> QuoteSide | None:
         end=window["end"],
         orders_total=window["orders"],
         trivial_orders=window["trivial_orders"],
-        links=tuple(
-            LinkSummary(
-                link=link["link"],
-                orders=link["orders"],
-                linked=link["linked"],
-                corroborated=link["corroborated"],
-                requoted=link["requoted"],
-                streamed=link["streamed"],
-                streamed_early=link["streamed_early"],
-                unlinked=tuple(
-                    sorted(link["unlinked"].items(), key=lambda item: -item[1])
-                ),
-            )
-            for link in window["links"]
+        link=LinkSummary(
+            orders=window["link"]["orders"],
+            linked=window["link"]["linked"],
+            requoted=window["link"]["requoted"],
+            streamed=window["link"]["streamed"],
+            streamed_early=window["link"]["streamed_early"],
+            unlinked=tuple(
+                sorted(window["link"]["unlinked"].items(), key=lambda item: -item[1])
+            ),
         ),
         window_orders=quote["window_orders"],
         window_volume_native=quote["window_volume_native"],
@@ -676,12 +625,8 @@ def _quote_side(payload: Mapping[str, Any]) -> QuoteSide | None:
         price_suspects_two_sided=window["price_suspects_two_sided"],
         price_suspect_volume_native=window["price_suspect_volume_native"],
         matched=quote["matched"],
-        matched_corroborated=quote["matched_corroborated"],
-        matched_raw=window["matched_raw"],
         quote_wins=quote["quote_wins"],
-        quote_wins_corroborated=quote["quote_wins_corroborated"],
         no_quote=quote["no_quote"],
-        no_quote_all=quote["no_quote_all"],
         no_quote_share=_decimal_or_none(quote["no_quote_share"]),
         class_flips=quote["class_flips"],
         degraded=quote["degraded"],
@@ -692,12 +637,10 @@ def _quote_side(payload: Mapping[str, Any]) -> QuoteSide | None:
         stream_wins=quote["stream_wins"],
         commit_dependent=quote["commit_dependent"],
         window_bps=_decimal_or_none(quote["window_bps"]),
-        window_bps_all_tiers=_decimal_or_none(quote["window_bps_all_tiers"]),
         conditional_bps=_decimal_or_none(quote["conditional_bps"]),
         median_bps=median,
         largest_share=largest_share,
         largest_bps=largest_bps,
-        fee_recharge=payload["quote_fee_recharge"],
         fee_recharge_partner=payload["quote_partner_fee_recharge"],
         fee_recharge_protocol=payload["quote_fee_recharge_protocol"],
         fee_recharge_median=recharge_median,
@@ -780,7 +723,7 @@ def load_report(path: str) -> Report:
     partial_uids: set[str] = set()
     for row in payload["changed"]:
         for diff in row["order_diffs"]:
-            if diff["contributes"] and diff["executed_base"] and not diff["executed_loo"]:
+            if diff["executed_base"] and not diff["executed_loo"]:
                 only_with += 1
                 uids = partial_uids if diff["partially_fillable"] else fok_uids
                 uids.add(diff["order_uid"])
@@ -795,7 +738,7 @@ def load_report(path: str) -> Report:
         outcome_rule=payload["outcome_rule"],
         price_suspects_excluded=bool(payload["exclude_price_suspect"]),
         price_suspects=len(payload["price_suspect_auctions"]),
-        missing_data=len(payload["missing_data_auctions"]),
+        fast_path=len(payload["fast_path_auctions"]),
         auctions=payload["auctions"],
         auctions_with_solver=payload["auctions_with_solver"],
         delta_protocol_and_partner_fees=payload["delta_protocol_and_partner_fees"],
@@ -1162,12 +1105,11 @@ def comparison(
         exclusions: list[str] = []
         if report.price_suspects and report.price_suspects_excluded:
             exclusions.append(f"{report.price_suspects} price-suspect")
-        if report.missing_data:
-            exclusions.append(f"{report.missing_data} missing-data")
+        if report.fast_path:
+            exclusions.append(f"{report.fast_path} fast-path")
         excluded = f" ({', '.join(exclusions)} excluded)" if exclusions else ""
-        auctions.append(
-            f"{report.analysed:,} of {report.auctions + report.missing_data:,}{excluded}"
-        )
+        window_total = report.auctions + report.fast_path
+        auctions.append(f"{report.analysed:,} of {window_total:,}{excluded}")
         bid.append(
             f"{report.auctions_with_solver:,} "
             f"({pct(report.auctions_with_solver, report.analysed)})"
@@ -1379,9 +1321,7 @@ def comparison(
                 )
             )
             quote_wins_row.append(
-                f"{quote.quote_wins_corroborated:,} corroborated of "
-                f"{quote.quote_wins:,} in {quote.matched:,} matched orders "
-                f"({quote.matched_raw:,} via the raw layer)"
+                f"{quote.quote_wins:,} in {quote.matched:,} matched orders"
                 + (
                     f"; {quote.stream_wins:,} on streamed quotes, "
                     f"{quote.commit_dependent:,} of them commit-dependent"
@@ -1485,17 +1425,14 @@ def _net_cell(report: Report, usd: UsdContext | None) -> str:
 
 
 def _link_cell(quote: QuoteSide) -> str:
-    """How the window's orders were tied to their competitions: per link, how many it
-    placed of the orders it was asked for and why the rest were not, then the trivial
-    unwraps neither link takes."""
+    """How the window's orders were tied to their competitions: how many the quote-id
+    link placed of the orders it was asked for and why the rest were not, then the
+    trivial unwraps it does not take."""
+    link = quote.link
     parts: list[str] = []
-    for link in quote.links:
+    if link.orders:
         rate = f" ({link.rate:.1%})" if link.rate is not None else ""
         detail = (
-            f", {link.corroborated:,} corroborated"
-            if link.link == "heuristic"
-            else ""
-        ) + (
             f", {link.requoted:,} via the backend's re-quote" if link.requoted else ""
         ) + (
             f", {link.streamed:,} through a stream ({link.streamed_early:,} before it "
@@ -1503,9 +1440,7 @@ def _link_cell(quote: QuoteSide) -> str:
             if link.streamed
             else ""
         ) + "".join(f"; {n:,} {why}" for why, n in link.unlinked)
-        parts.append(
-            f"{link.link}: {link.linked:,} of {link.orders:,}{rate}{detail}"
-        )
+        parts.append(f"{link.linked:,} of {link.orders:,}{rate}{detail}")
     if quote.trivial_orders:
         parts.append(f"{quote.trivial_orders:,} trivial unwraps, no competition")
     return " | ".join(parts) if parts else "no orders"

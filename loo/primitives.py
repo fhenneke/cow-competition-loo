@@ -158,12 +158,3 @@ def ceil_div(numerator: int, denominator: int) -> int:
         raise ZeroDivisionError("ceil_div by zero")
     return -(-numerator // denominator)
 
-
-def order_owner(order_uid: str) -> str:
-    """Owner address embedded in a 56-byte order uid (`primitives.rs:46`).
-
-    Layout: 32 bytes digest, 20 bytes owner, 4 bytes valid_to.
-    """
-    if len(order_uid) != 112:
-        raise ValueError(f"order uid is not 56 bytes: {order_uid!r}")
-    return order_uid[64:104]

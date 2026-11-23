@@ -66,14 +66,12 @@ def bid(
         is_winner=is_winner,
         filtered_out=False,
         orders=tuple(orders),
-        contributes={order.uid: True for order in orders},
     )
 
 
 def bundle(bids: list[Bid], prices: dict[str, int] | None = None) -> AuctionBundle:
     return AuctionBundle(
         auction_id=1,
-        jit_owners=frozenset(),
         native_prices=prices if prices is not None else {USDC: ONE},
         bids=tuple(bids),
         reference_scores={},
@@ -327,15 +325,6 @@ class TestRewardValidation:
         (mismatch,) = validation.mismatches
         assert mismatch.differing_fields == ("lower_cap",)
 
-    def test_a_mart_row_without_a_recorded_floor_is_compared_on_the_rest(self):
-        """The mart's `lower_reward_cap` is NULL on rows built before it was added (the
-        August 2026 rows): nothing to compare, so the floor is checked through
-        `capped_reward` alone, as before."""
-        validation = RewardValidation()
-        validation.check_auction(1, {"a": self.capped(Decimal(-2))}, {"a": self.capped(None)})
-        assert (validation.rows, validation.rows_matched) == (1, 1)
-        assert validation.gate_met
-
 
 class TestRewardsInCounterfactual:
     def test_the_removed_solver_drops_out_and_its_replacement_earns_instead(self):
@@ -507,10 +496,8 @@ class TestCapInheritance:
             solution_caps={0: SolutionCap(upper=Decimal(10), lower=-5, excluded=False)},
         )
         assert result.baseline_rewards["x"].capped_reward == Decimal(10)
-        assert not result.baseline_rewards["x"].cap_inherited
         assert result.loo_rewards["b"].upper_cap == Decimal(10)
         assert result.loo_rewards["b"].capped_reward == Decimal(10)
-        assert result.loo_rewards["b"].cap_inherited
         assert result.delta_rewards_capped == Decimal(0)
         assert result.cap_double_inherited == 0 and not result.cap_orphans_loo
 
@@ -544,7 +531,6 @@ class TestCapInheritance:
         assert result.loo_rewards["b"].uncapped_reward == -100
         assert result.loo_rewards["b"].lower_cap == Decimal(-2)
         assert result.loo_rewards["b"].capped_reward == Decimal(-2)
-        assert result.loo_rewards["b"].cap_inherited
         assert result.delta_rewards_capped == Decimal(0)
 
     def test_a_slot_without_a_penalty_cap_passes_on_the_flat_floor(self):

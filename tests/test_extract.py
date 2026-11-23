@@ -1,4 +1,4 @@
-"""`load_auctions`, the D17 missing-order policy, the price source, the
+"""`load_auctions`, the missing-order error and fast-path exclusion, the price source, the
 conversion-rate loader, and the reward-cap loaders.
 
 The DB is faked by monkeypatching `extract.fetch` with canned rows keyed on the module's
@@ -8,7 +8,6 @@ own SQL constants, so the tests exercise exactly the code path the CLI uses.
 from decimal import Decimal
 from typing import Any, cast
 
-import psycopg2.errors
 import pytest
 
 from loo import extract
@@ -21,8 +20,8 @@ CONN = cast(Connection, None)
 
 
 def execution(auction_id: int, missing: bool = False) -> Row:
-    """One execution row; `missing=True` mimics an order in neither order table, where
-    every column served by the orders join comes back NULL."""
+    """One execution row; `missing=True` mimics an auction order absent from the orders
+    table, where every column served by the join comes back NULL."""
     return {
         "auction_id": auction_id,
         "solution_uid": 0,
@@ -35,7 +34,6 @@ def execution(auction_id: int, missing: bool = False) -> Row:
         "buy_amount": None if missing else 15,
         "kind": None if missing else "sell",
         "partially_fillable": None if missing else False,
-        "in_auction": not missing,
     }
 
 
@@ -43,7 +41,7 @@ def execution(auction_id: int, missing: bool = False) -> Row:
 def canned_db(monkeypatch: pytest.MonkeyPatch) -> None:
     data: dict[str, list[Row]] = {
         extract.AUCTIONS_SQL: [
-            {"auction_id": a, "block_deadline": 1, "jit_owners": [], "unpriced": False}
+            {"auction_id": a, "block_deadline": 1, "unpriced": False, "fast_path": False}
             for a in (GOOD, BAD)
         ],
         extract.SOLUTIONS_SQL: [
@@ -58,7 +56,7 @@ def canned_db(monkeypatch: pytest.MonkeyPatch) -> None:
             for a in (GOOD, BAD)
         ],
         extract.EXECUTIONS_SQL: [execution(GOOD), execution(BAD, missing=True)],
-        extract.price_query(extract.PRICES_SQL, legacy=False): [],
+        extract.price_query(extract.PRICES_SQL): [],
         extract.REFERENCE_SCORES_SQL: [],
         extract.FEE_POLICIES_SQL: [
             {
@@ -86,21 +84,12 @@ def canned_db(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(extract, "fetch", fake_fetch)
 
 
-class TestMissingOrderPolicy:
-    def test_raises_by_default(self, canned_db: None):
+class TestMissingOrder:
+    """An auction order absent from the orders table is a broken sync, so it is loud."""
+
+    def test_it_raises(self, canned_db: None):
         with pytest.raises(extract.MissingOrderError):
             list(extract.load_auctions(CONN, [GOOD, BAD]))
-
-    def test_collector_skips_the_auction_and_records_it(self, canned_db: None):
-        missing: list[int] = []
-
-        bundles = list(extract.load_auctions(CONN, [GOOD, BAD], missing_data=missing))
-
-        assert [b.auction_id for b in bundles] == [GOOD]
-        assert missing == [BAD]
-        # the surviving auction is complete, not partially built
-        assert len(bundles[0].bids) == 1
-        assert len(bundles[0].bids[0].orders) == 1
 
 
 class TestFeeContext:
@@ -140,30 +129,46 @@ class TestFeeContext:
         assert bundle.fee_context.known == frozenset()
 
 
+class TestFastPath:
+    """A fast-path auction settles one order straight from its quote competition; the
+    losing quotes are stored as solutions below the order's limit. It is excluded by
+    name rather than arbitrated."""
+
+    def fast(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        original = extract.fetch
+
+        def fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
+            rows = original(conn, sql, params)
+            if sql is extract.AUCTIONS_SQL:
+                return [{**row, "fast_path": row["auction_id"] == BAD} for row in rows]
+            return rows
+
+        monkeypatch.setattr(extract, "fetch", fetch)
+
+    def test_it_is_skipped_and_recorded(
+        self, canned_db: None, monkeypatch: pytest.MonkeyPatch
+    ):
+        self.fast(monkeypatch)
+        fast_path: list[int] = []
+
+        bundles = list(extract.load_auctions(CONN, [GOOD, BAD], fast_path=fast_path))
+
+        assert [b.auction_id for b in bundles] == [GOOD]
+        assert fast_path == [BAD]
+
+    def test_it_is_skipped_without_a_collector_too(
+        self, canned_db: None, monkeypatch: pytest.MonkeyPatch
+    ):
+        """It comes before the missing-order check: `BAD`'s order is missing as well,
+        and a fast-path auction must not die on data nobody is going to use."""
+        self.fast(monkeypatch)
+        assert [b.auction_id for b in extract.load_auctions(CONN, [GOOD, BAD])] == [GOOD]
+
+
 class TestPriceSource:
-    """Prices come from the `competition_auctions` arrays. The legacy table is read only
-    for auctions whose arrays are NULL, so dropping it cannot break a window the arrays
-    cover, and cannot silently empty one they do not."""
+    """Prices come from the `competition_auctions` arrays and from nowhere else."""
 
-    def test_covered_auctions_never_touch_the_legacy_table(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        queries: list[str] = []
-
-        def fake_fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
-            queries.append(sql)
-            return []
-
-        monkeypatch.setattr(extract, "fetch", fake_fetch)
-        extract.fetch_prices(CONN, extract.USD_PRICES_SQL, {"ids": [GOOD], "tokens": []}, set())
-
-        assert len(queries) == 1
-        assert extract.LEGACY_PRICES_TABLE not in queries[0]
-        assert "price_tokens" in queries[0]
-
-    def test_only_the_unpriced_auctions_are_read_from_the_legacy_table(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_prices_are_read_from_the_arrays(self, monkeypatch: pytest.MonkeyPatch):
         calls: list[tuple[str, Any]] = []
 
         def fake_fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
@@ -171,77 +176,55 @@ class TestPriceSource:
             return []
 
         monkeypatch.setattr(extract, "fetch", fake_fetch)
-        params = {"ids": [GOOD, BAD], "tokens": []}
-        extract.fetch_prices(CONN, extract.USD_PRICES_SQL, params, {BAD})
+        params = {"ids": [GOOD], "tokens": []}
+        extract.fetch_prices(CONN, extract.USD_PRICES_SQL, params)
 
         [(sql, sent)] = calls
-        assert extract.LEGACY_PRICES_TABLE in sql
-        assert sent == {"ids": [GOOD, BAD], "tokens": [], "unpriced": [BAD]}
+        assert "price_tokens" in sql
+        assert sent == params
 
-    def test_legacy_prices_reach_the_bundle(
+    def test_array_prices_reach_the_bundle(
         self, canned_db: None, monkeypatch: pytest.MonkeyPatch
     ):
         original = extract.fetch
-        legacy_sql = extract.price_query(extract.PRICES_SQL, legacy=True)
+        prices_sql = extract.price_query(extract.PRICES_SQL)
 
-        def fetch_unpriced(conn: Connection, sql: str, params: Any = None) -> list[Row]:
-            if sql is extract.AUCTIONS_SQL:
-                return [{**row, "unpriced": True} for row in original(conn, sql, params)]
-            if sql == legacy_sql:
-                assert params["unpriced"] == [GOOD]
+        def fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
+            if sql == prices_sql:
                 return [{"auction_id": GOOD, "token": "bb" * 20, "price": 7}]
             return original(conn, sql, params)
 
-        monkeypatch.setattr(extract, "fetch", fetch_unpriced)
+        monkeypatch.setattr(extract, "fetch", fetch)
         bundle = next(iter(extract.load_auctions(CONN, [GOOD])))
         assert bundle.native_prices == {"bb" * 20: 7}
 
-    def test_bids_with_no_prices_anywhere_raise(
+    def test_bids_with_null_price_arrays_raise(
         self, canned_db: None, monkeypatch: pytest.MonkeyPatch
     ):
-        """What a dropped-but-empty or never-backfilled source looks like: without the
-        guard the auction becomes a valuation failure and the run exits 0."""
+        """An auction before 2026-09-15: without the guard it becomes a valuation
+        failure and the run exits 0."""
         original = extract.fetch
-        legacy_sql = extract.price_query(extract.PRICES_SQL, legacy=True)
 
         def fetch_unpriced(conn: Connection, sql: str, params: Any = None) -> list[Row]:
             if sql is extract.AUCTIONS_SQL:
                 return [{**row, "unpriced": True} for row in original(conn, sql, params)]
-            if sql == legacy_sql:
-                return []
             return original(conn, sql, params)
 
         monkeypatch.setattr(extract, "fetch", fetch_unpriced)
         with pytest.raises(extract.MissingPricesError, match=f"auction {GOOD} has bids"):
             list(extract.load_auctions(CONN, [GOOD]))
 
-    def test_a_dropped_legacy_table_names_what_it_strands(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        def fake_fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
-            raise psycopg2.errors.UndefinedTable(
-                f'relation "dbt.{extract.LEGACY_PRICES_TABLE}" does not exist'
-            )
 
-        monkeypatch.setattr(extract, "fetch", fake_fetch)
-        with pytest.raises(extract.MissingPricesError, match=f"2 auctions in {GOOD}..{BAD}"):
-            extract.fetch_prices(
-                CONN, extract.USD_PRICES_SQL, {"ids": [GOOD, BAD], "tokens": []}, {GOOD, BAD}
-            )
+class TestSupportedWindow:
+    """Only the current mechanism is replayed, so an older window fails by name."""
 
-    def test_another_missing_table_is_not_blamed_on_prices(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        def fake_fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
-            raise psycopg2.errors.UndefinedTable(
-                'relation "dbt.stg_backend_data__competition_auctions" does not exist'
-            )
+    def test_a_window_before_the_mechanism_start_is_refused(self):
+        with pytest.raises(extract.UnsupportedWindowError, match="2026-10-27"):
+            extract.require_current_mechanism("2026-10-27")
 
-        monkeypatch.setattr(extract, "fetch", fake_fetch)
-        with pytest.raises(psycopg2.errors.UndefinedTable):
-            extract.fetch_prices(
-                CONN, extract.USD_PRICES_SQL, {"ids": [GOOD], "tokens": []}, {GOOD}
-            )
+    def test_the_first_supported_day_and_later_pass(self):
+        extract.require_current_mechanism(extract.MECHANISM_START)
+        extract.require_current_mechanism("2026-11-18 12:00:00")
 
 
 class TestAllSolvers:

@@ -113,9 +113,9 @@ four focus measures (surplus, fees, coverage, price) never read the cap.
 
 `upper_reward_cap` depends on the **realised protocol fees of the settled batch**. A
 counterfactual winner that never settled has no realised fees, so they would have to be
-estimated from its proposed trade executions plus fee policies — and fee policies are
-stored only for executed orders (see [analytics-db.md](analytics-db.md)). The backfill
-workaround is to take an order's policies from another auction where it was executed.
+estimated from its proposed trade executions plus fee policies, which are stored for
+every order of every solution the arbitrator kept
+([analytics-db.md](analytics-db.md#fee-policies-cover-every-order-of-every-kept-solution)).
 
 Uncapped rewards need only scores and reference scores, both of which the winner-selection
 code produces directly. Start there.

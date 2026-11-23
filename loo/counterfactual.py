@@ -162,10 +162,6 @@ class OrderOutcome:
     """`None` when the order was not executed. Zero is a legitimate value for an
     executed order — an order filled at exactly its limit price has no surplus — so the
     flag and the amount have to stay separate."""
-    contributes: bool
-    """Does this order count as *user* surplus (`auction.rs:45`)? A JIT order whose
-    owner is not in `surplus_capturing_jit_order_owners` is executed but its surplus
-    accrues to the market maker, so it is carried at zero."""
     solution_uid: int | None = None
     solver: str | None = None
     observed: bool = False
@@ -176,8 +172,7 @@ class OrderOutcome:
     this solution's own, which is where the discarded surplus is real."""
     volume_native: int | None = None
     """Native value of the received leg when executed, `None` otherwise — the
-    denominator for relative price statements. Carried at 0 for a non-contributing
-    order, mirroring `surplus_native`; neither enters any user statistic."""
+    denominator for relative price statements."""
     partially_fillable: bool = False
     """Carried so the aggregation can exclude partially fillable orders from the
     relative-price statistic: the two sides may execute different amounts, and Δsurplus
@@ -196,7 +191,7 @@ class OrderOutcome:
     out, since every order of a kept solution has its policies recorded."""
 
 
-UNEXECUTED = OrderOutcome(executed=False, surplus_native=None, contributes=False)
+UNEXECUTED = OrderOutcome(executed=False, surplus_native=None)
 
 
 def price_imbalanced(
@@ -260,10 +255,7 @@ def recorded_executed_volume(
             if not outcome.counts_as_executed:
                 continue
         for order in entry.bid.orders:
-            order_volume = entry.valuation.order_volume_native.get(order.uid)
-            if order_volume is None:
-                # Non-contributing (JIT) order: not a user's volume.
-                continue
+            order_volume = entry.valuation.order_volume_native[order.uid]
             orders_all += 1
             if order.partially_fillable:
                 continue
@@ -339,9 +331,6 @@ class SideCaps:
     """The CIP-87 penalty cap, own or inherited like `by_uid`. `None` here is a
     solution without a cap, not an unknown: a replacement inherits it when any slot it
     displaced had none, and its solver's floor falls back to the flat one."""
-    inherited_solvers: frozenset[str]
-    """Solvers whose caps include at least one inherited contribution, i.e. whose
-    capped reward is an estimate rather than a record."""
     double_inherited: int
     """Displaced winners whose cap was inherited by more than one replacement on this
     side, double-counting it. Expected ~0: a replacement usually claims exactly the
@@ -360,7 +349,6 @@ def winner_caps(
     penalties)."""
     by_uid: dict[int, Decimal | None] = {}
     penalty_by_uid: dict[int, Decimal | None] = {}
-    inherited: set[str] = set()
     orphans: set[int] = set()
     claimed: dict[int, int] = {}
 
@@ -383,14 +371,12 @@ def winner_caps(
             continue
         by_uid[uid] = sum((cap.upper for cap in displaced.values()), Decimal(0))
         penalty_by_uid[uid] = _summed_penalty(displaced.values())
-        inherited.add(entry.bid.solver)
         for displaced_uid in displaced:
             claimed[displaced_uid] = claimed.get(displaced_uid, 0) + 1
 
     return SideCaps(
         by_uid=by_uid,
         penalty_by_uid=penalty_by_uid,
-        inherited_solvers=frozenset(inherited),
         double_inherited=sum(1 for count in claimed.values() if count > 1),
         orphans=frozenset(orphans),
     )
@@ -503,7 +489,6 @@ def side_outcomes(
                     f"{outcomes[order.uid].solution_uid} and {uid}: winners are supposed "
                     f"to hold disjoint token pairs, and an order fixes its own pair"
                 )
-            contributes = order.uid in entry.valuation.order_surplus_native
             outcomes[order.uid] = OrderOutcome(
                 executed=executed,
                 surplus_native=(
@@ -511,7 +496,6 @@ def side_outcomes(
                     if executed
                     else None
                 ),
-                contributes=contributes,
                 solution_uid=uid,
                 solver=entry.bid.solver,
                 observed=observed,
@@ -553,7 +537,6 @@ class OrderDiff:
     """One order, both sides."""
 
     order_uid: str
-    contributes: bool
     executed_base: bool
     executed_loo: bool
     surplus_base: int | None
@@ -561,9 +544,8 @@ class OrderDiff:
     solver_base: str | None = None
     solver_loo: str | None = None
     observed_base: bool = False
-    observed_loo: bool = False
-    """Did that side's outcome come from this solution's own record, rather than being
-    inherited from the slot or assumed?
+    """Did the baseline's outcome come from this solution's own record, rather than
+    being inherited from the slot or assumed?
 
     `observed_base and not executed_base` marks an order the baseline really did lose to a
     reverted batch. Under `inherited` the replacement holding that slot reverts too, so
@@ -571,13 +553,11 @@ class OrderDiff:
     """
 
     late_base: bool = False
-    late_loo: bool = False
     """The batch really filled this order, but after its deadline, so it is carried as a
     failure. The one place this analysis knowingly discards surplus a user did receive."""
 
     volume_base: int | None = None
-    volume_loo: int | None = None
-    """Native value of the received leg on each executed side. On an order that trades
+    """Native value of the received leg in the baseline. On an order that trades
     on both sides, `delta_surplus / volume_base` is the relative price change the
     counterfactual hands the user — the buy-token price cancels out of the ratio, so a
     wrong native price cannot fabricate it."""
@@ -601,27 +581,6 @@ class OrderDiff:
     def fees_known(self) -> bool:
         """Can this order's fee delta be formed at all?"""
         return self.fees_known_base and self.fees_known_loo
-
-    @property
-    def delta_protocol_and_partner_fee(self) -> int:
-        """Counterfactual minus actual, over the whole protocol fee (partner included).
-
-        Negative means less fee was charged without the removed solver.
-        """
-        return (self.fee_loo or 0) - (self.fee_base or 0)
-
-    @property
-    def delta_partner_fee(self) -> int:
-        return (self.partner_fee_loo or 0) - (self.partner_fee_base or 0)
-
-    @property
-    def delta_protocol_fee(self) -> int:
-        """The protocol's own revenue: `delta_protocol_and_partner_fee` net of the partners' share.
-
-        This is the direct value-to-the-protocol number. Negative means the DAO would
-        collect less without the removed solver.
-        """
-        return self.delta_protocol_and_partner_fee - self.delta_partner_fee
 
     @property
     def unsettled_base(self) -> bool:
@@ -666,7 +625,6 @@ def diff_outcomes(
         diffs.append(
             OrderDiff(
                 order_uid=order_uid,
-                contributes=left.contributes or right.contributes,
                 executed_base=left.executed,
                 executed_loo=right.executed,
                 surplus_base=left.surplus_native,
@@ -674,11 +632,8 @@ def diff_outcomes(
                 solver_base=left.solver,
                 solver_loo=right.solver,
                 observed_base=left.observed,
-                observed_loo=right.observed,
                 late_base=left.landed_late,
-                late_loo=right.landed_late,
                 volume_base=left.volume_native,
-                volume_loo=right.volume_native,
                 # A property of the order itself, so any side that saw it agrees.
                 partially_fillable=left.partially_fillable or right.partially_fillable,
                 fee_base=left.fee_native,
@@ -714,10 +669,6 @@ class AuctionCounterfactual:
     about reality the comparison table reports."""
     baseline_winner_uids: frozenset[int] = frozenset()
     loo_winner_uids: frozenset[int] = frozenset()
-    baseline_winning_total: int = 0
-    loo_winning_total: int = 0
-    """Sum of the winners' totals — recorded score in score mode. The reward formula
-    starts here."""
     baseline_reference_scores: dict[str, int] = field(default_factory=dict[str, int])
     loo_reference_scores: dict[str, int] = field(default_factory=dict[str, int])
     solver_set_reference_for: frozenset[str] = frozenset()
@@ -772,8 +723,8 @@ class AuctionCounterfactual:
     native-denominated number this auction contributes is fabricated with it."""
     multi_pair_solutions: int = 0
     """Solutions the fairness filter actually judged and that touch more than one directed
-    token pair — a single-pair solution is exempt, and a zero-value one is dropped before
-    the filter runs."""
+    token pair — a single-pair solution is exempt, and one with no auction order is
+    dropped before the filter runs."""
     multi_pair_filter_proxied: int = 0
     """Of those, how many rested on the surplus fallback: some pair had no recorded score
     *and* its surplus did not clear the baseline on its own. A pair whose surplus clears
@@ -861,15 +812,15 @@ class AuctionCounterfactual:
     def delta_surplus(self) -> int:
         """Change in native user surplus in the counterfactual: without-solver minus
         with-solver, over user orders. Negative means users would have received less."""
-        return sum(d.delta_surplus for d in self.order_diffs if d.contributes)
+        return sum(d.delta_surplus for d in self.order_diffs)
 
     @property
     def surplus_base(self) -> int:
-        return sum(d.surplus_base or 0 for d in self.order_diffs if d.contributes)
+        return sum(d.surplus_base or 0 for d in self.order_diffs)
 
     @property
     def surplus_loo(self) -> int:
-        return sum(d.surplus_loo or 0 for d in self.order_diffs if d.contributes)
+        return sum(d.surplus_loo or 0 for d in self.order_diffs)
 
     @property
     def fees_complete(self) -> bool:
@@ -880,24 +831,24 @@ class AuctionCounterfactual:
         recorded, so this can only fail where a solution the recorded competition
         filtered out wins the counterfactual.
         """
-        return all(d.fees_known for d in self.order_diffs if d.contributes)
+        return all(d.fees_known for d in self.order_diffs)
 
     @property
     def protocol_and_partner_fees_base(self) -> int:
         """Protocol fee charged by the winners, partner fees included."""
-        return sum(d.fee_base or 0 for d in self.order_diffs if d.contributes)
+        return sum(d.fee_base or 0 for d in self.order_diffs)
 
     @property
     def protocol_and_partner_fees_loo(self) -> int:
-        return sum(d.fee_loo or 0 for d in self.order_diffs if d.contributes)
+        return sum(d.fee_loo or 0 for d in self.order_diffs)
 
     @property
     def partner_fees_base(self) -> int:
-        return sum(d.partner_fee_base or 0 for d in self.order_diffs if d.contributes)
+        return sum(d.partner_fee_base or 0 for d in self.order_diffs)
 
     @property
     def partner_fees_loo(self) -> int:
-        return sum(d.partner_fee_loo or 0 for d in self.order_diffs if d.contributes)
+        return sum(d.partner_fee_loo or 0 for d in self.order_diffs)
 
     @property
     def protocol_fees_base(self) -> int:
@@ -1241,8 +1192,8 @@ def analyse_auction(
             by_uid_loo = {v.bid.uid: v for v in loo_valued}
 
     baseline = arbitrate(solutions, max_winners)
-    # Over the solutions the filter actually judged — zero-value ones are dropped before
-    # step 4 — and taken from the baseline side, whose baselines are the higher of the
+    # Over the solutions the filter actually judged — ones with no auction order are
+    # dropped before step 4 — and taken from the baseline side, whose baselines are the higher of the
     # two, so the count never understates the approximation.
     multi_pair = sum(1 for s in baseline.tested if len(s.pair_values) > 1)
     loo = leave_one_out(solutions, removed, max_winners)
@@ -1371,7 +1322,6 @@ def analyse_auction(
             baseline_reference_scores,
             lower_cap=lower_cap,
             excluded=excluded,
-            caps_inherited=base_caps.inherited_solvers,
         )
         loo_rewards = uncapped_rewards(
             [
@@ -1387,7 +1337,6 @@ def analyse_auction(
             loo_reference_scores,
             lower_cap=lower_cap,
             excluded=excluded,
-            caps_inherited=loo_caps.inherited_solvers,
         )
 
     return AuctionCounterfactual(
@@ -1399,8 +1348,6 @@ def analyse_auction(
         solver_won_db=bool(removed & {b.solver for b in bundle.bids if b.is_winner}),
         baseline_winner_uids=baseline.winner_uids,
         loo_winner_uids=loo.winner_uids,
-        baseline_winning_total=baseline.winning_score,
-        loo_winning_total=loo.winning_score,
         baseline_reference_scores=baseline_reference_scores,
         loo_reference_scores=loo_reference_scores,
         solver_set_reference_for=frozenset(
@@ -1617,13 +1564,11 @@ class Analysis:
 
     price_suspect_auctions: list[int] = field(default_factory=list[int])
 
-    missing_data_auctions: list[int] = field(default_factory=list[int])
-    """Auctions excluded before arbitration because a traded order is in neither order
-    table (D17) — `jit_orders` only records the JIT orders of *settled* batches, so an
-    unsettled solution's JIT legs are unrecoverable and even their pair claims are
-    unknown. Filled by `extract.load_auctions`, never by `add`: unlike price suspects
-    these auctions are not counted in `auctions` because they were never arbitrated.
-    Measured over 2026-07-12..08-12 mainnet: ~600 of 78,271 auctions (0.8%)."""
+    fast_path_auctions: list[int] = field(default_factory=list[int])
+    """Fast-path auctions, excluded before arbitration: one order settled straight from
+    its quote competition, with no solver competition to re-run. Filled by
+    `extract.load_auctions`, never by `add`; unlike price suspects these are not counted
+    in `auctions`, because they were never arbitrated."""
 
     orders_compared: int = 0
     orders_only_with_solver: int = 0
@@ -1637,11 +1582,6 @@ class Analysis:
     user surplus that `Settlement.counts_as_executed` deliberately discards, so this is the
     price of aligning the surplus side with the reward side. Reported rather than folded in,
     because it is the only figure here that is knowingly not what happened."""
-    jit_orders_only_with_solver: int = 0
-    jit_orders_only_without_solver: int = 0
-    """Non-contributing orders, counted apart from user orders: their surplus accrues to
-    a market maker, so they are not orders a user would otherwise have lost."""
-
     replacements_base: int = 0
     replacements_loo: int = 0
     """Winning solutions that never won for real, so nothing was recorded about their
@@ -1806,15 +1746,11 @@ class Analysis:
         self.reference_influence += len(result.solver_set_reference_for)
 
         for diff in result.order_diffs:
-            if diff.contributes:
-                self.orders_compared += 1
-                self.orders_only_with_solver += diff.only_with_solver
-                self.orders_only_without_solver += diff.only_without_solver
-                self.orders_unsettled_base += diff.unsettled_base
-                self.orders_lost_to_lateness += diff.late_base
-            else:
-                self.jit_orders_only_with_solver += diff.only_with_solver
-                self.jit_orders_only_without_solver += diff.only_without_solver
+            self.orders_compared += 1
+            self.orders_only_with_solver += diff.only_with_solver
+            self.orders_only_without_solver += diff.only_without_solver
+            self.orders_unsettled_base += diff.unsettled_base
+            self.orders_lost_to_lateness += diff.late_base
 
         if result.anything_moved:
             self.changed.append(result)
@@ -1847,7 +1783,7 @@ class Analysis:
         diffs = [
             d
             for d in result.order_diffs
-            if d.contributes and d.order_uid in result.quote_substituted_uids
+            if d.order_uid in result.quote_substituted_uids
         ]
         if not all(d.fees_known for d in diffs):
             self.auctions_fees_incomplete += 1

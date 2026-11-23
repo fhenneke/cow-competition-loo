@@ -36,8 +36,8 @@ def main(argv: list[str] | None = None) -> int:
         "validate", help="reproduce recorded winners, filter and reference scores"
     )
     check.add_argument("--network", default="mainnet")
-    check.add_argument("--start", required=True, help="inclusive, e.g. 2026-08-01")
-    check.add_argument("--end", required=True, help="exclusive, e.g. 2026-08-02")
+    check.add_argument("--start", required=True, help="inclusive, e.g. 2026-11-18")
+    check.add_argument("--end", required=True, help="exclusive, e.g. 2026-11-19")
     check.add_argument("--max-winners", type=int, default=MAX_WINNERS)
     check.add_argument("--limit", type=int, help="only the first N auctions in the window")
     check.add_argument(
@@ -56,8 +56,8 @@ def main(argv: list[str] | None = None) -> int:
         help="reproduce uncapped rewards from recorded inputs and diff against the mart",
     )
     check_rewards.add_argument("--network", default="mainnet")
-    check_rewards.add_argument("--start", required=True, help="inclusive, e.g. 2026-08-01")
-    check_rewards.add_argument("--end", required=True, help="exclusive, e.g. 2026-08-02")
+    check_rewards.add_argument("--start", required=True, help="inclusive, e.g. 2026-11-18")
+    check_rewards.add_argument("--end", required=True, help="exclusive, e.g. 2026-11-19")
     check_rewards.add_argument(
         "--limit", type=int, help="only the first N auctions in the window"
     )
@@ -98,8 +98,8 @@ def main(argv: list[str] | None = None) -> int:
             "came from the window, so nobody asked for that solver by name"
         ),
     )
-    analyse.add_argument("--start", required=True, help="inclusive, e.g. 2026-08-01")
-    analyse.add_argument("--end", required=True, help="exclusive, e.g. 2026-08-02")
+    analyse.add_argument("--start", required=True, help="inclusive, e.g. 2026-11-18")
+    analyse.add_argument("--end", required=True, help="exclusive, e.g. 2026-11-19")
     analyse.add_argument(
         "--mode",
         choices=("score", "surplus"),
@@ -192,6 +192,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
+    except extract.UnsupportedWindowError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 4
     except (db.ConnectionLostError, db.StatementTimeoutError) as error:
         # Neither says anything about the data. A traceback ending in psycopg2 reads
         # like a query or data bug, so the cause is printed instead, under its own code.
@@ -200,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def run_validate(args: argparse.Namespace) -> int:
+    extract.require_current_mechanism(args.start)
     weth = wrapped_native_token(args.network)
     conn = db.connect(args.network)
 
@@ -233,9 +237,9 @@ def run_validate(args: argparse.Namespace) -> int:
 
         summary = validate.Summary()
         surplus = validate.SurplusCrossCheck()
-        missing_data: list[int] = []
+        fast_path: list[int] = []
 
-        for bundle in extract.load_auctions(conn, auction_ids, missing_data=missing_data):
+        for bundle in extract.load_auctions(conn, auction_ids, fast_path=fast_path):
             summary.add(
                 validate.check_auction(bundle, weth, max_winners=args.max_winners)
             )
@@ -244,10 +248,10 @@ def run_validate(args: argparse.Namespace) -> int:
     finally:
         conn.close()
 
-    if missing_data:
+    if fast_path:
         print(
-            f"{len(missing_data)} auctions excluded for missing order data "
-            f"(an order in neither orders nor jit_orders — unsettled JIT, D17)",
+            f"{len(fast_path)} fast-path auctions excluded (settled from the quote "
+            f"competition, no solver competition to reproduce)",
             file=sys.stderr,
         )
     report_summary(summary, args)
@@ -255,7 +259,7 @@ def run_validate(args: argparse.Namespace) -> int:
         report_surplus(surplus)
 
     if args.out:
-        write_json(args.out, summary, surplus, missing_data)
+        write_json(args.out, summary, surplus, fast_path)
         print(f"\nfull report written to {args.out}", file=sys.stderr)
 
     # The gate is that every difference has a named cause, not that there are no
@@ -658,8 +662,7 @@ def report_quote_side(analysis: quotes.QuoteAnalysis) -> None:
         + (f" ({share:.3%} of {analysis.window_orders:,} created)" if share else "")
     )
     print(
-        f"  quote wins       {analysis.quote_wins:,} of {analysis.matched:,} matched "
-        f"orders ({analysis.matched_corroborated:,} corroborated)"
+        f"  quote wins       {analysis.quote_wins:,} of {analysis.matched:,} matched orders"
     )
     if analysis.class_flips:
         print(
@@ -708,14 +711,14 @@ def report_analysis(
             f"individual member"
         )
 
-    missing = analysis.missing_data_auctions
-    print(f"\nauctions in window            {total + len(missing)}")
-    if missing:
+    fast_path = analysis.fast_path_auctions
+    window_total = total + len(fast_path)
+    print(f"\nauctions in window            {window_total}")
+    if fast_path:
         print(
-            f"  missing order data, excluded {len(missing)} "
-            f"({pct(len(missing), total + len(missing))})"
-            "   <- an order in neither orders nor jit_orders: unsettled JIT, "
-            "unrecoverable (D17)"
+            f"  fast path, excluded         {len(fast_path)} "
+            f"({pct(len(fast_path), window_total)})"
+            "   <- settled from the quote competition; no solver competition to re-run"
         )
         print(f"  analysed                    {total}")
     print(
@@ -862,8 +865,6 @@ def report_analysis(
         f"    of which merely late     {analysis.orders_lost_to_lateness}"
         "   <- really filled; surplus discarded by choice"
     )
-    print(f"JIT orders only with solver   {analysis.jit_orders_only_with_solver}")
-    print(f"JIT orders only without       {analysis.jit_orders_only_without_solver}")
 
     print("\nwinners that never won for real, so nothing was recorded about them:")
     print(
@@ -943,7 +944,6 @@ def print_counterfactual(result: counterfactual.AuctionCounterfactual) -> None:
             f"executed {diff.executed_base}->{diff.executed_loo} "
             f"surplus {diff.surplus_base}->{diff.surplus_loo} "
             f"solver {(diff.solver_base or '-')[:8]}->{(diff.solver_loo or '-')[:8]}"
-            + ("" if diff.contributes else "  (JIT, not user surplus)")
         )
 
 
@@ -1079,10 +1079,10 @@ def write_json(
     path: str,
     summary: validate.Summary,
     surplus: validate.SurplusCrossCheck,
-    missing_data: list[int] | None = None,
+    fast_path: list[int] | None = None,
 ) -> None:
     payload = {
-        "missing_data_auctions": missing_data or [],
+        "fast_path_auctions": fast_path or [],
         "auctions": summary.auctions,
         "solutions": summary.solutions,
         "auctions_winners_match": summary.auctions_winners_match,

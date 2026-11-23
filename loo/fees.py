@@ -379,9 +379,8 @@ EMPTY_FEE_CONTEXT = FeeContext(
 def order_fees(order: Order, context: FeeContext) -> FeeSplit | None:
     """One order's fees, or `None` when its policies are not recorded for this auction.
 
-    A JIT order is never in `auction.orders`, so it never carries policies and its fee is
-    exactly 0 — but it is also never in `known`, so callers must decide that case before
-    reaching here, from whether the order contributes to score at all.
+    `known` holds the orders of every solution the arbitrator kept; an order outside it
+    was only traded by filtered-out solutions, whose policies are not stored.
     """
     if order.uid not in context.known:
         return None

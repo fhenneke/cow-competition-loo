@@ -25,6 +25,45 @@ autopilot only wraps it.
 
 Parameters: `max_winners = 20`, `max_solutions_per_solver = 3`.
 
+The line numbers above and in `loo/` docstrings are from the August 2026 revision. The
+file has since been reorganised (services#4929) and the fee math moved to
+`crates/protocol-fees` (services#5223), formula for formula, so find a function by its
+name. The local checkout also lags: compare `git -C ~/Work/Code/services log -1` with
+`git ls-remote origin main` before trusting it.
+
+### `loo` replays the current mechanism only
+
+`loo` is written against the rules live since **2026-10-28** (`extract.MECHANISM_START`)
+and refuses an earlier window. Two rule changes separate it from the August 2026
+transcription, both measured against the recorded competition on mainnet 2026-11-18:
+
+| Change | Rule now | What the old rule got wrong that day |
+| --- | --- | --- |
+| services#4753 (v2.376.0, August 2026) | a solution is kept iff it trades at least one order the mechanism cares about; a **zero score no longer drops it** | 7 winner sets: zero-score winners `loo` had dropped |
+| services#4902 (v2.385.0, live 2026-10-27) | **JIT liquidity orders claim no token pair** in `pick_winners` | 6 winner sets: winners `loo` had blocked on a pair only a JIT order touched |
+
+With both applied the winner set matched in 3,553 of 3,554 auctions; the one left, and
+all 22 valuation failures, were fast-path auctions
+([below](#fast-path-auctions-are-excluded)). The other 1,319 auctions of that day were
+not compared at all: the old code excluded every auction with an unrecorded JIT order.
+
+`loo validate` after the trim, measured 2026-11-23 (the mainnet 11-18 and arbitrum rows on the final, dead-code-free tree). Winner sets, filtered-out sets and
+reference scores all match the record in every auction, with no valuation failure and
+no missing-data exclusion:
+
+| Window | Auctions compared | Fast-path excluded | Solutions |
+| --- | --- | --- | --- |
+| mainnet 2026-11-18 | 4,850 of 4,850 | 23 | 88,532 |
+| mainnet 2026-10-29 | 4,264 of 4,264 | 0 | 100,225 |
+| bnb 2026-11-18 | 5,891 of 5,891 | 19 | 65,256 |
+| base 2026-11-18 | 2,746 of 2,746 | 1 | 22,875 |
+| arbitrum-one 2026-11-18 | 1,300 of 1,300 | 8 | — |
+
+The sections below record the reproduction as it stood in August and September 2026,
+under the rules of that time. The first mainnet auction with two winners
+on one directed pair, which the old rule made impossible, is 14118229 (2026-10-27 21:34
+UTC); from then on there are 2 to 10 a day.
+
 ## The algorithm
 
 Given all bids for one auction:
@@ -32,16 +71,18 @@ Given all bids for one auction:
 1. **Value each solution per directed token pair.** For each order that
    `contributes_to_score`, add its value to `value[(sell_token, buy_token)]`. Solution
    total = sum over pairs.
-2. Drop solutions with total 0. Sort descending by total.
+2. Drop solutions with **no** order that `contributes_to_score` (a total of 0 is not
+   enough to drop one: an order filled at exactly its limit scores 0 and still
+   trades). Sort descending by total.
 3. **Baselines.** For each directed pair, `baseline[pair]` = the highest total among
    solutions that touch *exactly one* pair.
 4. **Fairness filter.** Keep a solution if it touches exactly one pair, **or** if
    `value[pair] >= baseline[pair]` for every pair it touches. Otherwise it is
    `filtered_out`. (The one-pair exemption is deliberate — it avoids reference scores
    collapsing to 0; see `arbitrator.rs:88`.)
-5. **Pick winners.** Walk the kept solutions in descending order; a solution wins if its
-   directed token pairs are disjoint from every pair already claimed by a winner. Stop at
-   `max_winners`.
+5. **Pick winners.** Walk the kept solutions in descending order; a solution wins if the
+   directed token pairs of its orders that `contributes_to_score` are disjoint from
+   every pair already claimed by a winner. Stop at `max_winners`.
 6. **Reference score** of winner `s` = total of the winners produced by step 5 re-run on
    the ranked set with **all of `s`'s solutions** removed.
 
@@ -53,19 +94,35 @@ the fee-policy map", which contains every auction order. In the DB the analogue 
 rule is a different one ([storage
 rule](analytics-db.md#fee-policies-cover-every-order-of-every-kept-solution)).
 
-### Two asymmetries to preserve
+**In `loo` an order contributes iff it is in the auction, and JIT orders are not read at
+all.** `surplus_capturing_jit_order_owners` has been empty since the CoW AMMs were
+retired: zero auctions with an owner on any of ten chains over 2026-10-24..11-23. A JIT
+order then earns no score (step 1), is ignored by the filter (steps 3–4) and claims no
+pair (step 5), and a solution holding nothing else is never stored (step 2). So
+`extract.EXECUTIONS_SQL` returns only executions of `competition_auctions.order_uids`,
+and the mechanism code has no notion of a non-contributing order. This is exact, not an
+approximation, for as long as that array stays empty.
+
+### One asymmetry to preserve
 
 Step 1 keys pairs on the **raw** `sell_token`/`buy_token`. Step 5 normalises them through
 `as_erc20`, mapping the native-token sentinel `0xee…ee` to WETH. So a solution trading
 ETH→USDC and one trading WETH→USDC are scored under separate pairs but conflict when
-picking winners.
+picking winners. It is in the Rust and should be mirrored, not tidied up.
 
-Step 1 also skips orders failing `contributes_to_score`, while step 5 claims pairs from
-**every** order in the solution (`arbitrator.rs:587` iterates `solution.orders()` with no
-filter). A solution can therefore be single-pair for scoring — and so exempt from the
-fairness filter — while blocking two pairs when winners are picked.
+### Fast-path auctions are excluded
 
-Both are in the Rust and should be mirrored, not tidied up.
+Since 2026-11-08 (mainnet auction 14201960) some `competition_auctions` rows carry a
+`fast_path_quote_id`. Such an "auction" holds one order, settled straight from its quote
+competition: the winning quote is stored as a solution that fills the order at exactly
+its limit, the losing quotes as solutions **below** the limit with score 0 and
+`filtered_out = true`, and `penalty_caps_native` is written as 0. The mart pays the
+winner no batch reward (upper cap 0). There is no solver competition in it to re-run,
+and valuing the losing quotes fails on negative surplus, so `extract.load_auctions`
+never yields one and reports the count (`fast_path_auctions`, "fast-path excluded" in
+`compare`). They are about 0.5% of auctions: on 2026-11-18, 23 of 4,873 on mainnet, 19
+of 5,910 on bnb and 1 of 2,747 on base, and none yet on xdai, ink, linea or plasma. What the removed solver contributed as a *quoter* of
+such an order belongs to the quote side.
 
 ### `ranked` order is load-bearing
 
@@ -428,7 +485,10 @@ for a failed win of the same order just before it.
 
 ### A JIT leg can block another solution's execution — and the filter never sees it
 
-The two asymmetries above combine into a mechanism-level quirk. A non-contributing JIT
+**Historical: fixed by services#4902, live since 2026-10-27.** What follows describes
+the mechanism before it, which `loo` no longer replays.
+
+Two asymmetries of the old mechanism combined into a mechanism-level quirk. A non-contributing JIT
 order is invisible to the fairness filter (step 1 skips it) yet claims its directed pair
 in `pick_winners` (step 5 iterates every order). A batch of [user order + the solver's
 own JIT counterparty on the reverse direction] therefore passes the filter as a

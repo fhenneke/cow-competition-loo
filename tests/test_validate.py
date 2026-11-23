@@ -27,7 +27,6 @@ def valuation(pair_surplus: dict[Pair, int]) -> SolutionValuation:
     return SolutionValuation(
         pair_surplus=pair_surplus,
         order_surplus_native={},
-        order_surplus_atoms={},
         winner_pairs=frozenset(pair_surplus),
         order_uids=frozenset(),
     )
@@ -167,7 +166,6 @@ def bid(uid: int, solver: str, score: int, is_winner: bool, filtered_out: bool) 
         is_winner=is_winner,
         filtered_out=filtered_out,
         orders=(),
-        contributes={},
     )
 
 
@@ -189,7 +187,6 @@ class TestObservedPick:
     def bundle(self, bids: list[Bid]) -> AuctionBundle:
         return AuctionBundle(
             auction_id=1,
-            jit_owners=frozenset(),
             native_prices={},
             bids=tuple(bids),
             reference_scores={},

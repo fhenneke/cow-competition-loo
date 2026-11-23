@@ -50,7 +50,6 @@ def bundle(auction_id: int) -> AuctionBundle:
     winner, runner_up = order(2200), order(2100)
     return AuctionBundle(
         auction_id=auction_id,
-        jit_owners=frozenset(),
         native_prices={USDC: ONE},
         bids=(
             Bid(
@@ -61,7 +60,6 @@ def bundle(auction_id: int) -> AuctionBundle:
                 is_winner=True,
                 filtered_out=False,
                 orders=(winner,),
-                contributes={winner.uid: True},
             ),
             Bid(
                 auction_id=auction_id,
@@ -71,7 +69,6 @@ def bundle(auction_id: int) -> AuctionBundle:
                 is_winner=False,
                 filtered_out=False,
                 orders=(runner_up,),
-                contributes={runner_up.uid: True},
             ),
         ),
         reference_scores={},
@@ -106,7 +103,7 @@ def stubbed(monkeypatch: pytest.MonkeyPatch) -> Calls:
             )
         ]
 
-    def load_auctions(conn: Connection, ids: list[int], missing_data: list[int]):
+    def load_auctions(conn: Connection, ids: list[int], fast_path: list[int]):
         calls.extractions += 1
         for auction_id in ids:
             yield bundle(auction_id)
@@ -141,8 +138,8 @@ class TestAnalyseWindow:
         window = run.analyse_window(
             CONN,
             ["TestSolver"],
-            "2026-07-01",
-            "2026-08-01",
+            "2026-11-01",
+            "2026-12-01",
             outcome_rules=("inherited", "assume-settled"),
         )
 
@@ -161,15 +158,15 @@ class TestAnalyseWindow:
             assert solver_run.cow is not None
 
     def test_single_rule_default_is_inherited(self, stubbed: Calls):
-        window = run.analyse_window(CONN, ["TestSolver"], "2026-07-01", "2026-08-01")
+        window = run.analyse_window(CONN, ["TestSolver"], "2026-11-01", "2026-12-01")
         assert [r.analysis.outcome_rule for r in window.runs] == ["inherited"]
 
     def test_assume_settled_alone_skips_the_settlement_source(self, stubbed: Calls):
         run.analyse_window(
             CONN,
             ["TestSolver"],
-            "2026-07-01",
-            "2026-08-01",
+            "2026-11-01",
+            "2026-12-01",
             outcome_rules=("assume-settled",),
         )
         assert stubbed.settlements == 0
@@ -179,15 +176,15 @@ class TestAnalyseWindow:
             run.analyse_window(
                 CONN,
                 ["TestSolver"],
-                "2026-07-01",
-                "2026-08-01",
+                "2026-11-01",
+                "2026-12-01",
                 outcome_rules=("inherited", "inherited"),
             )
 
     def test_no_rules_is_rejected(self, stubbed: Calls):
         with pytest.raises(ValueError, match="at least one"):
             run.analyse_window(
-                CONN, ["TestSolver"], "2026-07-01", "2026-08-01", outcome_rules=()
+                CONN, ["TestSolver"], "2026-11-01", "2026-12-01", outcome_rules=()
             )
 
 
@@ -197,7 +194,7 @@ class TestRemovalGroups:
 
     def test_a_group_removes_all_members_jointly(self, stubbed: Calls):
         window = run.analyse_window(
-            CONN, ["TestSolver,Rival"], "2026-07-01", "2026-08-01"
+            CONN, ["TestSolver,Rival"], "2026-11-01", "2026-12-01"
         )
         (solver_run,) = window.runs
         assert solver_run.solver == "TestSolver,Rival"
@@ -213,21 +210,21 @@ class TestRemovalGroups:
         exactly the comparison joint removal exists for — and they share the one
         extraction pass like any other pair of runs."""
         window = run.analyse_window(
-            CONN, ["TestSolver", "TestSolver,Rival"], "2026-07-01", "2026-08-01"
+            CONN, ["TestSolver", "TestSolver,Rival"], "2026-11-01", "2026-12-01"
         )
         assert [r.analysis.delta_surplus for r in window.runs] == [-200, -400]
         assert stubbed.extractions == 1
 
     def test_the_label_is_normalised(self, stubbed: Calls):
         window = run.analyse_window(
-            CONN, ["TestSolver, Rival"], "2026-07-01", "2026-08-01"
+            CONN, ["TestSolver, Rival"], "2026-11-01", "2026-12-01"
         )
         assert window.runs[0].solver == "TestSolver,Rival"
 
     def test_a_competitor_named_twice_in_one_group_is_rejected(self, stubbed: Calls):
         with pytest.raises(extract.SolverResolutionError, match="once"):
             run.analyse_window(
-                CONN, ["TestSolver,AliasOfTestSolver"], "2026-07-01", "2026-08-01"
+                CONN, ["TestSolver,AliasOfTestSolver"], "2026-11-01", "2026-12-01"
             )
 
     def test_identical_scenarios_are_rejected(self, stubbed: Calls):
@@ -235,25 +232,25 @@ class TestRemovalGroups:
             run.analyse_window(
                 CONN,
                 ["TestSolver,Rival", "Rival, TestSolver"],
-                "2026-07-01",
-                "2026-08-01",
+                "2026-11-01",
+                "2026-12-01",
             )
 
     def test_the_same_competitor_under_two_names_is_still_rejected(self, stubbed: Calls):
         with pytest.raises(extract.SolverResolutionError, match="same removal"):
             run.analyse_window(
-                CONN, ["TestSolver", "AliasOfTestSolver"], "2026-07-01", "2026-08-01"
+                CONN, ["TestSolver", "AliasOfTestSolver"], "2026-11-01", "2026-12-01"
             )
 
     def test_an_empty_group_is_rejected(self, stubbed: Calls):
         with pytest.raises(extract.SolverResolutionError, match="names no solver"):
-            run.analyse_window(CONN, [" , "], "2026-07-01", "2026-08-01")
+            run.analyse_window(CONN, [" , "], "2026-11-01", "2026-12-01")
 
     def test_a_member_absent_from_every_analysed_auction_is_reported(self, stubbed: Calls):
         """The group's numbers are then the smaller group's numbers wearing the full
         label — `absent_members` is what lets the CLI refuse that."""
         window = run.analyse_window(
-            CONN, ["TestSolver,Ghost"], "2026-07-01", "2026-08-01"
+            CONN, ["TestSolver,Ghost"], "2026-11-01", "2026-12-01"
         )
         (solver_run,) = window.runs
         assert run.absent_members(solver_run) == ["Ghost"]
@@ -271,8 +268,8 @@ class TestQuoteSide:
             run.analyse_window(
                 CONN,
                 ["TestSolver"],
-                "2026-07-01",
-                "2026-08-01",
+                "2026-11-01",
+                "2026-12-01",
                 network="sepolia",
                 with_quotes=True,
             )
@@ -300,7 +297,6 @@ class TestQuoteSide:
                         order_uid=uid,
                         leaf="degraded",
                         is_sell=True,
-                        tier="corroborated",
                         winner="w",
                         replacement="s",
                         effective_base=2050.0,
@@ -335,12 +331,12 @@ class TestQuoteSide:
         window = run.analyse_window(
             CONN,
             ["TestSolver"],
-            "2026-07-01",
-            "2026-08-01",
+            "2026-11-01",
+            "2026-12-01",
             outcome_rules=("inherited", "assume-settled"),
             with_quotes=True,
         )
-        assert loads == [("mainnet", "2026-07-01", "2026-08-01", "effective-sell", [1, 2])]
+        assert loads == [("mainnet", "2026-11-01", "2026-12-01", "effective-sell", [1, 2])]
         assert stubbed.extractions == 1
         for solver_run in window.runs:
             assert solver_run.quote is not None

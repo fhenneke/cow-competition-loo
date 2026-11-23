@@ -13,7 +13,6 @@ import pytest
 
 from loo.fees import Quote
 from loo.quotes import (
-    BUY_AMOUNT_TOLERANCE,
     Estimate,
     MatchedQuote,
     Pricing,
@@ -25,12 +24,10 @@ from loo.quotes import (
     diff_quote,
     effective_sell_amount,
     leave_one_out,
-    match_orders,
     pick,
     price_suspect_orders,
     rank_key,
     validate_picks,
-    viable_requests,
 )
 
 # One gas unit costs 2 sell-token atoms: gas_price 200, sell_token_price 100.
@@ -46,7 +43,6 @@ def estimate(name: str, out: float, gas: float, verified: bool = True, winner: b
 def sell_request(*estimates: Estimate, in_amount: float = 1_000_000.0, winner: str = ""):
     return QuoteRequest(
         request_id="r1",
-        timestamp="2026-07-25 12:00:00.000",
         kind="sell",
         sell_token="aa",
         buy_token="bb",
@@ -282,8 +278,6 @@ def recorded(
         partially_fillable=False,
         sell_token="aa",
         buy_token="bb",
-        order_sell_amount=sell,
-        order_buy_amount=buy,
         quote_solver="cc" * 20,
         quote=Quote(sell_amount=sell, buy_amount=buy, fee=fee),
         pricing=PRICING,
@@ -300,7 +294,7 @@ class TestDiff:
             winner="winner",
         )
         diff = diff_quote(
-            MatchedQuote(order, request, "corroborated"), frozenset({"other"})
+            MatchedQuote(order, request), frozenset({"other"})
         )
         assert diff.leaf == "unaffected"
         assert diff.delta_bps == 0.0
@@ -314,7 +308,7 @@ class TestDiff:
             winner="winner",
         )
         diff = diff_quote(
-            MatchedQuote(order, request, "corroborated"), frozenset({"winner"})
+            MatchedQuote(order, request), frozenset({"winner"})
         )
         assert diff.leaf == "degraded"
         assert diff.replacement == "second"
@@ -332,7 +326,7 @@ class TestDiff:
             winner="winner",
         )
         diff = diff_quote(
-            MatchedQuote(order, request, "corroborated"), frozenset({"winner"})
+            MatchedQuote(order, request), frozenset({"winner"})
         )
         base = 500_000 * (1 - 2_000 / 1_000_000)
         assert diff.effective_base == pytest.approx(base)
@@ -343,7 +337,7 @@ class TestDiff:
             estimate("only", 500_000, 1_000, winner=True), winner="only"
         )
         diff = diff_quote(
-            MatchedQuote(order, request, "corroborated"), frozenset({"only"})
+            MatchedQuote(order, request), frozenset({"only"})
         )
         assert diff.leaf == "no_quote"
         assert diff.quote_loo is None
@@ -363,9 +357,8 @@ class TestDiff:
             estimate("loud", 600_000, 1_000, verified=False),
             winner="w",
         )
-        analysis.add(diff_quote(MatchedQuote(order, request, "corroborated"), frozenset({"w"})))
+        analysis.add(diff_quote(MatchedQuote(order, request), frozenset({"w"})))
         assert analysis.class_flips == 1
-        assert analysis.flip_volume_native == order.volume_native
         assert analysis.degraded == 0
         assert analysis.window_bps == 0.0
         assert analysis.conditional_bps is None
@@ -378,7 +371,7 @@ class TestDiff:
             winner="winner",
         )
         diff = diff_quote(
-            MatchedQuote(order, request, "corroborated"), frozenset({"winner"})
+            MatchedQuote(order, request), frozenset({"winner"})
         )
         assert diff.leaf == "class_flip"
         # The nominal quote improves while the quality falls, which is exactly why this
@@ -389,7 +382,6 @@ class TestDiff:
         order = recorded(kind="buy", sell=1_000_000, buy=500_000)
         request = QuoteRequest(
             request_id="r1",
-            timestamp="2026-07-25 12:00:00.000",
             kind="buy",
             sell_token="aa",
             buy_token="bb",
@@ -401,7 +393,7 @@ class TestDiff:
             ),
         )
         diff = diff_quote(
-            MatchedQuote(order, request, "corroborated"), frozenset({"winner"})
+            MatchedQuote(order, request), frozenset({"winner"})
         )
         assert diff.leaf == "degraded"
         # Both sides are costs in sell atoms and are stored as such — the recorded
@@ -429,7 +421,7 @@ class TestAnalysis:
         request = sell_request(
             estimate("w", 500_000, 1_000, winner=True), winner="w"
         )
-        analysis.add(diff_quote(MatchedQuote(order, request, "corroborated"), frozenset({"z"})))
+        analysis.add(diff_quote(MatchedQuote(order, request), frozenset({"z"})))
         assert analysis.matched == 1
         assert analysis.quote_wins == 0
         assert analysis.window_bps == 0.0
@@ -442,7 +434,7 @@ class TestAnalysis:
             estimate("s", 495_000, 1_000),
             winner="w",
         )
-        diff = diff_quote(MatchedQuote(order, request, "corroborated"), frozenset({"w"}))
+        diff = diff_quote(MatchedQuote(order, request), frozenset({"w"}))
         analysis.add(diff)
         assert analysis.degraded == 1
         window, conditional = analysis.window_bps, analysis.conditional_bps
@@ -458,175 +450,9 @@ class TestAnalysis:
         analysis = self.build()
         order = recorded()
         request = sell_request(estimate("w", 500_000, 1_000, winner=True), winner="w")
-        analysis.add(diff_quote(MatchedQuote(order, request, "corroborated"), frozenset({"w"})))
+        analysis.add(diff_quote(MatchedQuote(order, request), frozenset({"w"})))
         assert analysis.no_quote == 1
         assert analysis.no_quote_share == 0.1
-
-    def test_only_corroborated_matches_may_move_a_fee(self):
-        """A heuristic match would put a different request's runner-up against the
-        recorded winner's amount and call the difference a fee."""
-        analysis = self.build()
-        order = recorded()
-        request = sell_request(
-            estimate("w", 500_000, 1_000, winner=True),
-            estimate("s", 495_000, 1_000),
-            winner="w",
-        )
-        analysis.add(diff_quote(MatchedQuote(order, request, "heuristic"), frozenset({"w"})))
-        assert analysis.degraded_all == 1
-        # ...and it stays out of the headline sums as well as out of the fee path.
-        assert analysis.degraded == 0
-        assert analysis.window_bps == 0.0
-        assert analysis.window_bps_all_tiers is not None
-        assert analysis.window_bps_all_tiers < 0
-        assert analysis.counterfactual_quotes == {}
-
-
-class TestMatching:
-    def request_at(self, timestamp: str, in_amount: float, winner_out: float = 500_000.0):
-        return QuoteRequest(
-            request_id=f"r-{timestamp}",
-            timestamp=timestamp,
-            kind="sell",
-            sell_token="aa",
-            buy_token="bb",
-            in_amount=in_amount,
-            winner="w",
-            estimates=(estimate("w", winner_out, 1_000, winner=True),),
-        )
-
-    def match(
-        self,
-        orders: list[RecordedQuote],
-        requests: list[QuoteRequest],
-    ) -> tuple[list[MatchedQuote], dict[str, str]]:
-        """The two-phase path the loader uses: filter on time, then corroborate."""
-        return match_orders(orders, viable_requests(orders, requests))
-
-    def test_a_corroborating_amount_wins_over_a_closer_time(self):
-        """The identity the matcher never used decides, because it is the only evidence
-        outside the heuristic itself."""
-        order = recorded(buy=500_000)
-        wrong_amount_but_closer = self.request_at(
-            "2026-07-25 12:00:29.000", 1_000_000.0, winner_out=123.0
-        )
-        corroborating = self.request_at("2026-07-25 12:00:00.000", 1_000_000.0)
-        matches, _ = self.match([order], [wrong_amount_but_closer, corroborating])
-        assert len(matches) == 1
-        assert matches[0].tier == "corroborated"
-        assert matches[0].request.request_id == corroborating.request_id
-
-    def test_a_request_outside_the_time_window_is_not_a_match(self):
-        order = recorded()
-        stale = self.request_at("2026-07-25 11:00:00.000", 1_000_000.0)
-        assert self.match([order], [stale])[0] == []
-
-    def test_a_request_after_creation_matches_within_the_slack(self):
-        """A placement-time re-quote lands just after the order exists."""
-        order = recorded()
-        late = self.request_at("2026-07-25 12:01:00.000", 1_000_000.0)
-        assert len(self.match([order], [late])[0]) == 1
-
-    def test_a_buy_orders_amount_matches_within_the_slippage_tolerance(self):
-        order = recorded(kind="buy", sell=1_000_000, buy=500_000)
-        near = QuoteRequest(
-            request_id="r1",
-            timestamp="2026-07-25 12:00:00.000",
-            kind="buy",
-            sell_token="aa",
-            buy_token="bb",
-            in_amount=500_000.0 * (1 + BUY_AMOUNT_TOLERANCE / 2),
-            winner="w",
-            estimates=(estimate("w", 1_000_000, 1_000, winner=True),),
-        )
-        assert len(self.match([order], [near])[0]) == 1
-
-    def test_the_time_filter_runs_before_any_ladder_is_loaded(self):
-        """The reason matching is two-phase: a popular round amount matches every request
-        that ever asked for it — 1.9 M over a ten-day mainnet window — and only the time
-        filter cuts that to something a `request_id in (…)` scan can afford."""
-        order = recorded()
-        near = self.request_at("2026-07-25 12:00:00.000", 1_000_000.0)
-        far = self.request_at("2026-07-25 06:00:00.000", 1_000_000.0)
-        wrong_amount = self.request_at("2026-07-25 12:00:00.000", 999.0)
-        viable = viable_requests([order], [near, far, wrong_amount])
-        assert [r.request_id for r in viable[order.order_uid]] == [near.request_id]
-
-    def test_the_estimator_map_comes_only_from_corroborated_matches(self):
-        order = recorded(buy=500_000)
-        corroborating = self.request_at("2026-07-25 12:00:00.000", 1_000_000.0)
-        _, mapping = self.match([order], [corroborating])
-        assert mapping == {"w": order.quote_solver}
-
-        other = recorded(buy=1)
-        heuristic = self.request_at("2026-07-25 12:00:00.000", 1_000_000.0)
-        _, empty = self.match([other], [heuristic])
-        assert empty == {}
-
-    def test_the_estimator_map_is_keyed_on_the_winning_estimate_not_the_request_row(self):
-        """The tier rests on the `is_winner` row; the map must rest on the same identity,
-        or a request row whose `winner` column disagrees would map the wrong name."""
-        order = recorded(buy=500_000)
-        request = QuoteRequest(
-            request_id="r",
-            timestamp="2026-07-25 12:00:00.000",
-            kind="sell",
-            sell_token="aa",
-            buy_token="bb",
-            in_amount=1_000_000.0,
-            winner="stale-name",
-            estimates=(estimate("w", 500_000.0, 1_000, winner=True),),
-        )
-        _, mapping = self.match([order], [request])
-        assert mapping == {"w": order.quote_solver}
-
-
-class TestLadders:
-    """`load_ladders` against a fake client: the per-day bounds and the deduplication
-    that a `ReplacingMergeTree` needs before its parts merge."""
-
-    class FakeClient:
-        def __init__(self, rows: list[dict[str, Any]]) -> None:
-            self.rows = rows
-            self.sql: list[str] = []
-
-        def fetch(self, sql: str) -> list[dict[str, Any]]:
-            self.sql.append(sql)
-            return self.rows
-
-    def test_duplicate_rows_collapse_to_one_estimate_per_estimator(self):
-        from typing import cast
-
-        from loo import ch
-        from loo.quotes import load_ladders
-
-        row = {
-            "request_id": "r1", "estimator": "w", "out_amount": 500_000.0, "gas": 1_000.0,
-            "estimate_verified": 1, "is_winner": 1,
-        }
-        client = self.FakeClient([row, dict(row), {**row, "estimator": "s", "is_winner": 0}])
-        request = sell_request(winner="w")
-        ladders = load_ladders(cast(ch.Client, client), "mainnet", [request])
-        assert sorted(e.estimator for e in ladders["r1"]) == ["s", "w"]
-        # ...so the winner is unambiguous and the match can still be corroborated.
-        with_ladder = QuoteRequest(
-            request_id="r1", timestamp=request.timestamp, kind="sell", sell_token="aa",
-            buy_token="bb", in_amount=1_000_000.0, winner="w", estimates=ladders["r1"],
-        )
-        assert with_ladder.recorded_winner is not None
-
-    def test_each_query_is_bounded_to_the_requests_own_day(self):
-        from typing import cast
-
-        from loo import ch
-        from loo.quotes import load_ladders
-
-        client = self.FakeClient([])
-        load_ladders(cast(ch.Client, client), "mainnet", [sell_request(winner="w")])
-        (sql,) = client.sql
-        assert "event_timestamp >= '2026-07-24 23:30:00'" in sql
-        assert "event_timestamp < '2026-07-26 00:01:30'" in sql
-        assert "request_id in ('r1')" in sql
 
 
 class TestShiftedLimit:
@@ -701,7 +527,7 @@ class TestValidation:
             estimate("tie", 500_000, 1_000),
             winner="w",
         )
-        result = validate_picks([MatchedQuote(order, request, "corroborated")])
+        result = validate_picks([MatchedQuote(order, request)])
         assert result.reproduced == 1
         assert result.tied == 1
 
@@ -712,7 +538,7 @@ class TestValidation:
             estimate("better", 500_000, 1_000),
             winner="recorded",
         )
-        result = validate_picks([MatchedQuote(order, request, "corroborated")])
+        result = validate_picks([MatchedQuote(order, request)])
         assert result.reproduced == 0
         assert result.disagreements == [(request.request_id, "recorded", "better")]
 
@@ -728,8 +554,8 @@ class TestValidation:
         )
         result = validate_picks(
             [
-                MatchedQuote(order, homogeneous, "corroborated"),
-                MatchedQuote(order, mixed, "corroborated"),
+                MatchedQuote(order, homogeneous),
+                MatchedQuote(order, mixed),
             ]
         )
         assert result.mixed_class == 1
@@ -746,7 +572,7 @@ class TestValidation:
             winner="recorded",
         )
         result = validate_picks(
-            [MatchedQuote(order, request, "corroborated")],
+            [MatchedQuote(order, request)],
             price_suspects=frozenset({order.order_uid}),
         )
         assert result.price_suspect == 1
@@ -780,7 +606,7 @@ class TestGuards:
             winner="w",
         )
         diff = diff_quote(
-            MatchedQuote(order, request, "corroborated"),
+            MatchedQuote(order, request),
             frozenset({"w"}),
             price_suspects=frozenset({order.order_uid}),
         )
@@ -803,7 +629,7 @@ class TestGuards:
             in_amount=1_000.0,
             winner="w",
         )
-        diff = diff_quote(MatchedQuote(order, request, "corroborated"), frozenset({"w"}))
+        diff = diff_quote(MatchedQuote(order, request), frozenset({"w"}))
         assert diff.leaf == "nonpositive"
         analysis.add(diff)
         assert analysis.nonpositive == 1
@@ -826,7 +652,7 @@ class TestGuards:
             winner="w",
         )
         diff = diff_quote(
-            MatchedQuote(order, request, "corroborated"),
+            MatchedQuote(order, request),
             frozenset({"loser"}),
             price_suspects=frozenset({order.order_uid}),
         )
@@ -849,7 +675,7 @@ class TestGuards:
             winner="w",
         )
         diff = diff_quote(
-            MatchedQuote(order, request, "corroborated"),
+            MatchedQuote(order, request),
             frozenset({"w"}),
             ranking="autopilot",
             buy_token_prices={},
@@ -881,84 +707,6 @@ class TestPriceGuard:
         assert price_suspect_orders([order], {}) == frozenset()
 
 
-class TestRawLayer:
-    """Competitions the gold tables do not hold: `gold_quotes` is built from the
-    `quote_requested` event, so a competition whose request event never arrived is in
-    neither gold table while its estimates and winner are complete in `raw_quotes`."""
-
-    class FakeClient:
-        def __init__(self, answers: dict[str, list[dict[str, Any]]]) -> None:
-            self.answers = answers
-            self.sql: list[str] = []
-
-        def fetch(self, sql: str) -> list[dict[str, Any]]:
-            self.sql.append(sql)
-            for needle, rows in self.answers.items():
-                if needle in sql:
-                    return rows
-            return []
-
-    def test_the_gold_candidate_query_excludes_fast_but_not_id_less_requests(self):
-        from typing import cast
-
-        from loo import ch
-        from loo.quotes import load_candidate_requests
-
-        client = self.FakeClient({})
-        load_candidate_requests(cast(ch.Client, client), "mainnet", [recorded()])
-        (sql,) = client.sql
-        # `order_quotes` never holds a fast quote, so fast requests are not candidates;
-        # `quote_id` says nothing about whether the competition priced an order.
-        assert "quote_id" not in sql
-        assert "price_quality != 'fast'" in sql
-
-    def test_raw_candidates_group_estimates_by_request_and_match_the_exact_amount(self):
-        from typing import cast
-
-        from loo import ch
-        from loo.quotes import load_raw_candidates
-
-        order = recorded()
-        row = {
-            "request_id": "raw-1", "ts": "2026-07-25 12:00:00.000", "sell_": "0xaa",
-            "buy_": "0xbb", "kind_": "sell", "in_amount_": "1000000",
-        }
-        client = self.FakeClient({"price_estimates": [row]})
-        (request,) = load_raw_candidates(cast(ch.Client, client), "mainnet", [order])
-        (sql,) = client.sql
-        assert "raw_quotes.price_estimates" in sql and "group by request_id" in sql
-        assert "('0xaa', '0xbb', '1000000')" in sql  # the exact decimal string
-        assert " success " in sql and "environment" not in sql
-        assert (request.source, request.price_quality, request.winner) == ("raw", "unknown", "")
-        assert request.in_amount == 1_000_000.0
-
-    def test_raw_ladders_take_the_winner_from_its_own_event_stream(self):
-        from typing import cast
-
-        from loo import ch
-        from loo.quotes import load_ladders, with_ladder
-
-        request = QuoteRequest(
-            request_id="raw-1", timestamp="2026-07-25 12:00:00.000", kind="sell",
-            sell_token="aa", buy_token="bb", in_amount=1_000_000.0, winner="", source="raw",
-        )
-        client = self.FakeClient({
-            "winning_price_estimates": [{"request_id": "raw-1", "estimator": "w"}],
-            "price_estimates": [
-                {"request_id": "raw-1", "estimator": "w", "out_amount": "500000", "gas": "1000", "verified": True},
-                {"request_id": "raw-1", "estimator": "s", "out_amount": "495000", "gas": "1000", "verified": None},
-            ],
-        })
-        ladders = load_ladders(cast(ch.Client, client), "mainnet", [request])
-        by_name = {e.estimator: e for e in ladders["raw-1"]}
-        assert by_name["w"].is_winner and not by_name["s"].is_winner
-        assert by_name["w"].verified and not by_name["s"].verified
-        assert by_name["w"].out_amount == 500_000.0
-        # The request row carried no winner; the ladder's mark supplies it, so
-        # `diff_quote` asks the same first question on both sources.
-        assert with_ladder(request, ladders["raw-1"]).winner == "w"
-
-
 class TestImplausibleReplacement:
     """A replacement quote more than 2x off the recorded one is a broken estimate promoted
     to winner, not a price change — in either direction. The case that forced this: an
@@ -974,18 +722,17 @@ class TestImplausibleReplacement:
     def test_a_near_free_buy_replacement_is_excluded_not_an_improvement(self):
         order = recorded(kind="buy", sell=1_000_000, buy=500_000)
         request = QuoteRequest(
-            request_id="r1", timestamp="2026-07-25 12:00:00.000", kind="buy",
+            request_id="r1", kind="buy",
             sell_token="aa", buy_token="bb", in_amount=500_000.0, winner="winner",
             estimates=(estimate("winner", 1_000_000, 1_000, winner=True), estimate("broken", 3, 1)),
         )
-        diff = diff_quote(MatchedQuote(order, request, "corroborated"), frozenset({"winner"}))
+        diff = diff_quote(MatchedQuote(order, request), frozenset({"winner"}))
         assert diff.leaf == "implausible"
         assert diff.replacement == "broken"
         assert diff.quote_loo is None
         analysis = self.analysis()
         analysis.add(diff)
         assert analysis.implausible == 1
-        assert analysis.implausible_volume_native == order.volume_native
         assert analysis.degraded == 0 and analysis.window_bps == 0.0
         assert analysis.counterfactual_quotes == {}
 
@@ -996,7 +743,7 @@ class TestImplausibleReplacement:
             estimate("third", 160_000, 1_000),
             winner="winner",
         )
-        diff = diff_quote(MatchedQuote(order, request, "corroborated"), frozenset({"winner"}))
+        diff = diff_quote(MatchedQuote(order, request), frozenset({"winner"}))
         assert diff.leaf == "implausible"
 
     def test_a_replacement_within_the_factor_stays_a_degradation(self):
@@ -1006,7 +753,7 @@ class TestImplausibleReplacement:
             estimate("half-ish", 260_000, 1_000),  # 0.52x: a bad quote, not a broken one
             winner="winner",
         )
-        diff = diff_quote(MatchedQuote(order, request, "corroborated"), frozenset({"winner"}))
+        diff = diff_quote(MatchedQuote(order, request), frozenset({"winner"}))
         assert diff.leaf == "degraded"
         assert diff.delta_bps == pytest.approx((260_000 / 500_000 - 1) * 10_000)
 
@@ -1043,7 +790,7 @@ class TestProdTieBreaks:
             estimate("second", 500_000, 1_000),
             winner="first",
         )
-        result = validate_picks([MatchedQuote(order, request, "corroborated")])
+        result = validate_picks([MatchedQuote(order, request)])
         assert (result.reproduced, result.tied, result.tie_mismatches) == (1, 1, 0)
 
     def test_a_tie_resolved_to_another_estimate_is_not_a_disagreement(self):
@@ -1055,58 +802,9 @@ class TestProdTieBreaks:
             estimate("recorded", 500_000, 1_000, winner=True),
             winner="recorded",
         )
-        result = validate_picks([MatchedQuote(order, request, "corroborated")])
+        result = validate_picks([MatchedQuote(order, request)])
         assert (result.reproduced, result.tie_mismatches) == (0, 1)
         assert result.disagreements == []
-
-
-class TestArrivalOrder:
-    class FakeClient:
-        def __init__(self, answers: dict[str, list[dict[str, Any]]]) -> None:
-            self.answers = answers
-
-        def fetch(self, sql: str) -> list[dict[str, Any]]:
-            for needle, rows in self.answers.items():
-                if needle in sql:
-                    return rows
-            return []
-
-    def test_gold_ladders_come_back_in_estimate_timestamp_order(self):
-        from typing import cast
-
-        from loo import ch
-        from loo.quotes import load_ladders
-
-        def row(name: str, arrived: str) -> dict[str, Any]:
-            return {
-                "request_id": "r1", "estimator": name, "out_amount": 1.0, "gas": 1.0,
-                "estimate_verified": 1, "is_winner": 0, "arrived": arrived,
-            }
-
-        client = self.FakeClient({"fct_quote_estimates": [
-            row("late", "2026-07-25 12:00:00.300"), row("early", "2026-07-25 12:00:00.100"),
-        ]})
-        ladders = load_ladders(cast(ch.Client, client), "mainnet", [sell_request()])
-        assert [e.estimator for e in ladders["r1"]] == ["early", "late"]
-
-    def test_raw_ladders_come_back_in_nats_seq_order(self):
-        from typing import cast
-
-        from loo import ch
-        from loo.quotes import load_ladders
-
-        request = QuoteRequest(
-            request_id="r1", timestamp="2026-07-25 12:00:00.000", kind="sell",
-            sell_token="aa", buy_token="bb", in_amount=1.0, winner="", source="raw",
-        )
-        client = self.FakeClient({"from raw_quotes.price_estimates": [
-            {"request_id": "r1", "estimator": "b", "out_amount": "1", "gas": "1",
-             "verified": True, "nats_seq": "20"},
-            {"request_id": "r1", "estimator": "a", "out_amount": "1", "gas": "1",
-             "verified": True, "nats_seq": "3"},
-        ]})
-        ladders = load_ladders(cast(ch.Client, client), "mainnet", [request])
-        assert [e.estimator for e in ladders["r1"]] == ["a", "b"]
 
 
 def id_order(uid: str, quote_id: int | None, *, out: int = 500_000, solver: str = "cc" * 20):
@@ -1188,7 +886,6 @@ class TestQuoteIdLink:
         result, _ = self.link()
         assert [m.order.order_uid for m in result.matches] == ["o-linked", "o-streamed"]
         linked, streamed = result.matches
-        assert linked.tier == "corroborated" and linked.request.source == "raw"
         assert linked.request.winner == "w" and linked.stream is None
         assert streamed.stream is not None and streamed.stream.taken == "early"
         assert result.stats.unlinked == {
@@ -1263,7 +960,6 @@ class TestQuoteIdLink:
             ],
         )
         (requoted,) = [m for m in result.matches if m.order.order_uid == "o-recomputed"]
-        assert requoted.tier == "corroborated"
         assert requoted.request.winner == "kipseli"
         assert requoted.request.request_id == "requote-501"
         assert [e.estimator for e in requoted.request.estimates] == [
@@ -1378,7 +1074,7 @@ class TestStream:
     def diff(self, request: QuoteRequest, take: Any, removed: str, *, buy: int = 500_000):
         order = recorded(buy=buy)
         return diff_quote(
-            MatchedQuote(order, request, "corroborated", stream=take), frozenset({removed})
+            MatchedQuote(order, request, stream=take), frozenset({removed})
         )
 
     def test_removing_the_recorded_winner_leaves_an_earlier_answer_standing(self):
@@ -1452,12 +1148,12 @@ class TestStream:
             estimate("a", 500_000, 1_000), estimate("b", 510_000, 1_000, winner=True),
             winner="b",
         )
-        good = MatchedQuote(order, request, "corroborated",
+        good = MatchedQuote(order, request,
                             stream=self.take("a", 0, 1, forwarded=("a", "b")))
         result = validate_picks([good])
         assert (result.streams, result.streams_reproduced) == (1, 1)
         bad_request = replace_request(request, "r9")
-        bad = MatchedQuote(order, bad_request, "corroborated",
+        bad = MatchedQuote(order, bad_request,
                            stream=self.take("a", 0, 1, forwarded=("b", "a")))
         result = validate_picks([bad])
         assert (result.streams, result.streams_reproduced) == (1, 0)

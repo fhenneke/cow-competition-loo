@@ -188,7 +188,6 @@ class TestValuationIntegration:
         prices = {"ee" * 20: 10**18}
         valuation = value_solution(
             [LIVE_ORDER],
-            {UID: True},
             prices,
             WETH,
             FeeContext(
@@ -207,7 +206,6 @@ class TestValuationIntegration:
         prices = {"ee" * 20: 10**18}
         valuation = value_solution(
             [LIVE_ORDER],
-            {UID: True},
             prices,
             WETH,
             FeeContext(
@@ -217,16 +215,11 @@ class TestValuationIntegration:
                 known=frozenset({UID}),
             ),
         )
-        assert valuation.partner_fee_native >= 0
-        assert valuation.protocol_fee_native_net >= 0
-        assert (
-            valuation.partner_fee_native + valuation.protocol_fee_native_net
-            == valuation.fee_native
-        )
+        assert 0 <= valuation.partner_fee_native <= valuation.fee_native
 
     def test_without_a_context_fees_are_unknown_not_zero(self) -> None:
         prices = {"ee" * 20: 10**18}
-        valuation = value_solution([LIVE_ORDER], {UID: True}, prices, WETH)
+        valuation = value_solution([LIVE_ORDER], prices, WETH)
         assert not valuation.fees_complete
         assert valuation.fees_unknown == frozenset({UID})
         assert valuation.fee_native == 0  # nothing recorded, so nothing summed
@@ -247,7 +240,6 @@ SECOND_ORDER = Order(
 
 PRICES = {"ee" * 20: 10**18, USDC: 10**18}
 ORDERS = [LIVE_ORDER, SECOND_ORDER]
-CONTRIBUTES = {UID: True, SECOND_UID: True}
 BOTH_KNOWN = frozenset({UID, SECOND_UID})
 
 
@@ -267,9 +259,7 @@ class TestPairScoreSplitOnLiveFees:
         )
 
     def valuation(self, *, known: frozenset[str]):
-        return value_solution(
-            ORDERS, CONTRIBUTES, PRICES, WETH, self.context(known=known)
-        )
+        return value_solution(ORDERS, PRICES, WETH, self.context(known=known))
 
     def test_the_split_is_surplus_plus_fee_per_pair(self) -> None:
         valuation = self.valuation(known=BOTH_KNOWN)
@@ -309,7 +299,6 @@ class TestPairScoreSplitOnLiveFees:
             is_winner=True,
             filtered_out=False,
             orders=tuple(ORDERS),
-            contributes=dict(CONTRIBUTES),
         )
 
         scored, _ = build_solutions(

@@ -51,9 +51,10 @@ class Solution:
     decomposition at all."""
 
     pair_values: dict[Pair, int] = field(default_factory=dict[Pair, int])
-    """Native **user surplus** per **raw** directed token pair, over score-contributing
-    orders only. A lower bound on the pair's score, and what the filter falls back to for
-    a pair whose score is unrecorded."""
+    """Native **user surplus** per **raw** directed token pair, over the auction's orders
+    the solution trades. A lower bound on the pair's score, and what the filter falls
+    back to for a pair whose score is unrecorded. Empty means the solution trades no
+    order the mechanism cares about, and `arbitrate` drops it."""
 
     pair_scores: dict[Pair, int] = field(default_factory=dict[Pair, int])
     """Per-pair **score**, for the pairs where it is known — deliberately partial.
@@ -70,11 +71,11 @@ class Solution:
     report it separately so a broken fee port cannot read as thin coverage."""
 
     order_uids: frozenset[str] = frozenset()
-    """All orders traded by the solution, contributing to score or not."""
+    """The auction's orders traded by the solution."""
 
     winner_pairs: frozenset[Pair] = frozenset()
-    """Directed pairs claimed in `pick_winners`, `as_erc20`-normalised and covering
-    **all** orders — not just the score-contributing ones (`arbitrator.rs:587`)."""
+    """Directed pairs claimed in `pick_winners`: the pairs of `pair_values`,
+    `as_erc20`-normalised. JIT orders claim nothing (services#4902)."""
 
 
 FilterScale = Literal["score", "surplus"]
@@ -106,10 +107,6 @@ class Ranking:
     that has both the solutions and the baselines, and every caller that reports the
     filter's exactness would otherwise re-derive it."""
 
-    dropped_uids: frozenset[int] = frozenset()
-    """Solutions dropped before ranking because their total was 0
-    (`arbitrator.rs:72`). These never reach the DB."""
-
     @property
     def winners(self) -> tuple[Solution, ...]:
         return tuple(s for s in self.ranked if s.solution_uid in self.winner_uids)
@@ -118,9 +115,10 @@ class Ranking:
     def tested(self) -> tuple[Solution, ...]:
         """Solutions the fairness filter actually judged.
 
-        Not every solution: zero-value ones are dropped before step 4 and are therefore
-        neither kept nor filtered out. They are the right thing to leave out of any
-        "how exact was the filter" denominator.
+        Not every solution: ones without a scoring order are dropped before step 4
+        (`partition_unfair_solutions`) and are neither kept nor filtered out; they never
+        reach the DB either. A solution that trades such an order at exactly its limit
+        scores 0 and is **kept** (services#4753).
         """
         return self.ranked + self.filtered_out
 
@@ -132,11 +130,9 @@ class Ranking:
 def compute_baseline_scores(solutions: Iterable[Solution]) -> dict[Pair, int]:
     """Best single-pair total per directed pair (`arbitrator.rs:650`).
 
-    Only solutions touching *exactly one* pair are baseline candidates. Note this runs
-    over the solutions as they were *scored*, before zero-total ones are dropped —
-    `scores_by_solution` is never pruned in the Rust. A zero-total solution can only
-    ever install a baseline of 0, which the filter comparison passes trivially, so the
-    distinction is behaviourally inert; it is preserved anyway.
+    Only solutions touching *exactly one* pair are baseline candidates. This runs over
+    the solutions as they were *scored*, before any is dropped — `scores_by_solution` is
+    never pruned in the Rust — which is inert: a dropped solution has no pair at all.
 
     Reads `total`, so the baseline is **exact in whatever currency the mode ranks in** and
     needs no decomposition: a single-pair solution puts its whole value on that one pair.
@@ -313,8 +309,8 @@ def arbitrate(
 ) -> Ranking:
     """Steps 1-5 of the mechanism (`arbitrator.rs:38`).
 
-    Valuation (step 1) has already happened; this is drop-zero, sort, baselines,
-    fairness filter, pick winners.
+    Valuation (step 1) has already happened; this is drop the solutions without a
+    scoring order, sort, baselines, fairness filter, pick winners.
 
     Ties in `total` are broken by input order, so feeding solutions in `uid` order
     reproduces the ordering the autopilot recorded (uids are assigned best-to-worst).
@@ -324,8 +320,7 @@ def arbitrate(
     all_solutions = list(solutions)
     baselines = compute_baseline_scores(all_solutions)
 
-    dropped = frozenset(s.solution_uid for s in all_solutions if s.total == 0)
-    scored = [s for s in all_solutions if s.total != 0]
+    scored = [s for s in all_solutions if s.pair_values]
     scored.sort(key=lambda s: -s.total)
 
     kept: list[Solution] = []
@@ -346,7 +341,6 @@ def arbitrate(
         winner_uids=winner_uids,
         baselines=baselines,
         proxied_uids=frozenset(proxied),
-        dropped_uids=dropped,
     )
 
 

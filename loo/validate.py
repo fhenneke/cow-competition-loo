@@ -241,9 +241,9 @@ class AuctionReport:
         if any(
             check.n_pairs == 0 and not check.db_filtered for check in self.checks
         ):
-            # No contributing orders, yet the DB recorded a positive score and kept the
-            # solution. The Rust drops zero-value solutions before ranking, so this should
-            # be unreachable; the fairness filter would also wave it through vacuously.
+            # No auction order, yet the DB recorded the solution as kept. The Rust drops
+            # solutions without a scoring order before ranking, so this should be
+            # unreachable.
             return "solution-with-no-contributing-orders"
         if any(check.filter_cause == "bug" for check in self.checks):
             return "filter-decision-no-valid-split-explains"

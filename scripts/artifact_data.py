@@ -229,13 +229,9 @@ def row(
             "window_orders": quote.window_orders,
             "window_volume": _native(quote.window_volume_native),
             "matched": quote.matched,
-            "matched_corroborated": quote.matched_corroborated,
-            "matched_raw": quote.matched_raw,
             "orders_total": quote.orders_total,
             "wins": quote.quote_wins,
-            "wins_corroborated": quote.quote_wins_corroborated,
             "no_quote": quote.no_quote,
-            "no_quote_all": quote.no_quote_all,
             "no_quote_share": float(quote.no_quote_share)
             if quote.no_quote_share is not None
             else None,
@@ -243,9 +239,6 @@ def row(
             "degraded": quote.degraded,
             "window_bps": float(quote.window_bps)
             if quote.window_bps is not None
-            else None,
-            "window_bps_all": float(quote.window_bps_all_tiers)
-            if quote.window_bps_all_tiers is not None
             else None,
             "conditional_bps": float(quote.conditional_bps)
             if quote.conditional_bps is not None
@@ -350,8 +343,8 @@ def main(argv: list[str] | None = None) -> int:
             "price_suspects": {
                 r.network: r.price_suspects for r in reports if r.price_suspects
             },
-            "missing_data": {
-                r.network: r.missing_data for r in reports if r.missing_data
+            "fast_path": {
+                r.network: r.fast_path for r in reports if r.fast_path
             },
         },
     }

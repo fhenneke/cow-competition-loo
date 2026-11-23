@@ -97,15 +97,11 @@ class SolverReward:
     them was unknowable, or when no caps were supplied at all."""
     lower_cap: Decimal | None = None
     """The floor the clamp applied — `lower_reward_cap` of the solver's wins. `None`
-    when no caps were supplied, and on the mart's side for rows built before the mart
-    recorded its floor (the August 2026 rows)."""
+    when no caps were supplied."""
     capped_reward: Decimal | None = None
     """`0` if the auction is excluded, else `clamp(uncapped, lower_cap, upper_cap)`.
-    Exact for recorded winners, an estimate wherever `cap_inherited`."""
-    cap_inherited: bool = False
-    """True when any of the caps behind `upper_cap` and `lower_cap` came from a
-    displaced slot rather than this solution's own record — i.e. `capped_reward` is an
-    estimate."""
+    Exact for recorded winners, an estimate wherever a cap was inherited from a
+    displaced slot (`counterfactual.winner_caps`)."""
 
 
 def lower_reward_cap(wins: Iterable[Win], flat: int) -> Decimal:
@@ -139,7 +135,6 @@ def uncapped_rewards(
     *,
     lower_cap: int | None = None,
     excluded: bool = False,
-    caps_inherited: frozenset[str] = frozenset(),
 ) -> dict[str, SolverReward]:
     """Reward per winning solver of one auction — uncapped always, capped when caps
     are supplied.
@@ -151,8 +146,8 @@ def uncapped_rewards(
 
     The capped side is computed only when `lower_cap` — the auction's flat floor — is
     given: each solver's upper cap is the sum of its wins' `upper_cap` contributions
-    (`None` if any contribution is `None`), its floor is `lower_reward_cap` of its
-    wins, and `caps_inherited` names the solvers whose caps are estimates.
+    (`None` if any contribution is `None`), and its floor is `lower_reward_cap` of its
+    wins.
     """
     wins = list(wins)
     winning_score = sum(win.score for win in wins)
@@ -210,7 +205,6 @@ def uncapped_rewards(
             upper_cap=upper_cap,
             lower_cap=floor,
             capped_reward=capped,
-            cap_inherited=solver in caps_inherited,
         )
     return rewards
 
@@ -245,19 +239,13 @@ def differing_fields(
     ours: SolverReward | None, theirs: SolverReward | None
 ) -> tuple[str, ...]:
     """The `RewardMismatch.COMPARED_FIELDS` on which our row and the mart's disagree;
-    empty when they match.
-
-    A mart row with no `lower_cap` has no floor on record to compare — the column was
-    appended after the August 2026 rows were built — so the floor is then checked only
-    through `capped_reward`, which is how it was checked before the mart recorded it.
-    """
+    empty when they match."""
     if ours is None or theirs is None:
         return ("missing",)
     return tuple(
         name
         for name in RewardMismatch.COMPARED_FIELDS
         if getattr(ours, name) != getattr(theirs, name)
-        and not (name == "lower_cap" and theirs.lower_cap is None)
     )
 
 

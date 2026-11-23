@@ -129,12 +129,10 @@ carried the limit change) are counted and reported so that assumption is tested 
 held.
 
 It needs the `CLICKHOUSE_*` credentials and a network with quote data — mainnet and bnb
-from 2026-07-22, base, arbitrum-one, xdai, polygon, avalanche, ink, plasma and linea from
-2026-09-01; the quote window is clamped forward to the first day of that data and both
-windows are reported. An order created from 2026-09-29 17:20 UTC is linked to its
-competition **by quote id**, exactly; an earlier one by a heuristic over the gold request
-table and the raw estimates, corroborated where the winning estimate reproduces the stored
-amount. Unwraps (quote solver `0x0`) had no competition and are linked by neither. Orders
+base, arbitrum-one, xdai, polygon, avalanche, ink, plasma and linea. An order is linked
+to its competition **by quote id**, and only where the linked estimate reproduces the
+stored amount to the atom. Unwraps (quote solver `0x0`) had no competition and are not
+linked. Orders
 whose prices fail a check — the api's against the auction's, or sold against bought value,
 both at the prices of the auctions the order traded in — leave every quote figure.
 `--quote-ranking` chooses how the pick is re-run: `effective-sell` (default) nets the gas

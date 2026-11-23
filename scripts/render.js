@@ -198,8 +198,7 @@ function renderQuotes() {
     out.push(`<tr class="detail">` +
       `<td>${fmtBps(q.conditional_bps, 2)} on the ${
         q.degraded.toLocaleString("en-US")} that moved</td>` +
-      `<td>${q.wins_corroborated.toLocaleString("en-US")} of ${
-        q.wins.toLocaleString("en-US")} wins used${
+      `<td>${q.wins.toLocaleString("en-US")} wins${
         q.class_flips ? `<br>${q.class_flips} lost verification` : ""}</td>` +
       `<td>${q.no_quote_share === null ? "n/a"
         : `${pct(q.no_quote_share, 3)} of ${q.window_orders.toLocaleString("en-US")}`}</td>` +

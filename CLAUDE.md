@@ -78,19 +78,20 @@ Both are read-only references here. Do not modify them.
     price feed (`stg_auction_prices_corrections`, overlaid in
     `int_backend_data__price_data`); the score the competition was decided on is not. So
     never diff our native fees against the mart's — diff the **atoms**, which is what the
-    M13 cross-check does. The table is tiny (20 rows, all after auction 13639326) and
-    every auction in it is independently caught by `price_imbalanced`, so it changes no
-    number reported so far
+    M13 cross-check does. On 2026-08-30 the table had 20 rows and every auction in it
+    was independently caught by `price_imbalanced`; it has since grown to 7,184 archived
+    rows on mainnet and that check has not been re-run
     ([detail](docs/analytics-db.md#the-accounting-path-corrects-these-prices-the-scoring-path-must-not)).
-13. `stg_backend_data__jit_orders` only records JIT orders of **settled** batches, so an
-    unsettled solution's JIT orders are in neither order table and its auction cannot be
-    arbitrated faithfully. `analyse`/`validate` exclude such auctions transparently
-    (~0.8% of a month, D17); a crash on `MissingOrderError` means a caller bypassed the
-    `missing_data` collector
-    ([details](docs/analytics-db.md#jit-orders-are-recorded-only-when-the-batch-settles)).
-    The M1 window had zero of these — do not calibrate on it.
-14. An order's quote competition is a **join by quote id** for orders created from
-    2026-09-29 17:20 UTC, and a heuristic before. Read `quote_id` from
+13. **JIT orders are not read, and that is exact only while
+    `surplus_capturing_jit_order_owners` is empty.** Since services#4902 (live
+    2026-10-27) a JIT order earns no score, is ignored by the fairness filter and claims
+    no token pair, so `extract.EXECUTIONS_SQL` returns only the auction's own orders.
+    The array was empty on all ten chains over 2026-10-24..11-23; if CoW AMMs or any
+    other surplus-capturing owner return, those orders score again and the trim is
+    wrong. This replaced the D17 exclusion, which had reached 27% of mainnet's auctions
+    ([rule](docs/winner-selection.md#loo-replays-the-current-mechanism-only)).
+14. An order's quote competition is a **join by quote id**, the only link `loo` has
+    (ids exist from 2026-09-29 17:16 UTC). Read `quote_id` from
     `raw_prod_<chain>.order_quotes`: the staging model's copy is NULL on every row built
     before ~2026-10-06. Even linked, a streamed quote's order can carry a *non-winning*
     estimate, an ethflow order's stored quote can come from a request-less re-quote the
@@ -104,13 +105,11 @@ Both are read-only references here. Do not modify them.
     honest trades of any token that moved during the window
     ([details](docs/quotes.md#two-price-checks-both-at-the-orders-own-auctions)).
 14. Native prices come from the `price_tokens` / `price_values` arrays of
-    `stg_backend_data__competition_auctions`. Those arrays are **NULL before
-    2026-09-15**, so the deprecated `stg_backend_data__auction_prices` (frozen 2026-09-21
-    ~10:00 UTC, to be dropped) is still the only copy of every earlier price. Go through
-    `extract.fetch_prices`, which falls back per auction; never query one source
-    directly. Code that reads either source alone gets no prices for some windows, marks
-    those auctions abandoned, and still exits 0
-    ([coverage](docs/analytics-db.md#native-prices-price-arrays-and-the-legacy-table)).
+    `stg_backend_data__competition_auctions` and from nowhere else: the legacy
+    `stg_backend_data__auction_prices` was **dropped on 2026-11-05**. The arrays are
+    NULL before 2026-09-15, where `load_auctions` raises `MissingPricesError`. Go
+    through `extract.fetch_prices`
+    ([coverage](docs/analytics-db.md#native-prices-the-competition_auctions-arrays)).
 14. **The quote winner need not bid on its order.** `analyse_auction` skips auctions the
     removed solver never bid in, so anything wired through it that does not depend on the
     solver's bid — the recharged price-improvement fee is the case in hand — has to be
@@ -119,12 +118,10 @@ Both are read-only references here. Do not modify them.
     an excluded win and must run **after** the did-the-solver-win test; run first, it makes
     every suspect order a win of every solver
     ([both](docs/quotes.md#traps)).
-15. **`gold_quotes` does not hold every competition.** It is built off the `quote_requested`
-    event, and a competition whose event never arrived is in neither gold table — 0.6% of
-    requests, but the competitions behind a quarter of a day's orders (API callers). Link
-    through `raw_quotes.price_estimates` grouped by `request_id` before calling an order
-    unquoted, and never filter candidates on `quote_id` (`fast` is the one filter that
-    belongs: `order_quotes` never holds a fast quote)
+15. **`gold_quotes` does not hold every competition, so `loo` reads `raw_quotes` only.**
+    The gold tables are built off the `quote_requested` event, and a competition whose
+    event never arrived is in neither — 0.6% of requests, but the competitions behind a
+    quarter of a day's orders (API callers). Do not reach for them in new queries
     ([measured](docs/quotes.md#the-gold-tables-do-not-hold-every-competition--link-through-the-raw-layer)).
 16. **A window CTE joined against `proposed_solutions` is planned as a sequential scan
     of the whole table** (13.4M rows on mainnet): the planner cannot size a CTE whose
@@ -144,6 +141,24 @@ Both are read-only references here. Do not modify them.
     where NULL means "no cap, use the flat one" and 0 is a real cap. Read both through
     `rewards.lower_reward_cap`, never the column alone
     ([rule](docs/rewards.md#since-2026-09-08-the-lower-cap-is-per-order-cip-87)).
+
+19. **`loo` replays only the mechanism live since 2026-10-28** (`extract.MECHANISM_START`);
+    `validate` and `analyse` refuse an earlier window with exit 4. Before that date JIT
+    orders claimed token pairs, and before 2026-09-15 there are no prices. A zero-score
+    solution is **kept** if it trades an auction order (services#4753) — only a solution
+    with no auction order is dropped. `validate-rewards` has no such limit. Reports are
+    format 15; `compare` refuses older files, which excluded the JIT auctions.
+20. **Fast-path auctions are excluded, not arbitrated** (`fast_path_quote_id` non-NULL,
+    ~0.5% of auctions since 2026-11-08): one order settled from its quote competition,
+    losing quotes stored as zero-score solutions below the order's limit. They are
+    counted as `fast_path_auctions`; anything that iterates `competition_auctions`
+    directly has to skip them itself
+    ([why](docs/winner-selection.md#fast-path-auctions-are-excluded)).
+21. **The reference checkouts go stale.** On 2026-11-23 `~/Work/Code/services` sat on a
+    feature branch from 2026-09-15 and `cow-dagster` was 12 commits behind, which hid a
+    dropped table and two winner-selection changes. Compare against
+    `git ls-remote origin main` before reading either as current; a scratch
+    `git clone --shared` plus `git fetch <url> main` reads upstream without touching them.
 
 ## Environment
 

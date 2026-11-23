@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, NamedTuple, cast
@@ -157,13 +157,13 @@ class WindowAnalysis:
     start: str
     end: str
     auction_ids: list[int]
-    missing_data: list[int]
-    """Auctions excluded before arbitration because a traded order is in neither order
-    table (D17). A property of the window, so shared by every run."""
     runs: list[SolverRun]
     quote_window: QuoteWindow | None = None
     """The quote competition over the same window, loaded once for every scenario;
     `None` when the quote pass was off or the network has no quote data."""
+    fast_path: list[int] = field(default_factory=list[int])
+    """Fast-path auctions, excluded before arbitration: there is no solver competition
+    in them to re-run. A property of the window as well."""
 
 
 def analyse_window(
@@ -278,6 +278,7 @@ def analyse_window(
         for rule in outcome_rules
     ]
 
+    extract.require_current_mechanism(start)
     auction_ids = extract.auctions_in_window(conn, start, end)
     if limit:
         auction_ids = auction_ids[:limit]
@@ -287,7 +288,6 @@ def analyse_window(
         start=start,
         end=end,
         auction_ids=auction_ids,
-        missing_data=[],
         runs=runs,
     )
     if not auction_ids:
@@ -341,9 +341,7 @@ def analyse_window(
             f"recorded winning solutions"
         )
 
-    for bundle in extract.load_auctions(
-        conn, auction_ids, missing_data=window.missing_data
-    ):
+    for bundle in extract.load_auctions(conn, auction_ids, fast_path=window.fast_path):
         for run in runs:
             run.analysis.add(
                 analyse_auction(
@@ -361,7 +359,7 @@ def analyse_window(
 
     for run in runs:
         # The exclusion is a property of the window, not of the solver being removed.
-        run.analysis.missing_data_auctions = list(window.missing_data)
+        run.analysis.fast_path_auctions = list(window.fast_path)
 
     if mode == "score":
         # One rate query for every run together: the rates are identical across
@@ -450,7 +448,6 @@ def _json_default(value: Any) -> Any:
 
 _QUOTE_PROPERTIES = (
     "window_bps",
-    "window_bps_all_tiers",
     "conditional_bps",
     "no_quote_share",
 )
@@ -471,7 +468,6 @@ def _quote_payload(analysis: QuoteAnalysis) -> dict[str, Any]:
         {
             "order_uid": diff.order_uid,
             "leaf": diff.leaf,
-            "tier": diff.tier,
             "winner": diff.winner,
             "replacement": diff.replacement,
             "delta_bps": diff.delta_bps,
@@ -492,31 +488,20 @@ def _quote_window_payload(quote_window: QuoteWindow) -> dict[str, Any]:
     return {
         "ranking": quote_window.ranking,
         "ranking_description": quotes.RANKING[quote_window.ranking],
-        "coverage_start": quote_window.coverage_start,
         "start": quote_window.start,
         "end": quote_window.end,
         "orders": len(quote_window.orders),
         "orders_dropped": quote_window.orders_dropped,
-        "orders_before_coverage": quote_window.orders_before_coverage,
         "trivial_orders": quote_window.trivial_orders,
-        "links": [
-            {
-                "link": stats.link,
-                "orders": stats.orders,
-                "linked": stats.linked,
-                "corroborated": stats.corroborated,
-                "requoted": stats.requoted,
-                "streamed": stats.streamed,
-                "streamed_early": stats.streamed_early,
-                "unlinked": dict(stats.unlinked),
-            }
-            for stats in quote_window.links
-        ],
+        "link": {
+            "orders": quote_window.link.orders,
+            "linked": quote_window.link.linked,
+            "requoted": quote_window.link.requoted,
+            "streamed": quote_window.link.streamed,
+            "streamed_early": quote_window.link.streamed_early,
+            "unlinked": dict(quote_window.link.unlinked),
+        },
         "matched": len(quote_window.matches),
-        "matched_corroborated": sum(
-            1 for m in quote_window.matches if m.tier == "corroborated"
-        ),
-        "matched_raw": quote_window.matched_raw,
         "volume_native": quote_window.window_volume_native,
         "quoted_volume_native": quote_window.window_quoted_volume_native,
         "price_suspects": len(quote_window.price_suspects),

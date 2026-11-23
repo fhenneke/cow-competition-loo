@@ -149,14 +149,12 @@ implies, and auctions where shifting every score by that limit change would move
 winner set. Both should be near zero; a large one is a finding about the method and the
 page says so rather than adjusting by it.
 
-The section states three things about the window before the table, because they bound every
+The section states two things about the window before the table, because they bound every
 figure in it: the **pick reproduction rate** (a window where it falls is a window where the
-protocol's rule changed), the **match coverage** (unmatched orders contribute zero), and
-the **quote window**, which is shorter than the run's whenever the quote data begins later.
-Class flips and heuristic-tier matches are excluded from the bps figures and their counts
-are named — see docs/quotes.md. State how the orders were linked: the gold request table
-plus the raw estimates for the competitions it never held, with the per-source match count
-the report carries.
+protocol's rule changed) and the **link coverage** (unlinked orders contribute zero).
+Class flips are excluded from the bps figures and their count is named — see
+docs/quotes.md. State how the orders were linked: by quote id, with the counts the report
+carries for re-quoted and streamed orders and for each reason an order was not linked.
 
 ## Page structure
 
@@ -259,7 +257,7 @@ group reads as one band whatever the signs in it happen to be.
 - [ ] Every figure in the prose appears in a report or `compare` output for this run.
 - [ ] Signs read as counterfactual − actual, and the sign note is present.
 - [ ] Gross and net fees are labelled distinctly everywhere they appear.
-- [ ] Excluded auctions (price-suspect, missing-JIT, fee-unpriced) are counted on the page.
+- [ ] Excluded auctions (price-suspect, fast-path, fee-unpriced) are counted on the page.
 - [ ] No chain a solver bid on is missing from its rows, including the ones that came back zero.
 - [ ] Anything the run measured but the page does not show is named once in the
       footnote, so a reader knows it exists.
