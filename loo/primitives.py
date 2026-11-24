@@ -1,9 +1,6 @@
-"""Primitives shared by valuation and winner selection.
+"""Mirrors `services/crates/winner-selection/src/primitives.rs`.
 
-Mirrors `services/crates/winner-selection/src/primitives.rs`.
-
-Addresses and order uids are lowercase hex strings *without* a `0x` prefix, which is
-what `encode(col, 'hex')` returns from the analytics DB.
+Addresses and order uids are lowercase hex *without* `0x` (as `encode(col, 'hex')`).
 """
 
 from __future__ import annotations
@@ -15,12 +12,8 @@ NATIVE_TOKEN = "ee" * 20
 
 ONE_ETH = 10**18
 
-# Wrapped native token per network. Only needed for `as_erc20`, i.e. only when a
-# solution trades the `0xee..ee` sentinel directly. Deliberately incomplete: the
-# autopilot takes this from per-deployment config rather than a table, so an
-# unverified address is worse than a loud failure.
-# Verified against the WETH9 per-network deployment table in the services repo
-# (contracts/src/main.rs) — the same source the autopilot's `as_erc20` wrapping uses.
+# Verified against services contracts/src/main.rs. Add only verified addresses:
+# a wrong one is worse than the KeyError.
 WRAPPED_NATIVE_TOKEN = {
     "mainnet": "c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
     "xdai": "e91d153e0b41518a2ce8dd3d7944fa863463a97d",  # WXDAI
@@ -35,27 +28,15 @@ WRAPPED_NATIVE_TOKEN = {
     "plasma": "6100e367285b01f48d07953803a2d8dca5d19873",  # WXPL
 }
 
-# USD reference tokens per network, address -> decimals. The analytics DB has no USD
-# price table, but `stg_backend_data__auction_prices` carries a native price for every
-# token in the auction — so a major stablecoin's own native price implies the USD rate,
-# per auction, from the same source every other number here already trusts. Measured on
-# the M1 window the three tokens below agree within ~0.1%, so a median across them is
-# robust to any one being off. Deliberately incomplete like WRAPPED_NATIVE_TOKEN:
-# an unverified stablecoin address would silently fabricate every USD figure.
+# Stablecoin address -> decimals; their auction native prices imply USD/native (median).
+# Add only verified addresses: a wrong one silently fabricates every USD figure.
 USD_REFERENCE_TOKENS: dict[str, dict[str, int]] = {
     "mainnet": {
         "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": 6,  # USDC
         "dac17f958d2ee523a2206206994597c13d831ec7": 6,  # USDT
         "6b175474e89094c44da98b954eedeac495271d0f": 18,  # DAI
     },
-    # The non-mainnet entries below were verified over July 2026 (~200-auction
-    # samples): each token is priced in every sampled auction, the tokens of one
-    # network agree with each other to 0.1-0.7% on the implied USD/native rate, and
-    # that rate matches an independent anchor (mainnet USD/ETH x the two chains'
-    # COW accounting rates) to a few percent. Polygon's bridged USDC.e is
-    # deliberately absent: it disagreed with the other three by ~6%. The ink and
-    # plasma entries labelled "dollar token" have no name to cite, only that
-    # three-way agreement; the analytics DB carries no token metadata to name them.
+    # Polygon USDC.e is deliberately absent: it disagrees with the others.
     "xdai": {
         "2a22f9c3b484c3629090feed35f17ff8f88f76f0": 6,  # USDC.e
         "4ecaba5870353805a9f068101a40e0f32ed605c6": 6,  # USDT
@@ -81,8 +62,8 @@ USD_REFERENCE_TOKENS: dict[str, dict[str, int]] = {
         "8f3cf7ad23cd3cadbd9735aff958023239c6a063": 18,  # DAI
     },
     "bnb": {
-        "55d398326f99059ff775485246999027b3197955": 18,  # USDT (18 decimals on BNB)
-        "8ac76a51cc950d9822d68b83fe1ad97b32cd580d": 18,  # USDC (18 decimals on BNB)
+        "55d398326f99059ff775485246999027b3197955": 18,  # USDT
+        "8ac76a51cc950d9822d68b83fe1ad97b32cd580d": 18,  # USDC
         "e9e7cea3dedca5984780bafc599bd69add087d56": 18,  # BUSD
     },
     "linea": {
@@ -130,12 +111,7 @@ def usd_reference_tokens(network: str) -> dict[str, int]:
 
 
 def usd_per_native(price: int, decimals: int) -> Decimal:
-    """USD per native token implied by a stablecoin's native price.
-
-    1 USD = `10**decimals` atoms, worth `10**decimals * price / 1e18` wei, so one
-    native token (1e18 wei) is `10**(36 - decimals) / price` USD. Display only —
-    nothing on the valuation path consumes this.
-    """
+    """USD per native token implied by a stablecoin's native price. Display only."""
     return Decimal(10) ** (36 - decimals) / Decimal(price)
 
 
@@ -150,10 +126,7 @@ def price_in_eth(price: int, amount: int) -> int:
 
 
 def ceil_div(numerator: int, denominator: int) -> int:
-    """`U256Ext::checked_ceil_div` — division rounding away from zero.
-
-    Both operands are non-negative here, so `-(-a // b)` is plain ceiling division.
-    """
+    """`U256Ext::checked_ceil_div`; operands are non-negative."""
     if denominator == 0:
         raise ZeroDivisionError("ceil_div by zero")
     return -(-numerator // denominator)

@@ -1,15 +1,7 @@
-"""The quote competition: who priced an order into existence, and what changes without
-them.
+"""The quote competition: reproduce the pick, re-run it without a solver, and hand the
+counterfactual quote to the fee path (`fees.py`).
 
-The solve competition decides who *fills* an order; the quote competition decides the
-price the user was shown, and therefore the order's limit price and the baseline every
-`priceimprovement` fee is charged against. Removing a solver moves both. This module is
-the quote half: it reproduces the pick, re-runs it without a solver, and hands the
-resulting counterfactual quote to the fee path that already exists (`fees.py`).
-
-## The pick
-
-`services/crates/price-estimation/src/competition/quote.rs`:
+The pick, `services/crates/price-estimation/src/competition/quote.rs` (services#4846):
 
 ```
 is_reasonable          drop any estimate with gas == 0 or out_amount == 0
@@ -21,52 +13,8 @@ effective_out_amount   gas cost in the sell token = gas × gas_price / native(se
 results.sort_by        stable, over the answers in arrival order — a tie goes first-come
 ```
 
-That is the rule since services#4846 (merged 2026-09-02); before it, `effective_eth_out`
-valued the out amount at the *out* token's native price and netted gas in wei. Three facts
-make it reproducible from recorded data, all measured (docs/quotes.md):
-
-1. The **verified class is a hard first key.** Over 5,041 requests carrying both
-   verified and unverified estimates, a verified one won all 5,041.
-2. `gas_price` and `native(sell)` are the order's own `order_quotes.gas_price` and
-   `sell_token_price`, so the rule needs nothing that is not recorded per order. Even
-   before #4846 they entered only through a ratio common to every estimator of one
-   request, and the sell-token netting reproduced the recorded winner on **99.6%** of
-   mainnet and **100.0%** of bnb order-creating requests (2026-08-10..16); the gross
-   `out_amount` alone reproduces 61.5% / 90.2%.
-3. **Arrival order is recorded** — `nats_seq` on the raw layer — so the clamp and the
-   truncation, which make ties common on dust requests, are reproducible too.
-
-So there are two ranking rules, and `RANKING` names them:
-
-- `effective-sell` (default) — the effective quote netted in the sell token. The
-  protocol's own rule since #4846, and the same quantity the price-improvement fee is
-  charged against, so pick and fee cannot disagree.
-- `autopilot` — the out-token rule from before #4846, which needs the *buy* token's
-  native price for sell orders. Kept as the cross-check: it measures how far the two
-  differ, which is exactly the quote's own pricing error, since `in × sell_price ≈ out ×
-  buy_price` is what a quote asserts. For a **buy** order the out token *is* the sell
-  token, so the two rules differ there only in the unit they truncate in.
-
-## Linking an order to its competition
-
-By quote id (`link_by_quote_id`): the order records the id of the quote it was placed
-with, every estimate records its own id and its estimator's settlement address, so the
-link is a join and the estimator map is read rather than derived. Per-estimate ids exist
-on every chain from 2026-09-29 17:16 UTC, well before the earliest window the solve side
-accepts (`extract.MECHANISM_START`).
-
-An order whose recorded quote solver is the zero address had no competition at all — a
-wrapped-to-native unwrap, answered identically by every estimator — and is not linked
-(`RecordedQuote.trivial`).
-
-## What is exact and what is not
-
-The raw layer stores amounts as exact decimal strings, and the link reads only the raw
-layer, so its ladders are exact ints. The
-recorded quote, its fee and every solve-side number stay exact, because they come from
-Postgres: the ladder supplies only the *counterfactual*, never the baseline (Q-D5). A link
-failure therefore degrades the counterfactual and can be counted; it can never corrupt a
-recorded number.
+The baseline quote and its fee always come from Postgres; the ClickHouse ladder supplies
+only the counterfactual.
 """
 
 from __future__ import annotations
@@ -103,37 +51,16 @@ RANKING: dict[QuoteRanking, str] = {
 }
 
 PRICE_IMBALANCE_THRESHOLD = 2.0
-"""D14 on the quote side, applied by two checks that catch different breakages.
-
-**One-sided** (`price_suspect_orders`): two independent feeds price the order's sell
-token — the api's, recorded per order as `order_quotes.sell_token_price` (wei per atom),
-and the autopilot's, in the auction's own price vector (the same quantity scaled by
-1e18). They agree to four decimals on real tokens — measured 1.0000 for WETH, 0.9999 for
-USDC, 1.0004 for USDT — and disagree by factors of 1e7 to 1e18 where one of them is
-broken. The same wrong price sets both the order's weight and its gas cost: one such
-order carried 6.9 M ETH of apparent executed volume, 90% of a corrected window.
-
-**Two-sided** (`imbalanced_orders`): when both feeds carry the *same* wrong price the
-first check passes, so the order's sold value is also compared with its bought value,
-trade by trade at the prices of the auction each trade settled in — the solve side's
-`counterfactual.price_imbalanced`, per order. On bnb 2026-10-05..12, 26 orders priced
-that way passed the one-sided check and carried 28.68 M of the 28.70 M BNB of executed
-volume it let through (the solve side's whole week was 16,988 BNB).
-
-An order failing either is excluded from every quote figure and counted."""
+"""Disagreement factor past which `price_suspect_orders` or `imbalanced_orders` excludes
+an order ([docs](../docs/quotes.md#two-price-checks-both-at-the-orders-own-auctions))."""
 
 
 TRIVIAL_QUOTE_SOLVER = "00" * 20
-"""`order_quotes.solver` of an order whose quote no competition decided: every one seen
-is a wrapped-native-to-native unwrap (WETH→ETH, WBNB→BNB) — 10 on mainnet 2026-07-25, 29
-on 2026-10-08, 22 on bnb that day, no other pair. Every estimator answers such a request
-identically and arrival order picks the winner, so it is not linked."""
+"""`order_quotes.solver` of a wrapped-native unwrap: no competition, so not linked."""
 
 PRE_CREATION_WINDOW_SECONDS = 30 * 60
 POST_CREATION_WINDOW_SECONDS = 90
-"""How far around an order's creation day the estimates are searched: a quote can
-precede its order by up to half an hour, and the backend's re-quote at indexing lands
-just after creation."""
+"""Estimate search window around order creation; the indexing re-quote lands just after."""
 
 
 # --- the ladder ---------------------------------------------------------------------
@@ -141,8 +68,6 @@ just after creation."""
 
 @dataclass(frozen=True)
 class Estimate:
-    """One estimator's answer to one request, as `fct_quote_estimates` recorded it."""
-
     estimator: str
     out_amount: float
     gas: float
@@ -151,21 +76,14 @@ class Estimate:
 
     @property
     def reasonable(self) -> bool:
-        """`is_reasonable` (`competition/quote.rs:191`) — a zero on either field means
-        the estimate never entered the comparison at all."""
+        """`is_reasonable` (`competition/quote.rs:191`)."""
         return self.out_amount > 0 and self.gas > 0
 
 
 @dataclass(frozen=True)
 class Pricing:
-    """The scalars one request's ranking needs.
-
-    `gas_price` and `sell_token_price` are recorded on the order's own quote, so they
-    are exact for every order-creating request. `buy_token_price` is only consulted by
-    the `autopilot` rule on sell orders and is `None` when the window's auctions never
-    priced that token — in which case the request is reported unpriced, not guessed.
-    All three are wei per atom; the auction feed's 1e18 scaling is divided out first.
-    """
+    """Ranking scalars, all wei per atom. `buy_token_price` is used only by `autopilot`
+    on sell orders; `None` means unpriced."""
 
     gas_price: float
     sell_token_price: float
@@ -177,20 +95,15 @@ class Pricing:
 
 @dataclass(frozen=True)
 class QuoteRequest:
-    """One request and the ladder it produced."""
-
     request_id: str
     kind: str
     sell_token: str
     buy_token: str
     in_amount: float
     winner: str
-    """The estimator `winning_price_estimates` recorded. Empty when the request has no
-    recorded winner, which `pick` then has nothing to be checked against."""
+    """Empty when no winner was recorded."""
     estimates: tuple[Estimate, ...] = ()
-    """In **arrival order** (`nats_seq`). Prod breaks an exact tie by arrival (a stable sort over
-    the answers in completion order, `quote.rs:80`) and `pick` keeps the first of equal
-    keys, so the order here is what makes a tie reproducible."""
+    """In arrival order (`nats_seq`): prod breaks ties first-come (`quote.rs:80`)."""
 
     @property
     def is_sell(self) -> bool:
@@ -209,12 +122,8 @@ class QuoteRequest:
 def effective_sell_amount(
     estimate: Estimate, *, is_sell: bool, in_amount: float, pricing: Pricing
 ) -> float:
-    """The quote's effective amount, netted for the estimator's own gas in the sell
-    token — the `order_quotes_effective` netting without the volume factor, which is
-    also what `fees._adjust_quote_to_order_limits` charges against.
-
-    Returned on the *out* side: buy atoms for a sell order, sell atoms for a buy one.
-    """
+    """The quote netted for its own gas in the sell token, on the out side — what
+    `fees._adjust_quote_to_order_limits` charges against."""
     cost = pricing.gas_cost_in_sell_atoms(estimate.gas)
     if is_sell:
         if in_amount <= 0:
@@ -231,36 +140,18 @@ def rank_key(
     pricing: Pricing,
     ranking: QuoteRanking,
 ) -> float:
-    """The comparison key, oriented so that **larger is better** under both order kinds
-    and both rules — a buy order's cost is negated rather than compared backwards, so
-    every caller can use plain `max`.
-
-    Each rule is prod's arithmetic, in prod's order of operations, down to its two
-    discontinuities, because both decide winners in practice:
-
-    - **The clamp.** A sell quote whose gas exceeds its value is worth zero, so every
-      underwater estimate ties and arrival order decides. On bnb 2026-10-05..12 the
-      unclamped key named another winner on dust requests — 0.006 USDT against ~330 k
-      gas — where prod had taken the first answer.
-    - **The truncation.** The value is truncated to an integer before comparing
-      (`U256::saturating_from(v.trunc())`) — atoms of the out token under
-      `effective-sell`, wei under `autopilot`. On an out amount of 35 atoms, 32.79 and
-      32.24 are both 32, so again arrival order decides: six bnb requests that week, all
-      of them reproduced once the key truncates.
-
-    The counterfactual is unaffected by either: a replacement under water lands in the
-    `nonpositive` leaf whichever underwater estimate it is, and a tie is between
-    estimates prod itself could not tell apart."""
+    """Comparison key, larger is better for both kinds. Prod's arithmetic in prod's order,
+    including the zero clamp and the truncation (`U256::saturating_from(v.trunc())`):
+    both create ties that arrival order decides."""
     if ranking == "effective-sell":
-        # `RankingContext::effective_out_amount` (services#4846, merged 2026-09-02).
+        # `RankingContext::effective_out_amount` (services#4846).
         cost = pricing.gas_cost_in_sell_atoms(estimate.gas)
         if is_sell:
             value = estimate.out_amount - cost * (estimate.out_amount / in_amount)
             return float(math.trunc(value)) if value > 0 else 0.0
         return -float(math.trunc(estimate.out_amount + cost))
     if ranking == "autopilot":
-        # `effective_eth_out` before services#4846: the out amount valued in wei at the
-        # out token's native price, gas at the gas price, truncated in wei.
+        # `effective_eth_out` before services#4846, truncated in wei.
         price = pricing.sell_token_price if not is_sell else pricing.buy_token_price
         if not price:
             raise UnpricedRequestError(
@@ -287,14 +178,8 @@ def pick(
     pricing: Pricing,
     ranking: QuoteRanking = "effective-sell",
 ) -> Estimate | None:
-    """The winning estimate under the protocol's rule, or `None` if nothing is usable.
-
-    Verified beats unverified at any amount (`QuoteVerificationMode::Prefer`, which the
-    data confirms is what prod runs), then the ranking key decides. Ties keep the first
-    estimate in the given order — arrival order for a loaded ladder
-    (`QuoteRequest.estimates`), which is prod's own tie-break; `PickValidation.tied`
-    counts the requests where it mattered.
-    """
+    """Verified first (`QuoteVerificationMode::Prefer`), then `rank_key`; ties keep the
+    first in the given order. `None` if nothing is usable."""
     usable = [e for e in estimates if e.reasonable]
     if not usable:
         return None
@@ -315,11 +200,7 @@ def leave_one_out(
     pricing: Pricing,
     ranking: QuoteRanking = "effective-sell",
 ) -> Estimate | None:
-    """Who wins the request with every estimator in `removed` absent.
-
-    `None` means no quote at all: the request produced nothing, so the order it created
-    would never have existed.
-    """
+    """Winner with `removed` absent; `None` means no quote, so no order."""
     return pick(
         (e for e in request.estimates if e.estimator not in removed),
         is_sell=request.is_sell,
@@ -337,13 +218,9 @@ def replay_stream(
     pricing: Pricing,
     ranking: QuoteRanking = "effective-sell",
 ) -> list[str]:
-    """The estimators a stream sends to the client, in order: every reasonable answer
-    that strictly beats the best one so far, on the same verified-first key as `pick`
-    (`estimate_stream`, `beats_best = compare_quote_result(…).is_gt()`) — less the ones
-    the quoter then drops because their gas cost does not fit the sell amount
-    (`SellAmountDoesNotCoverFee` in `OrderQuoter::calculate_quote_stream`). A dropped
-    answer still sets the bar the next one must beat, though nobody saw it. `estimates`
-    must be in arrival order."""
+    """Estimators a stream forwards, in order: each answer beating the best so far
+    (`estimate_stream`), less those dropped as `SellAmountDoesNotCoverFee`, which still
+    set the bar. `estimates` must be in arrival order."""
     forwarded: list[str] = []
     best: tuple[bool, float] | None = None
     for estimate in estimates:
@@ -366,10 +243,7 @@ def replay_stream(
 def _sendable(
     estimate: Estimate, *, is_sell: bool, in_amount: float, pricing: Pricing
 ) -> bool:
-    """Whether the quoter turns a forwarded answer into a quote at all. On bnb
-    2026-10-05..12 the record lacked a forwarded answer in 15 of 11,523 streams, and in
-    every one its gas cost was 1.02–1.70x the sell amount. Only sell orders are checked:
-    no buy-order case has been seen."""
+    """Whether the quoter turns a forwarded answer into a quote (sell orders only)."""
     return not is_sell or pricing.gas_cost_in_sell_atoms(estimate.gas) < in_amount
 
 
@@ -385,19 +259,9 @@ def stream_replacement(
     pricing: Pricing,
     ranking: QuoteRanking = "effective-sell",
 ) -> tuple[Estimate | None, bool]:
-    """What the user of a streamed order would have committed to with `removed` absent,
-    given that the answer they took is among them.
-
-    The best remaining answer that had arrived by the commit (`take.horizon`). If none
-    had, the user waits for the stream's next remaining answer and takes that: in a
-    finished stream it is in the ladder; in a dropped one it was cancelled unrecorded,
-    which raises `UnrecordedStreamError`. `None` means the stream never had another
-    usable answer, so no quote at all.
-
-    Also returns whether the commit time mattered: whether a commit the moment the
-    taken answer was forwarded — the earliest the record allows — would have shown a
-    different estimator. A count for the reader, not a second scenario.
-    """
+    """The replacement a streamed order's user would have taken with `removed` absent:
+    the best remaining answer by `take.horizon`, else the next to arrive. Also returns
+    whether committing at `take.position` instead would change it."""
     remaining = [e for e in request.estimates if e.estimator not in removed]
 
     def best(upto: int) -> Estimate | None:
@@ -424,7 +288,6 @@ def stream_replacement(
                     "the stream was dropped before another answer arrived"
                 )
             return None
-        # The first remaining answer to arrive is what the stream would have sent.
         return later[0]
 
     if not any(e.reasonable for e in remaining):
@@ -443,17 +306,8 @@ def stream_replacement(
 def counterfactual_quote(
     estimate: Estimate, *, is_sell: bool, in_amount: float, pricing: Pricing
 ) -> Quote:
-    """The `fees.Quote` an estimate would have put on the order.
-
-    The request's `in_amount` is the sell side of a sell request and the buy side of a
-    buy one, so the two amounts swap roles with the kind. `fee` is the estimator's own
-    gas cost in sell atoms — the same `quote_fee` the recorded quote carries, computed
-    from the estimator's `gas` instead of the winner's.
-
-    Amounts are rounded rather than floored: they come from a `Float64` ladder, where a
-    floor would bias every counterfactual quote down by up to one atom and so bias
-    every fee delta up.
-    """
+    """The `fees.Quote` an estimate would have put on the order. Rounded, not floored,
+    so fee deltas are not biased."""
     fee = round(pricing.gas_cost_in_sell_atoms(estimate.gas))
     if fee < 0:
         raise FeeError(f"negative counterfactual quote fee ({fee})")
@@ -468,10 +322,7 @@ def counterfactual_quote(
 
 # --- the recorded orders and their quotes -------------------------------------------
 
-# `quote_id` is read from the backend's own `order_quotes` mirror, not the staging model:
-# `stg_backend_data__order_quotes` is incremental with `append_new_columns`, so its
-# `quote_id` is NULL on every row built before the column was added (~2026-10-06), while
-# the raw table has it from 2026-09-22.
+# `quote_id` comes from `raw_prod_<chain>.order_quotes`: the staging copy is NULL early.
 ORDERS_SQL = """
 with traded as (
     select t.order_uid, sum(t.sell_amount) as executed_sell
@@ -506,10 +357,7 @@ where o.creation_timestamp >= %(start)s and o.creation_timestamp < %(end)s
 order by o.creation_timestamp
 """
 
-# The autopilot's native price per token: the median over the window's auctions. Crude by
-# design — it is a cross-check and the `autopilot` ranking's input, never a valuation —
-# and a token the window never priced stays absent rather than being guessed. Prices are
-# read through `extract.fetch_prices`; the source is described above `extract.PRICES_SQL`.
+# Window median per token: a cross-check and `autopilot` input, never a valuation.
 TOKEN_PRICES_SQL = """
 select encode(ap.token, 'hex') as token, percentile_cont(0.5) within group (
            order by ap.price
@@ -522,12 +370,7 @@ group by ap.token
 
 @dataclass(frozen=True)
 class RecordedQuote:
-    """One order created in the window, with the quote that priced it.
-
-    Every field here comes from Postgres and is exact. `in_amount` is the amount the
-    quote request carried — the sell side of a sell order, the buy side of a buy one —
-    and is the key the ClickHouse request is matched on.
-    """
+    """An order created in the window with its recorded quote, exact from Postgres."""
 
     order_uid: str
     created: str
@@ -540,15 +383,9 @@ class RecordedQuote:
     pricing: Pricing
     verified: bool
     app_code: str
-    """The integration that placed the order. Match coverage varies by an order of
-    magnitude between app codes, so it is the only honest unit to report coverage in."""
     executed_sell: int = 0
-    """Sell-side atoms this order actually traded, summed over its trades — 0 for an
-    order that never traded."""
     quote_id: int | None = None
-    """The id of the quote the order was placed with, as the backend's `order_quotes`
-    records it — the key of the quote-id link. `None` before 2026-09-22 and `0` on an
-    ethflow order placed without one; both mean there is nothing to join on."""
+    """`None`, or `0` for an ethflow order placed without one: nothing to join on."""
 
     @property
     def is_sell(self) -> bool:
@@ -561,13 +398,12 @@ class RecordedQuote:
 
     @property
     def in_atoms(self) -> int:
-        """`in_amount` as the exact integer the order stores — the request's key."""
+        """The request's in amount: sell side of a sell order, buy side of a buy one."""
         return self.quote.sell_amount if self.is_sell else self.quote.buy_amount
 
     @property
     def out_atoms(self) -> int:
-        """`out_amount` as the exact integer the order stores — what the winning estimate
-        of the order's competition must equal to the atom."""
+        """What the linked estimate must equal to the atom."""
         return self.quote.buy_amount if self.is_sell else self.quote.sell_amount
 
     @property
@@ -576,27 +412,16 @@ class RecordedQuote:
 
     @property
     def out_amount(self) -> float:
-        """The amount the linked estimate must have returned for the link to hold."""
         return float(self.quote.buy_amount if self.is_sell else self.quote.sell_amount)
 
     @property
     def volume_native(self) -> int:
-        """The order's **executed** sell-side value in native wei, at the quote's own
-        sell-token price — the weight of every quality figure and the window denominator.
-
-        Executed rather than quoted, and that is not a detail. Quoted volume is not a
-        market: five probe orders of 1e25 atoms — ten million WETH — were 52.4 M of one
-        ten-day window's 52.5 M ETH of quoted volume, and none of them traded. Weighting
-        by what traded drops them by construction, and matches the denominator D23 uses
-        on the solve side. An order that never traded weighs nothing: its quote moved a
-        limit price nobody used.
-        """
+        """Executed (not quoted: untraded probe orders would dominate) sell-side value
+        in native wei at the quote's sell price — the weight of every quote figure."""
         return round(self.executed_sell * self.pricing.sell_token_price)
 
     @property
     def quoted_volume_native(self) -> int:
-        """The quoted sell-side value, kept only to report how much of the window never
-        traded."""
         return round(self.quote.sell_amount * self.pricing.sell_token_price)
 
     @property
@@ -607,12 +432,8 @@ class RecordedQuote:
 def load_recorded_quotes(
     conn: Connection, start: str, end: str, *, network: str
 ) -> tuple[list[RecordedQuote], int]:
-    """Orders created in `[start, end)` on `network` that carry a recorded quote.
-
-    Returns the orders and the number of rows dropped because their quote could not be
-    evaluated — a zero `sell_token_price` makes the gas cost undefined, and an order
-    whose own quote cannot be netted cannot have a counterfactual either.
-    """
+    """Orders created in `[start, end)` with a recorded quote, and how many were dropped
+    as unevaluable."""
     orders: list[RecordedQuote] = []
     dropped = 0
     sql = ORDERS_SQL.format(raw_schema=raw_schema(network))
@@ -656,8 +477,6 @@ def load_recorded_quotes(
 
 
 def _time_bounds(start: str, end: str) -> tuple[str, str]:
-    """The ClickHouse window for orders created in `[start, end)`: wide enough for a
-    quote that precedes its order and for a re-quote just after the last one."""
     from datetime import datetime, timedelta
 
     first = datetime.fromisoformat(start) - timedelta(
@@ -668,7 +487,7 @@ def _time_bounds(start: str, end: str) -> tuple[str, str]:
 
 
 Arrival = int
-"""When an estimate arrived, as a sort key: its `nats_seq`."""
+"""An estimate's `nats_seq`."""
 
 
 def _keep_earliest(
@@ -677,8 +496,8 @@ def _keep_earliest(
     arrival: Arrival,
     estimate: Estimate,
 ) -> None:
-    """One estimate per `(request_id, estimator)` — a `ReplacingMergeTree` can hold a row
-    twice until it merges — keeping the earliest arrival."""
+    """Keep the earliest per `(request_id, estimator)`: a `ReplacingMergeTree` can hold
+    duplicates until it merges."""
     key = (request_id, estimate.estimator)
     if key not in rows or arrival < rows[key][0]:
         rows[key] = (arrival, estimate)
@@ -687,7 +506,6 @@ def _keep_earliest(
 def _ladders(
     rows: Mapping[tuple[str, str], tuple[Arrival, Estimate]],
 ) -> dict[str, tuple[Estimate, ...]]:
-    """Group deduplicated estimates into ladders, each in arrival order."""
     ladders: dict[str, list[tuple[Arrival, Estimate]]] = {}
     for (request_id, _), entry in rows.items():
         ladders.setdefault(request_id, []).append(entry)
@@ -702,43 +520,29 @@ def _ladders(
 
 @dataclass(frozen=True)
 class MatchedQuote:
-    """One order joined to the request that priced it."""
-
     order: RecordedQuote
     request: QuoteRequest
-    """The linked estimate reproduces the amount stored on the order to the atom, or
-    there is no match (`link_by_quote_id`)."""
+    """Its linked estimate reproduces the order's stored amount to the atom."""
     stream: StreamTake | None = None
-    """Set when the order was placed from a streamed quote (`StreamTake`); the
-    counterfactual then follows what the stream would have shown, not the full ladder."""
+    """Set for a streamed quote: the counterfactual follows the stream."""
 
 
 @dataclass(frozen=True)
 class StreamTake:
-    """Which answer of a streamed competition an order took, and what had arrived by the
-    time its user committed.
-
-    `/api/v1/quote/stream` forwards every answer that beats the best one sent so far and,
-    since services#4957, records each forwarded answer as a `quote_computed` row and the
-    final best as the winner. The user commits to whichever forwarded answer is on screen;
-    the order carries its quote id. The commit itself is not recorded, so it is placed at
-    the latest moment the record allows: just before the next forwarded answer arrived,
-    or, for the last one, before the order was created (`horizon`).
+    """Which forwarded answer of a streamed competition (services#4957) an order took.
+    The commit is unrecorded, so it is placed as late as the record allows (`horizon`)
+    ([docs](../docs/quotes.md#streamed-quotes-the-order-takes-what-the-stream-showed-not-the-winner)).
     """
 
     taken: str
-    """The estimator whose forwarded answer the order carries."""
     position: int
-    """Its index in the arrival-ordered ladder."""
+    """Index in the arrival-ordered ladder."""
     horizon: int
-    """Answers `[0, horizon)` of the ladder may have arrived before the user committed."""
+    """Answers `[0, horizon)` may have arrived before the commit."""
     complete: bool
-    """The stream reported a winner, so it ran to the end and every answer it received is
-    in the ladder. A stream the client dropped early has no winner, and the answers it
-    cancelled were never recorded."""
+    """A winner was recorded, so every answer the stream received is in the ladder."""
     forwarded: tuple[str, ...] = ()
-    """The estimators of the request's `quote_computed` rows, in order — what the stream
-    forwarded, as recorded; `validate_picks` replays the stream against it."""
+    """Estimators of the request's `quote_computed` rows, in order."""
 
 
 # --- the quote-id link --------------------------------------------------------------
@@ -746,22 +550,14 @@ class StreamTake:
 
 @dataclass(frozen=True)
 class LinkStats:
-    """How the quote-id link fared on the orders it was asked to place."""
-
     orders: int
-    """Non-trivial orders handed to the link — the base its rate is over."""
     linked: int
     unlinked: Mapping[str, int] = field(default_factory=dict[str, int])
-    """Why the rest were not linked, by reason."""
     requoted: int = 0
-    """Of `linked`, the orders linked to the backend's own re-quote rather than through
-    their quote id (`_link_requotes`) — ethflow orders whose stored quote was recomputed
-    when the order was indexed."""
+    """Of `linked`, through `_link_requotes`."""
     streamed: int = 0
     streamed_early: int = 0
-    """Of `linked`, the orders placed from a streamed quote (`StreamTake`), and of those
-    the ones whose answer is not the stream's recorded final best — taken before the
-    stream finished, or from a stream dropped before it reported one."""
+    """Of `streamed`, those whose answer is not the stream's recorded final best."""
 
     @property
     def rate(self) -> float | None:
@@ -772,9 +568,7 @@ class LinkStats:
 class IdLink:
     matches: list[MatchedQuote]
     estimator_map: dict[str, str]
-    """`estimator -> settlement address` as `price_estimates.solver` records it — read,
-    not derived, so it covers every estimator in the loaded ladders, including ones that
-    never won."""
+    """`estimator -> settlement address`, read from `price_estimates.solver`."""
     stats: LinkStats
 
 
@@ -786,8 +580,7 @@ ID_LADDER_COLUMNS = (
 
 
 def _exact(value: object) -> float:
-    """A raw-layer amount — an exact decimal string — as the `int` it is. Typed `float`
-    because an `Estimate` holds either; an int compares and rounds exactly."""
+    """A raw-layer decimal string as an exact `int` (typed `float`, as `Estimate` is)."""
     text = str(value)
     try:
         return int(text)
@@ -803,31 +596,10 @@ def link_by_quote_id(
     chunk: int = 2000,
     log: Callable[[str], None] | None = None,
 ) -> IdLink:
-    """Link each order to its competition by the id of the quote it was placed with.
-
-    `order_quotes.quote_id` → the `raw_quotes.price_estimates` row carrying that id → its
-    `request_id` → every estimate of that request, with its winner from
-    `winning_price_estimates`. One query per creation day and chunk of ids for each of
-    the two, the ids resolved to request ids by a subquery so the ladder comes back in
-    the same round trip. The raw tables partition by month, so the day bound prunes
-    little; it is what keeps an id from matching an estimate of another day.
-
-    The amounts are exact decimal strings and are kept as ints, so the check that makes a
-    link a link is exact: the linked estimate must be its competition's recorded winner
-    and reproduce the amount stored on the order to the atom. Two kinds of order fail
-    it, and each is handled for what it is:
-
-    - **An ethflow order whose stored quote was recomputed when it was indexed**, or that
-      was placed with `quote_id = 0`: the id names the UI's quote, or nothing, while the
-      stored one came from a competition the backend ran itself, with no request id. A
-      second pass finds that competition by the stored amount (`_link_requotes`).
-    - **An order placed from a streamed quote**: the id is right, but the answer it names
-      need not be the competition's recorded winner — the stream forwards every
-      improvement and records only its final best, or none if the client dropped it.
-      Such an order is linked with a `StreamTake`, read from the request's
-      `quote_computed` rows, and its counterfactual follows the stream
-      (`stream_replacement`).
-    """
+    """Link each order to its competition by quote id, through the raw layer only (the
+    gold tables miss competitions). The linked estimate must reproduce the order's stored
+    amount to the atom. Ethflow re-quotes fall to `_link_requotes`; an order from a stream
+    gets a `StreamTake`. The day bound keeps an id from matching another day's estimate."""
     from datetime import date, timedelta
 
     emit: Callable[[str], None] = log or (lambda message: None)
@@ -862,8 +634,7 @@ def link_by_quote_id(
                 f"where chain_id = {chain} and {window} and request_id in ({linked})"
             ):
                 winners.setdefault(row["request_id"], set()).add(row["estimator"])
-            # What a stream forwarded: one `quote_computed` row per forwarded answer,
-            # where a one-shot request has a single one (services#4957).
+            # One `quote_computed` row per forwarded answer (services#4957).
             for row in client.fetch(
                 f"select request_id, quote_id, nats_seq from "
                 f"{ch.RAW_DATABASE}.quote_computed "
@@ -923,8 +694,7 @@ def link_by_quote_id(
         "not a forwarded answer of its stream": 0,
         "stored quote not reproduced": 0,
     }
-    # Orders the id cannot place but a re-quote might have priced, with the reason that
-    # stands if none did.
+    # With the reason that stands if no re-quote places them.
     requote_candidates: list[tuple[RecordedQuote, str]] = [
         (o, "no quote id") for o in orders if not o.quote_id
     ]
@@ -1025,9 +795,7 @@ def _stream_take(
     forwarded: tuple[str, ...],
     arrived_at: Mapping[tuple[str, str], str],
 ) -> StreamTake:
-    """Where in its stream an order's answer sits, and how far the stream can have got
-    before the user committed: up to the next forwarded answer, which they did not take,
-    or — when theirs was the last one forwarded — up to the order's creation."""
+    """The horizon runs to the next forwarded answer, or for the last one to creation."""
     order_of = [e.estimator for e in request.estimates]
     position = order_of.index(taken)
     later = [order_of.index(f) for f in forwarded if f in order_of]
@@ -1050,14 +818,10 @@ def _stream_take(
 
 
 REQUOTE_AFTER_CREATION_SECONDS = (-60, 600)
-"""Where the re-quote of an ethflow order lands relative to the order's creation (its
-block time, whole seconds): 1–3 s after it on every case seen, bounded generously."""
+"""Where an ethflow re-quote lands relative to order creation (block time), generously."""
 REQUOTE_SIBLING_SECONDS = 5
 REQUOTE_ID_SPAN = 64
-"""A re-quote's estimates arrive within a second and carry quote ids from one block the
-orderbook drew before quoting (1608345417–437 for one 11-estimate mainnet competition), so
-siblings are request-less estimates of the same request key within both bounds of the
-estimate that priced the order."""
+"""A re-quote's siblings lie within both bounds (seconds, quote ids) of its winner."""
 
 REQUOTE_COLUMNS = (
     "quote_id, estimator, solver, lower(sell_token) as sell_, lower(buy_token) as buy_, "
@@ -1073,21 +837,9 @@ def _link_requotes(
     *,
     chunk: int = 300,
 ) -> tuple[list[MatchedQuote], dict[str, dict[str, int]]]:
-    """Link orders to the competition the backend ran itself when it indexed them.
-
-    An ethflow order is placed on chain with the UI quote's id (or `0`), and the backend,
-    indexing it, re-quotes when that quote cannot be used: a full competition run
-    internally, so with **no `request_id`** — invisible to
-    `link_by_quote_id`'s request join — and stored on the order while `quote_id` keeps
-    naming the UI's quote. Every ethflow order the id join missed in 2026-10-05..12 (25 on
-    four chains) had one, its winner reproducing the stored amount to the atom 1–3 s after
-    the order's block time.
-
-    So the estimate that priced the order is found by its exact amount among request-less
-    estimates of the order's request key, must be the recorded winner (the winner event
-    carries the winning estimate's quote id), and its competition is the request-less
-    estimates around it (`REQUOTE_SIBLING_SECONDS`, `REQUOTE_ID_SPAN`). Returns the
-    matches and the settlement addresses seen, for the estimator map.
+    """Link ethflow orders to the request-less competition the backend ran when indexing
+    them, found by the stored amount; also returns the settlement addresses seen
+    ([docs](../docs/quotes.md#an-ethflow-orders-stored-quote-can-come-from-the-backends-own-re-quote)).
     """
     from datetime import date, datetime, timedelta
 
@@ -1203,24 +955,9 @@ def price_suspect_orders(
     auction_prices: Mapping[str, float],
     traded_prices: Mapping[str, float] | None = None,
 ) -> frozenset[str]:
-    """The **one-sided** check: orders whose two native price feeds for the sell token
-    disagree past `PRICE_IMBALANCE_THRESHOLD`.
-
-    The auction side is the order's own: `traded_prices[order_uid]`, the sell token's
-    price in the auctions the order traded in (`traded_sell_prices`), where it has one,
-    and the window's median `auction_prices[sell_token]` only for an order that never
-    traded. A median is wrong for a token that moved during the window: on bnb
-    2026-10-05..12 it excluded 238 orders of 0xfb4f81f5… and the like whose api price
-    matches the per-auction one at 1.00x — the volatile token's price had tripled.
-    Untraded orders weigh nothing in the bps figures, so the median only decides whether
-    they count towards `no_quote` and the pick validation.
-
-    Both feeds are scaled by 1e18 (`primitives.price_in_eth` divides by it), so the
-    comparison divides them back down. A token never priced cannot be tested and is left
-    alone — the guard excludes what it can prove wrong, never what it cannot check, which
-    is D14's rule. Blind to a token both feeds price wrong by the same factor, which is
-    what `imbalanced_orders` is for.
-    """
+    """Orders whose api and auction prices for the sell token disagree past the threshold.
+    The auction price is where the order traded (a window median fails tokens that
+    moved); the median serves only untraded orders. Unpriced tokens are left alone."""
     traded = traded_prices or {}
     suspect: set[str] = set()
     for order in orders:
@@ -1244,12 +981,8 @@ class OrderTrade:
     buy_amount: int
 
 
-# A trade belongs to the first settlement after it in its block: the `Trade` events of a
-# settlement precede its `Settlement` event, which is the only one carrying the auction
-# id. That is the rule `int_backend_data__trade_with_tx_hash` applies; it is applied here
-# directly so the result does not depend on the run windows of that incremental model.
-# The lateral probe rides the `(block_number, log_index)` index on settlements: 0.4-0.7 s
-# for a bnb week.
+# A trade belongs to the first settlement after it in its block, whose `Settlement` event
+# carries the auction id (the `int_backend_data__trade_with_tx_hash` rule).
 ORDER_TRADES_SQL = """
 with window_trades as (
     select t.order_uid, t.block_number, t.log_index, t.sell_amount, t.buy_amount
@@ -1269,8 +1002,6 @@ cross join lateral (
 ) s
 """
 
-# Native prices of exactly the (auction, token) pairs the trades need, through the same
-# `{auction_prices}` relation the solve side reads (`extract.fetch_prices`).
 TRADE_PRICES_SQL = """
 select ap.auction_id, encode(ap.token, 'hex') as token, ap.price
 from {auction_prices} ap
@@ -1280,9 +1011,8 @@ join unnest(%(pair_auctions)s::bigint[], %(pair_tokens)s::bytea[]) as w (auction
 
 
 def load_order_trades(conn: Connection, start: str, end: str) -> list[OrderTrade]:
-    """Every trade of the orders created in `[start, end)`, each with its auction —
-    including trades after `end`, which `executed_sell` counts too. A trade whose
-    settlement is not recorded yet has no auction and is left out: it cannot be priced."""
+    """Every trade, with its auction, of orders created in `[start, end)` — including
+    trades after `end`. Trades with an unrecorded settlement are left out."""
     return [
         OrderTrade(
             order_uid=row["order_uid"],
@@ -1295,8 +1025,7 @@ def load_order_trades(conn: Connection, start: str, end: str) -> list[OrderTrade
 
 
 def _priced_token(token: str, weth: str) -> str:
-    """The token whose price an auction lists for `token`: the native sentinel is priced
-    as its wrapped ERC20, as the solve side prices it (`primitives.as_erc20`)."""
+    """The native sentinel is priced as its wrapped ERC20."""
     return as_erc20(token, weth)
 
 
@@ -1350,18 +1079,9 @@ def imbalanced_orders(
     *,
     weth: str,
 ) -> frozenset[str]:
-    """The **two-sided** check: orders whose executed sell value and executed buy value
-    disagree past `PRICE_IMBALANCE_THRESHOLD`, each trade valued at the native prices of
-    the auction it settled in — `counterfactual.price_imbalanced`, per order rather than
-    per solution.
-
-    Per auction and not at window medians, because a median two-sided check excludes a
-    volatile token's honest trades: USDT→0xfb4f81f5… failed at bnb's week medians on 225
-    orders whose per-auction values match the trade-implied rate at 1.00x. A trade
-    missing either price is skipped, and an order with nothing checkable is left alone,
-    as the solve side leaves a solution — D14's rule. Blind, like that check, to a pair
-    whose two tokens are both mispriced by the same factor.
-    """
+    """Orders whose executed sell and buy values disagree past the threshold, each trade
+    at its own auction's prices (`counterfactual.price_imbalanced`, per order). Blind to
+    a pair mispriced by the same factor."""
     tokens = {
         o.order_uid: (_priced_token(o.sell_token, weth), _priced_token(o.buy_token, weth))
         for o in orders
@@ -1397,9 +1117,7 @@ def traded_sell_prices(
     *,
     weth: str,
 ) -> dict[str, float]:
-    """`order_uid -> the sell token's auction price where the order traded`, weighted by
-    each trade's sell amount and scaled by 1e18 like the feed — the one-sided check's
-    reference for every order that traded (`price_suspect_orders`)."""
+    """`order_uid ->` sell-amount-weighted sell-token auction price, 1e18-scaled."""
     sell_token = {o.order_uid: _priced_token(o.sell_token, weth) for o in orders}
     sums: dict[str, list[int]] = {}
     for trade in trades:
@@ -1440,14 +1158,8 @@ Leaf = Literal[
 ]
 
 IMPLAUSIBLE_QUOTE_FACTOR = PRICE_IMBALANCE_THRESHOLD
-"""A replacement quote more than this factor away from the recorded quote's rate — in
-either direction — is a broken estimate, not a price change. The ladder holds such
-estimates: an estimator that mis-scaled a token's decimals answers a buy request with a
-cost of a few atoms, and once the winner is removed that answer *wins*, because the
-pick maximises. Read as a price change it is millions of basis points of improvement;
-charged against as a fee reference it is nonsense of the same size. The same 2x that
-D14 uses to call a native price broken is used here, so the two guards say "broken" at
-the same point."""
+"""A replacement this far off the recorded rate, either way, is a broken estimate (e.g.
+mis-scaled decimals) promoted to winner, not a price change."""
 
 
 @dataclass(frozen=True)
@@ -1461,32 +1173,18 @@ class QuoteDiff:
     replacement: str | None
     effective_base: float
     effective_loo: float
-    """The recorded and the counterfactual effective quote, on the request's *out*
-    side: buy atoms the user receives on a sell order, sell atoms the user pays on a
-    buy one. Both are stored as they are — `delta_bps` orients the comparison."""
+    """Effective quotes on the out side, unoriented; `delta_bps` orients them."""
     volume_native: int
     partially_fillable: bool
     quote_loo: Quote | None
-    """The counterfactual quote the fee path should charge against, or `None` where
-    there is nothing to charge — an unaffected order keeps its recorded quote and an
-    order that would never exist has no fee at all."""
+    """For the fee path; `None` when unaffected or when no order would exist."""
     streamed: bool = False
     commit_dependent: bool = False
-    """The order was placed from a streamed quote, and whether its replacement would
-    differ had the user committed the moment their answer was forwarded rather than at
-    the latest moment the record allows (`stream_replacement`)."""
 
     @property
     def delta_bps(self) -> float:
-        """How much worse the quote is, as the change in the **rate** the user was shown
-        — out per in — in basis points. Negative is worse for the user under both order
-        kinds, and the measure is the same one for both: a sell order's rate is the
-        effective buy amount over the fixed sell amount, a buy order's the fixed buy
-        amount over the effective cost, so its ratio is `base / loo`. A rate can fall by
-        at most 100%, so one order's weighted contribution is bounded by its own volume;
-        the cost-increase reading (`loo / base − 1`) is not, and a replacement quote
-        thirty times the recorded cost — the ladder holds such estimates — would then
-        carry thirty times its volume into the window figure."""
+        """Change in the shown rate (out per in), bps; negative is worse. A rate, not a
+        cost ratio, so one order's contribution is bounded by its volume."""
         if (
             not self.effective_base
             or not self.effective_loo
@@ -1502,8 +1200,6 @@ class QuoteDiff:
 
     @property
     def delta_volume_native(self) -> float:
-        """The bps change carried on this order's volume — the numerator of the
-        window-level figure, so that one sum over orders gives it."""
         return self.delta_bps / 10_000 * self.volume_native
 
 
@@ -1515,30 +1211,9 @@ def diff_quote(
     buy_token_prices: Mapping[str, float] | None = None,
     price_suspects: frozenset[str] = frozenset(),
 ) -> QuoteDiff:
-    """Re-run one request's pick without `removed_estimators` and diff the quotes.
-
-    The **recorded** quote is the baseline, always — never the ladder's winner, even
-    where the two agree to the atom (Q-D5). The ladder decides only who replaces it.
-
-    Three leaves exist to keep a ratio from being formed where it means nothing, and
-    all are reached only *after* the removal is known to have moved this quote — a
-    guard leaf is an excluded win, never a win the removed solver did not have.
-    `implausible` is a replacement quote more than `IMPLAUSIBLE_QUOTE_FACTOR` off the
-    recorded quote's rate in either direction: a broken estimate promoted to winner.
-    `price_suspect` is an order whose two native price feeds disagree past
-    `PRICE_IMBALANCE_THRESHOLD`: the same price sets its weight and its gas cost, so
-    neither its bps nor its fee can be trusted. `nonpositive` is an order where the gas
-    cost swallows the input on one side of the comparison — the protocol clamps such an
-    estimate to zero value (`effective_eth_out`, quote.rs:285) and a ratio against it is
-    not a price change; the replacement quote is withheld from the fee path too, since
-    the same arithmetic is what `fees._adjust_quote_to_order_limits` would refuse.
-
-    An order placed from a streamed quote (`match.stream`) is decided by the answer it
-    took rather than the recorded winner, and its replacement is what the stream would
-    have shown by the user's commit (`stream_replacement`). A replacement the record
-    cannot tell — the stream was dropped before the answer the user would have waited
-    for — is the `unrecorded` leaf.
-    """
+    """Re-pick one request without `removed_estimators` and diff against the **recorded**
+    quote, never the ladder's winner. Guard leaves are reached only after the removal is
+    known to have moved the quote, so each is an excluded win."""
     order, request, take = match.order, match.request, match.stream
     pricing = order.pricing
     if ranking == "autopilot" and order.is_sell:
@@ -1546,9 +1221,6 @@ def diff_quote(
         pricing = Pricing(pricing.gas_price, pricing.sell_token_price, price)
 
     base_effective = _recorded_effective(order)
-    # The template every other leaf is a `replace` of, so the fields a leaf does not
-    # change are stated once.
-    # Who priced the order: the recorded winner, or the streamed answer it took.
     taken = take.taken if take else request.winner
     unaffected = QuoteDiff(
         order_uid=order.order_uid,
@@ -1564,11 +1236,7 @@ def diff_quote(
         streamed=take is not None,
     )
     if taken and taken not in removed_estimators:
-        # Removing a loser cannot move the winner, and cannot change the winner's
-        # verified class either: the class is a property of the estimates that remain,
-        # and the winner is in the preferred one by definition. On a stream the same
-        # holds for the answer taken: nothing that arrived after it before the commit
-        # beat it, and a removal only takes candidates away.
+        # Removing a loser moves neither the winner nor its verified class.
         return unaffected
     if not any(e.estimator in removed_estimators for e in request.reasonable):
         return unaffected
@@ -1632,11 +1300,7 @@ def diff_quote(
 
 
 def _recorded_effective(order: RecordedQuote) -> float:
-    """The recorded quote's effective amount, from Postgres alone.
-
-    `Quote.fee` is already the gas cost in sell atoms, so this is the same netting as
-    `effective_sell_amount` with the recorded numbers in place of a ladder row.
-    """
+    """`effective_sell_amount` of the recorded quote; `Quote.fee` is gas in sell atoms."""
     if order.is_sell:
         sell = order.quote.sell_amount
         if sell <= 0:
@@ -1650,32 +1314,20 @@ def _recorded_effective(order: RecordedQuote) -> float:
 
 @dataclass(frozen=True)
 class ShiftedLimit:
-    """What a replacement quote does to the order's limit price, against the recorded
-    execution — the one channel besides the fee through which a quote reaches the solve
-    side, and the reason it can be held fixed there (PLAN.md D32, D34).
-
-    A user signs a limit derived from the quote they were shown, so a different quote
-    means a different limit: the same *wedge* — the user's slippage tolerance, revealed
-    as the ratio of the signed limit rate to the recorded effective quote rate — applied
-    to the replacement quote's rate instead. That is the whole model, and it is the
-    only assumption here.
+    """The user's limit wedge (signed limit rate over shown quote rate) applied to a
+    replacement quote, tested against the recorded execution, which the solve side holds
+    fixed ([docs](../docs/quotes.md#what-is-held-fixed-what-is-recomputed-and-why-the-user-effect-is-not-a-surplus)).
     """
 
     clears: bool
-    """Would the recorded execution still have satisfied the shifted limit? True by
-    construction whenever the replacement quote is worse — a weaker limit is a weaker
-    constraint — so this can only be false on a class flip, where the nominal amount
-    may rise and the limit tighten."""
+    """Only a class flip can make this false."""
     surplus_shift_atoms: int
-    """Change in the surplus the mechanism would have *measured* on this execution, in
-    the surplus token (buy for a sell order, sell for a buy one): positive when the
-    limit weakens. Not a user gain — the user's tokens are unchanged, only their
-    reservation moved — which is why it is used to test the ranking (D34) and never
-    reported as Δsurplus."""
+    """Measured-surplus change in surplus-token atoms, positive when the limit weakens.
+    A ranking test, not a user gain: never reported as Δsurplus."""
 
 
 def _effective_rate(quote: Quote, is_sell: bool) -> Fraction:
-    """Buy atoms per sell atom of the effective quote — what the user was shown."""
+    """Buy atoms per sell atom of the effective quote."""
     if is_sell:
         if quote.sell_amount <= 0:
             return Fraction(0)
@@ -1685,11 +1337,7 @@ def _effective_rate(quote: Quote, is_sell: bool) -> Fraction:
 
 
 def shifted_limit(order: Order, recorded: Quote, replacement: Quote) -> ShiftedLimit | None:
-    """The order's limit under `replacement`, tested against what it actually executed.
-
-    `None` when there is nothing to test: the order did not execute on this side, or
-    one of the quotes has no positive effective rate to form a wedge from.
-    """
+    """`None` when the order did not execute or a quote has no positive rate."""
     is_sell = order.side == "sell"
     rate_recorded = _effective_rate(recorded, is_sell)
     rate_replacement = _effective_rate(replacement, is_sell)
@@ -1726,35 +1374,17 @@ def shifted_limit(order: Order, recorded: Quote, replacement: Quote) -> ShiftedL
 
 @dataclass
 class QuoteAnalysis:
-    """The quote side of one removal scenario over one window.
-
-    Three figures lead, one per question the analysis exists to answer: how much worse
-    the quotes would be, how often there would be no quote at all, and what the fee
-    consequence is. The fee consequence is deliberately *not* a field here — it flows
-    into the existing protocol-fee delta through the counterfactual quotes this class
-    hands out, so the report carries one fee number rather than two that have to be
-    reconciled.
-
-    **Class flips are outside the bps figures.** Removing the only *verified* estimator
-    leaves a quote that may read better in bps while being worse in kind. One such flip
-    supplied the whole conditional figure of a one-day test (+70 bps on 5 ETH against 81
-    genuinely degraded orders), which is what a count is for and a basis-point average
-    is not.
-    """
+    """The quote side of one removal scenario over one window. The fee effect flows
+    through `counterfactual_quotes` into the protocol-fee delta. Class flips are counted
+    but kept out of the bps figures: better in bps, worse in kind."""
 
     solver: str
     ranking: QuoteRanking
     window_orders: int = 0
-    """Orders created in the window that carry a recorded quote — the denominator of
-    `no_quote_share`, over the whole window rather than the matched part of it: an
-    unmatched order contributes zero to every numerator, exactly as an unmoved one
-    does (D23's rule). `matched` is what says how much of the window was measured."""
+    """Whole window, not just matched orders: an unmatched order adds zero, like an
+    unmoved one."""
     window_volume_native: int = 0
-    """The window's **executed** quoted volume: the denominator of `window_bps`. See
-    `RecordedQuote.volume_native` for why executed rather than quoted."""
     window_quoted_volume_native: int = 0
-    """What was quoted, executed or not — reported beside the denominator so the gap is
-    visible rather than implied."""
     matched: int = 0
     quote_wins: int = 0
     no_quote: int = 0
@@ -1765,26 +1395,11 @@ class QuoteAnalysis:
     price_suspect: int = 0
     implausible: int = 0
     unrecorded: int = 0
-    """Wins on a stream the client dropped before the answer its user would have waited
-    for arrived — cancelled, so never recorded (`stream_replacement`)."""
+    """Guard leaves: wins excluded from every figure, so subsets of `quote_wins`."""
     stream_wins: int = 0
     commit_dependent: int = 0
-    """Wins on orders placed from a streamed quote, and how many of those would have a
-    different replacement had the user committed the moment their answer was forwarded
-    rather than at the latest moment the record allows — the one assumption the stream
-    rule makes, counted."""
-    """Wins — orders whose quote the removed solver did win — excluded from every figure
-    because the gas cost swallowed the input, because the order's two native price feeds
-    disagree (`PRICE_IMBALANCE_THRESHOLD`), or because the replacement quote is more than
-    `IMPLAUSIBLE_QUOTE_FACTOR` off the recorded one (a broken estimate promoted to
-    winner). None of these leaves is reached for an order the removed solver merely
-    lost, so they are subsets of `quote_wins`; the implausible volume is kept so the
-    excluded slice can be sized."""
     delta_volume_native: float = 0.0
-    """Σ (Δbps / 10,000 x order volume) over degraded orders — the numerator of
-    `window_bps`, so the window figure is one division."""
     degraded_volume_native: int = 0
-    """Volume of the orders that degraded, the denominator of the conditional figure."""
     diffs: list[QuoteDiff] = field(default_factory=list[QuoteDiff])
 
     def add(self, diff: QuoteDiff) -> None:
@@ -1822,38 +1437,28 @@ class QuoteAnalysis:
 
     @property
     def window_bps(self) -> float | None:
-        """The headline: Δ effective quote spread over the window's whole quoted
-        volume, the quote-side analogue of D23. `None` when the window quoted nothing.
-        """
+        """Δ effective quote rate, bps, over the window's whole executed volume."""
         if not self.window_volume_native:
             return None
         return self.delta_volume_native / self.window_volume_native * 10_000
 
     @property
     def conditional_bps(self) -> float | None:
-        """The same movement over the volume of the orders that actually moved — the
-        conditional reading, labelled beside the window one and never instead of it."""
+        """Over the volume of the orders that moved; shown beside `window_bps`, never
+        instead."""
         if not self.degraded_volume_native:
             return None
         return self.delta_volume_native / self.degraded_volume_native * 10_000
 
     @property
     def no_quote_share(self) -> float | None:
-        """Orders that would not have been created, over every order the window
-        created."""
         if not self.window_orders:
             return None
         return self.no_quote / self.window_orders
 
     @property
     def counterfactual_quotes(self) -> dict[str, Quote]:
-        """`order_uid -> quote` for the fee path: the counterfactual quote of every
-        order whose quote moved.
-
-        Class flips are included: the fee is charged against whatever quote the order
-        would have carried, and an unverified replacement still priced the order. Only
-        the *bps* figures leave them out, where a signed average would mislead.
-        """
+        """`order_uid -> quote` for the fee path; class flips included."""
         return {
             d.order_uid: d.quote_loo
             for d in self.diffs
@@ -1866,52 +1471,32 @@ class QuoteAnalysis:
 
 @dataclass
 class PickValidation:
-    """Does our pick return the estimator the competition recorded?
-
-    The quote-side equivalent of M1's gate. It runs on matched orders because the
-    ranking needs the order's `gas_price` and `sell_token_price`, and it is reported as
-    a rate with its exceptions named rather than asserted: a window where the rate drops
-    means the rule changed, and every quote number downstream is then suspect.
-    """
+    """Does our pick return the recorded winner? A falling rate means the rule changed."""
 
     ranking: QuoteRanking
     requests: int = 0
     with_recorded_winner: int = 0
-    """Requests whose recorded winner survives `is_reasonable` — the only ones there is
-    anything to reproduce on."""
     reproduced: int = 0
     mixed_class: int = 0
     mixed_class_correct: int = 0
-    """Requests carrying both verified and unverified estimates, and how many of those
-    the verified-first rule got right. The rule is only *tested* by these."""
+    """Requests with both verified classes: the only test of the verified-first rule."""
     unpriced: int = 0
     tied: int = 0
-    """Requests where another estimate shares the recorded winner's key to the last float
-    bit, so arrival order decided rather than the rule: prod sorts the answers stably in
-    completion order (`quote.rs:80`), and the ladder is loaded in that order
-    (`nats_seq`). Every sell estimate under water ties at zero (`rank_key`), so dust requests are ties
-    too."""
+    """Another estimate shares the winner's key, so arrival order decided."""
     tie_mismatches: int = 0
-    """Ties our arrival order resolved to another estimator — the rule picked an
-    equivalent estimate, so these are not counted as disagreements; on the gold layer two
-    answers in the same millisecond are the expected cause."""
+    """Ties resolved to an equivalent estimator; not disagreements."""
     price_suspect: int = 0
-    """Matched orders left out because their recorded `sell_token_price` failed the
-    cross-check: the gas weight the ranking needs is the very number that is wrong."""
     disagreements: list[tuple[str, str, str]] = field(
         default_factory=list[tuple[str, str, str]]
     )
-    """`(request_id, recorded, ours)` for the first few, so a failure can be opened."""
+    """`(request_id, recorded, ours)`, first few."""
     streams: int = 0
     streams_reproduced: int = 0
-    """Streamed competitions with two or more forwarded answers, and how many of them
-    `replay_stream` reproduces exactly — the same answers forwarded, in the same order,
-    as their `quote_computed` rows record. The stream rule rests on this as the pick
-    rests on `rate`."""
+    """Streams with two or more forwarded answers that `replay_stream` reproduces."""
     stream_disagreements: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = field(
         default_factory=list[tuple[str, tuple[str, ...], tuple[str, ...]]]
     )
-    """`(request_id, recorded, replayed)` for the first few."""
+    """`(request_id, recorded, replayed)`, first few."""
 
     @property
     def rate(self) -> float | None:
@@ -1928,8 +1513,7 @@ def validate_picks(
     price_suspects: frozenset[str] = frozenset(),
     keep_disagreements: int = 20,
 ) -> PickValidation:
-    """Re-pick every matched request and compare against the recorded winner, and replay
-    every streamed competition against the answers it recorded forwarding."""
+    """Re-pick every match against its recorded winner; replay every stream."""
     result = PickValidation(ranking=ranking)
     replayed: set[str] = set()
     for match in matches:
@@ -2023,11 +1607,7 @@ def validate_picks(
 
 @dataclass
 class QuoteWindow:
-    """The quote side of one window, loaded once for every removal scenario.
-
-    Loading is the whole cost here as it is on the solve side: the ClickHouse ladder and
-    the link are scenario-independent, so N solvers cost one load.
-    """
+    """The quote side of one window, loaded once for every removal scenario."""
 
     network: str
     start: str
@@ -2036,24 +1616,18 @@ class QuoteWindow:
     orders: list[RecordedQuote]
     matches: list[MatchedQuote]
     estimator_map: dict[str, str]
-    """`estimator -> solver address` on this chain, read from the linked estimates."""
     buy_token_prices: dict[str, float]
     validation: PickValidation
     link: LinkStats
-    """How the quote-id link fared on the window's non-trivial orders."""
     price_suspects: frozenset[str] = frozenset()
-    """Orders failing either price check (`PRICE_IMBALANCE_THRESHOLD`). Out of every
-    quote figure, on both sides of every ratio, and counted."""
+    """Orders failing either price check; out of every quote figure."""
     one_sided_suspects: int = 0
     two_sided_suspects: int = 0
-    """How many orders each check flagged. An order can fail both, so the two can sum
-    past `price_suspects`."""
+    """An order can fail both checks."""
     orders_dropped: int = 0
 
     @property
     def trivial_orders(self) -> int:
-        """Orders no competition priced (`RecordedQuote.trivial`): in the window's
-        population, not linked."""
         return sum(1 for o in self.orders if o.trivial)
 
     @property
@@ -2070,19 +1644,13 @@ class QuoteWindow:
 
     @property
     def suspect_volume_native(self) -> int:
-        """Executed volume, at the api's price, that the price checks took out of the
-        denominator — the size of what they caught."""
         return sum(
             o.volume_native for o in self.orders if o.order_uid in self.price_suspects
         )
 
     def coverage_by_app(self) -> list[tuple[str, int, int]]:
-        """`(app_code, orders, matched)`, busiest first.
-
-        The only honest unit for coverage: on 2026-07-25 mainnet it ran from 99.3% for
-        CoW Swap and 100% for the aggregator integrations down to 1.8% for Trust Wallet
-        and 0% for `defibot`, so a single window-level rate describes nobody.
-        """
+        """`(app_code, orders, matched)`, busiest first: coverage varies too much by app
+        for one rate."""
         matched = {m.order.order_uid for m in self.matches}
         totals: dict[str, list[int]] = {}
         for order in self.orders:
@@ -2095,11 +1663,7 @@ class QuoteWindow:
         )
 
     def estimators_of(self, addresses: frozenset[str]) -> frozenset[str]:
-        """The estimator names belonging to a removal scenario's solver addresses.
-
-        Empty means the scenario never won a quote we could attribute, which is a
-        finding (a solve-only solver), not an error.
-        """
+        """Empty means a solve-only solver, not an error."""
         return frozenset(
             estimator
             for estimator, address in self.estimator_map.items()
@@ -2107,7 +1671,6 @@ class QuoteWindow:
         )
 
     def analyse(self, solver: str, addresses: frozenset[str]) -> QuoteAnalysis:
-        """Diff every matched order for one removal scenario."""
         analysis = QuoteAnalysis(
             solver=solver,
             ranking=self.ranking,
@@ -2142,16 +1705,9 @@ def load_quote_window(
     auction_ids: Sequence[int] = (),
     log: Callable[[str], None] | None = None,
 ) -> QuoteWindow:
-    """Load the quote competition for `[start, end)` on one network.
-
-    Orders are linked to their competitions by quote id (`link_by_quote_id`), trivial
-    unwraps not at all. Both price checks then run over every order, and the pick is
-    validated on what was linked.
-
-    Raises `NoQuoteDataError` for a network with no quote data: reporting empty quote
-    columns would read as "this solver quoted nothing" rather than "there is no quote
-    data here" (Q-D10).
-    """
+    """Load the quote competition for `[start, end)` on one network. Raises
+    `ch.NoQuoteDataError` where there is no quote data: empty columns would read as "no
+    value" rather than "no data"."""
     emit: Callable[[str], None] = log or (lambda message: None)
     ch.chain_id(network)  # refuse an unsupported network before any query runs
 
@@ -2166,16 +1722,13 @@ def load_quote_window(
     matches = id_link.matches
     estimator_map = id_link.estimator_map
 
-    # Both checks run on every ranking: they are data guards, not ranking inputs. The
-    # one-sided check needs the window's median per sell token, and the autopilot rule
-    # the buy tokens' too; the two-sided one prices each trade in its own auction.
+    # Data guards, not ranking inputs: they run under every ranking.
     guard_tokens = sorted({o.sell_token for o in orders})
     wanted = guard_tokens + (
         sorted({m.order.buy_token for m in matches}) if ranking == "autopilot" else []
     )
     auction_prices = load_token_prices(conn, auction_ids, wanted)
-    # The auction feed is scaled by 1e18; `Pricing` holds wei per atom, as the api's
-    # `sell_token_price` does.
+    # The auction feed is 1e18-scaled; `Pricing` is wei per atom.
     buy_token_prices = (
         {token: price / ONE_ETH for token, price in auction_prices.items()}
         if ranking == "autopilot"

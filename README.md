@@ -1,461 +1,266 @@
 # Leave-one-out solver analysis
 
-Counterfactual analysis of the CoW Protocol solver competition: remove one solver —
-or several at once — from past auctions, re-run winner selection, and measure the
-impact on user surplus, protocol fee revenue, solver rewards and order coverage.
+Counterfactual analysis of the CoW Protocol solver competition: remove one solver — or
+several at once — from past auctions, re-run winner selection, and measure the impact on
+user surplus, protocol fee revenue, solver rewards, order coverage and, optionally, the
+quote competition.
+
+`loo` replays only the mechanism live since **2026-10-28**; an earlier window exits 4
+([why](docs/winner-selection.md#loo-replays-the-current-mechanism-only)). Windows are
+dates, `--start` inclusive and `--end` exclusive.
 
 ## Setup
 
-`uv` handles the environment; there is nothing to install by hand.
-
-Put the analytics DB credentials in `.env` (gitignored):
+`uv` handles the environment. Put credentials in `.env` (gitignored):
 
 ```
-ANALYTICS_DB_URL=user:password@host:port
+ANALYTICS_DB_URL=user:password@host:port      # no scheme, no database name
+CLICKHOUSE_URL=…                              # only for --quotes
+CLICKHOUSE_USER=…
+CLICKHOUSE_PASSWORD=…
 ```
 
-No scheme and no database name — the database is derived from `--network`.
+The database is derived from `--network` (default `mainnet`). Details and traps:
+[docs/analytics-db.md](docs/analytics-db.md).
 
-## The full flow
-
-Windows are date ranges, `--start` inclusive, `--end` exclusive; the three-day window
-below is ~7,700 mainnet auctions and each `analyse` run over it takes about five
-minutes.
-
-**Signs:** every delta is **counterfactual − actual** (without-solver minus
-with-solver), so the numbers read directly as what the removal scenario changes:
-negative Δsurplus means users would have received less, negative Δprotocol fee means the
-protocol would have collected less, and positive Δrewards means it would have paid
-more. The tables state this convention with the numbers.
-
-**1. The counterfactual**, one invocation. `--solver` and `--outcome-rule` are both
-repeatable and everything shares one extraction pass — extraction is nearly all of the
-run time, so analysing five solvers under both rules costs barely more than one solver
-under one. Only `inherited` is required; `assume-settled` is the optional
-everything-lands-in-time scenario (what the rules mean: [below](#the-outcome-rule)):
+## The flow
 
 ```bash
-uv run loo analyse --solver Fractal --solver Sector \
-    --start 2026-08-01 --end 2026-08-04 \
+# 1. the counterfactual — one extraction pass shared by every scenario and rule
+caffeinate -i uv run loo analyse --solver Fractal --solver Sector \
+    --start 2026-11-17 --end 2026-11-20 \
     --outcome-rule inherited --outcome-rule assume-settled \
     --out "out/{solver}-{rule}.json"
-```
 
-The `{solver}` placeholder in `--out` becomes each solver's slug and `{rule}` the
-outcome rule; each is required when several of its values are given.
-
-A comma-separated `--solver` removes those solvers **together**:
-`--solver "Fractal,Sector"` is one counterfactual with both absent at once, not two
-runs. The deltas describe the joint scenario and are deliberately not attributed to
-individual members — and the single removals do not sum to the joint one, because
-removed solvers stop replacing each other. Mixing forms compares the two directly:
-`--solver Fractal --solver "Fractal,Sector"`.
-
-**2. The comparison table** — seconds, it only reads the JSONs (plus one DB query for
-the USD columns):
-
-```bash
+# 2. the comparison table — seconds, reads the JSONs (plus one DB query for USD)
 uv run loo compare out/*.json
-```
 
-Add `--markdown --out out/comparison.md` for a GitHub table, or `--skip-usd` to run
-without a DB connection.
-
-**3. The notebook** — the same aggregation plus the concentration curve, per-auction
-distributions and the rule-sensitivity chart, from the same `out/*.json`:
-
-```bash
+# 3. the notebook — concentration curve, per-auction distributions, rule sensitivity
 uv run --extra notebook jupyter lab notebooks/analysis.ipynb
 ```
 
-The measured result of exactly this flow is [PLAN.md §7.1](PLAN.md#71-m4-result).
-First time on a new window, network or code change? Run the
-[validation gates](#validating-the-implementation) first — the counterfactual is only
-as good as its reproduction of the recorded competition.
+On a new network, a new kind of window or after a code change, run the
+[validation gates](#validate-and-validate-rewards) first: the counterfactual is only as
+good as its reproduction of the recorded competition.
 
-## The commands
+## Commands
 
 ### analyse
 
-```bash
-uv run loo analyse --solver Sector --start 2026-08-01 --end 2026-08-04
-```
-
-Removes one or more solvers from every auction in the window, re-runs winner selection,
-and reports what users would have gained or lost. `--solver` takes a name or a
-submission address, matched exactly — `Arc` and `Arctic` are different solvers and both
-compete — or a comma-separated list of them, which is removed **jointly** as one
-counterfactual (all absent at once, nothing attributed to individual members). It may
-be repeated; the scenarios share one extraction pass and each gets its own report. If
-a group member ends up bidding in none of the analysed auctions the run errors rather
-than passing a smaller group's numbers off under the full label.
-
-**`--all-solvers`** removes every solver that bid in the window, one at a time, without
-naming any of them:
-
-```bash
-uv run loo analyse --all-solvers --start 2026-07-01 --end 2026-08-01 --out "reports/{solver}.json"
-```
-
-The list comes from the window, not the catalogue: one scenario per catalogue name — with
-that name's rotated addresses removed together, as `--solver` would — and one per
-uncatalogued address, named by the address. It is mutually exclusive with `--solver` and
-needs the `{solver}` placeholder in `--out`.
-
-One semantic differs from `--solver`, deliberately. A named solver that ends up bidding in
-no analysed auction is an error, because its all-zero deltas would read as "removing this
-solver costs nothing". Under `--all-solvers` nobody named it — the price-suspect exclusion
-or `--limit` simply took it out — so it is reported and skipped, and the run still exits 0.
-
-**`--quotes`** removes the solver from the **quote** competition as well:
-
-```bash
-uv run loo analyse --all-solvers --start 2026-07-22 --end 2026-08-01 --quotes --out "reports/{solver}.json"
-```
-
-The quote competition prices orders into existence, so removing a solver from it changes
-the price the user was shown and the baseline every price-improvement fee is charged
-against. The run then reports two more figures — how much worse the quotes would have
-been, in basis points over the executed volume of the window's quoted orders, and how many
-orders would not have been quoted at all — and **recharges the price-improvement fee** of
-the affected orders against the replacement quote in every auction that executed them,
-whether or not the solver bid there. That recharge is its own quote-side figure and is
-**not** added to the protocol-fee delta, which is computed with the recorded quotes on
-both sides: a worse quote raises the fee baseline mechanically, and folding it in read as
-the protocol gaining from losing a good quoter. Everything the solvers did — bids,
-executions, ranking — stays as recorded; two per-auction checks (would the execution still
-clear the limit the replacement quote implies; would the winner set move if every score
-carried the limit change) are counted and reported so that assumption is tested rather than
-held.
-
-It needs the `CLICKHOUSE_*` credentials and a network with quote data — mainnet and bnb
-base, arbitrum-one, xdai, polygon, avalanche, ink, plasma and linea. An order is linked
-to its competition **by quote id**, and only where the linked estimate reproduces the
-stored amount to the atom. Unwraps (quote solver `0x0`) had no competition and are not
-linked. Orders
-whose prices fail a check — the api's against the auction's, or sold against bought value,
-both at the prices of the auctions the order traded in — leave every quote figure.
-`--quote-ranking` chooses how the pick is re-run: `effective-sell` (default) nets the gas
-cost in the sell token at the order's own recorded prices, truncated as prod truncates —
-the protocol's own rule since services#4846, reproducing the recorded winner on ≥ 99.8% of
-requests on every chain; `autopilot` is the out-token rule from before it and needs the buy
-token's native price. Every run reports its own reproduction rate and link rate — a window
-where the first falls is a window where the rule changed, or a tie-break is being missed.
-See [docs/quotes.md](docs/quotes.md).
+Removes solvers from every auction in the window, re-runs winner selection, and reports
+the deltas.
 
 | flag | |
 | --- | --- |
-| `--all-solvers` | one scenario per solver that bid in the window; excludes `--solver` |
-| `--outcome-rule` | `inherited` (default) or `assume-settled`, repeatable — all rules share the extraction pass; see below |
-| `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus |
-| `--quotes` | also remove the solver from the quote competition (every chain but lens and sepolia) |
-| `--quote-ranking` | `effective-sell` (default) or `autopilot` |
+| `--solver` | a name or submission address, matched **exactly** (`Arc` is not `Arctic`); all rotated addresses of a name go together. Repeatable. A comma-separated entry `"A,B"` is **one joint** removal: all absent at once, nothing attributed to members, and not the sum of the single removals |
+| `--all-solvers` | one scenario per solver that bid in the window (rotated addresses together, uncatalogued ones by address); excludes `--solver`, needs `{solver}` in `--out` |
+| `--outcome-rule` | `inherited` (default) or `assume-settled`, repeatable; see [below](#the-outcome-rule) |
+| `--mode` | `score` (default) ranks on recorded scores; `surplus` ranks on user surplus — a separate user-value question, not an approximation of the competition |
+| `--quotes` | also remove the solver from the quote competition ([below](#the-quote-side)) |
+| `--quote-ranking` | `effective-sell` (default, prod's rule) or `autopilot` (the cross-check) |
+| `--include-price-suspects` | keep price-suspect auctions in the statistics |
 | `--limit N` | only the first N auctions — start here |
-| `--out report.json` | per-auction records, including both sides' reference scores and rewards; `{solver}` in the path becomes each solver's slug, `{rule}` the outcome rule |
+| `--out FILE` | the report JSON; `{solver}` becomes each solver's slug, `{rule}` the rule, each required when several values are given |
 
-Exit code is 0 normally, 1 if the window has no auctions, 2 if any auction could not be
-valued, 4 if a `--solver` did not resolve (or the flags are inconsistent, or a named
-solver bid in no analysed auction), 5 if the settlement source does not cover the window,
-6 if the analytics-DB connection was lost or a statement ran past the 30-minute
-`statement_timeout` (every subcommand uses 6 for these; [below](#long-runs-go-under-caffeinate--i)).
+A named solver (or group member) that bids in no analysed auction is an error, since its
+all-zero deltas would read as "costs nothing"; under `--all-solvers` it is reported and
+skipped.
 
-A month of mainnet with every solver removed in turn — 84,767 auctions, 26 scenarios —
-has taken between 12 and 25 minutes on different days. The process itself is idle for
-most of that: one day of mainnet (2,958 auctions) took 42 s of wall time and 1.7 s of CPU
-for one solver, so the runtime is the analytics DB's response time, which varies by 2x
-or more with its cache state and whoever else is querying it. Arbitration adds about
-8 s of CPU per (solver, rule) per month on top — some 7 minutes for 26 solvers under
-both rules — and resolving the solvers costs about half a second each since the
-solver queries were bounded to the window's auction-id range
-([why](docs/analytics-db.md#bound-joins-against-proposed_solutions-to-the-windows-auction-id-range)).
-Measure before promising a runtime: `--limit 3000` on one day gives the DB's rate.
+Exit codes: 0 ok; 1 no auctions in the window; 2 an auction could not be valued; 4 a
+solver did not resolve, inconsistent flags, a named solver absent, or a window before the
+replayed mechanism; 5 the settlement source does not cover the window; 6 the DB
+connection was lost or a statement passed the 30-minute timeout.
 
-From Python, the same pipeline is one call — the CLI is a rendering around it:
+From Python the pipeline is one call, which the CLI renders:
 
 ```python
 from loo import db, run
 
 conn = db.connect("mainnet")
-window = run.analyse_window(conn, ["Fractal", "Sector"], "2026-08-01", "2026-08-04")
+window = run.analyse_window(conn, ["Fractal", "Fractal,Sector"], "2026-11-17", "2026-11-20")
 for solver_run in window.runs:
     print(solver_run.solver, solver_run.analysis.delta_surplus)
 ```
 
-An entry `"Fractal,Sector"` would instead remove both in one joint counterfactual.
+#### Runtime
+
+The run waits on the analytics DB for ~96% of its time, so runtime is the DB's and varies
+2x or more by day: one mainnet day took 42 s of wall time and 1.7 s of CPU for one solver
+(2026-09-15). A month of mainnet with every solver removed in turn has taken 12–25
+minutes on different days, two outcome rules about 1.4x one. Arbitration adds ~8 s of CPU
+per (solver, rule) per month. Measure before promising: `--limit 3000` over one day gives
+the DB's current rate.
 
 #### Long runs go under `caffeinate -i`
 
-A Mac that sleeps mid-run loses the DB session: the server drops a client it has not
-heard from for about six minutes. `loo` notices within about two minutes of the line
-going quiet and exits 6 with `ERROR: lost the connection to the analytics DB … This is
-the network, not the data` — rerun the window as it was. (Until 2026-10-22 it waited on
-the dead socket forever instead; one run sat 7.5 hours with an empty log.) `caffeinate -i`
-keeps the machine from idle-sleeping for exactly as long as the command runs — closing
-the lid still sleeps a laptop:
-
-```bash
-caffeinate -i uv run loo analyse --all-solvers --start 2026-07-01 --end 2026-08-01 --out "reports/{solver}.json"
-```
-
-How the connection is guarded and what the server does on its side:
-[docs/analytics-db.md](docs/analytics-db.md#dead-connections-and-long-statements).
-
-#### The outcome rule
-
-A winner that never won for real never settled either, so the counterfactual has to
-decide what its orders do. That decision is not a footnote — 14.9% of winning solutions
-never settled and they carry half of all winning score — so instead of hiding one
-assumption in the code, the rule is an explicit choice between the two defensible
-scenarios:
-
-- `inherited` (**default**) — settlement belongs to the **slot**, not the solver. A
-  replacement inherits the outcome of the recorded winner that held its token pairs, so a
-  batch that really reverted stays reverted whoever replaces it. Settlement cancels out of
-  Δsurplus and what is left is the competition's *decision*. This is the one scenario
-  grounded in the record.
-- `assume-settled` — everything lands in time, on both sides, so the comparison is about
-  proposals alone and settlement risk is excluded entirely.
-
-A third rule (`observed` — replacements assumed to settle while recorded winners keep
-their real outcomes) was carried for a while as a "lower bound" and was removed: settlement
-attached to the solution is not a counterfactual anyone would defend, and a number
-nobody should quote is not made useful by calling it a bound. See
-[PLAN.md §7.1](PLAN.md#71-m4-result).
-
-Two things the rule names do **not** vary, both measured facts
-([details](docs/analytics-db.md#observed-outcomes-what-actually-settled)): executed
-amounts are always the **proposed** ones — a batch that lands executes its proposal
-exactly, to the atom, so the only on-chain input the pipeline has is the settlement
-status — and "settled" means landed **in time**, so the real surplus of late batches is
-reported as `of which merely late` rather than absorbed.
-
-#### Protocol fees
-
-`analyse` reports the fee the winning solutions charged on each side, split into the
-partners' share and the protocol's own revenue:
-
-| row | meaning |
-| --- | --- |
-| **Δprotocol and partner fees** | the gross amount the mechanism charges |
-| Δpartner fee | passed straight through to the app that declared it |
-| **Δprotocol fee** | what the protocol keeps |
-
-Over 2026-08-01..04 on mainnet partner fees were the larger half of the gross — 33.9 ETH
-partner against 30.8 ETH protocol — so reading the gross figure as protocol revenue
-roughly doubles it.
-
-**The split is not a fixed fraction, so all three rows are reported.** A partner fee is a
-volume policy, so it survives a rival winning the same order and is lost only when the
-order stops trading. The partners' share of the *delta* therefore tracks how much of a
-removal's cost is coverage rather than price, and it ranges from ~0% (Baseline on xdai
-and plasma, July 2026) to 74% (Baseline on polygon).
-
-**A naming warning.** The analytics DB and `arbitrator.rs` both use "protocol fee" for
-the *gross* amount, and spell the net one `protocol_fee_without_partner_fee_native`.
-This tool follows budget usage instead: "protocol fee" is what the protocol keeps, and
-the gross quantity is named for what it contains. `loo/fees.py` carries the mapping.
-
-Δprotocol fee is the direct value of a solver *to the protocol*, where Δsurplus is its
-value to users. It is **gross** revenue, so it belongs beside Δrewards rather than
-instead of it:
-the protocol also pays for the competition, and the two usually move in opposite
-directions. They are deliberately not netted into one number — fees are exact and
-uncapped rewards are not the payout, and combining them would hide that.
-
-Fees come from `stg_backend_data__fee_policies`, which covers every auction order of
-every non-filtered-out solution, so they are recomputable for essentially every solution
-the counterfactual prices. An auction where some executed order's policies are
-unrecorded is dropped from **both** sides of the fee sum and counted separately, so the
-delta stays like-for-like; that needs a solution the recorded competition filtered out to
-win the counterfactual, and runs at a fraction of a percent of auctions.
-
-#### Rewards
-
-In score mode `analyse` reports solver rewards on both sides, twice:
-
-- **Uncapped** — the mechanism's exact accounting. The removed solver's own reward
-  drops out, and rivals' rewards grow because their reference scores fall without it.
-  Not a payout: a failed settlement's uncapped penalty is `-reference_score` against a
-  real floor of −0.01 ETH before 2026-09-08 and the failed orders' CIP-87 penalty caps
-  since — a median 0.000069 ETH per failed solution on mainnet 2026-10-12. Over the
-  2026-08-01..04 window uncapped rewards sum to −410 ETH against 0.75 ETH actually paid.
-- **Capped (estimate)** — the payout-scale answer, clamping each reward into the
-  recorded caps. A replacement winner inherits the `upper_reward_cap` and the CIP-87
-  penalty cap of the recorded winner whose token pairs it claims — realised fees and
-  penalised orders follow the pairs, and a reverted slot's upper cap is 0 exactly where
-  its settlement is a revert
-  ([details](docs/rewards.md#the-slot-inheritance-estimate-and-why-the-caps-cannot-be-skipped)).
-  A winner with nothing to inherit drops its auction from the capped aggregate rather
-  than being guessed at; the report counts those.
-
-Both deltas are converted native → COW at each auction's accounting-period rate where
-the rate has been snapshotted. Rewards use the same outcome rule as surplus, so the two
-sides of one auction never disagree about which winners delivered.
-
-#### Price sanity
-
-Native prices in `auction_prices` are sometimes plain wrong — one token was priced
-~15,300× too high for a whole window, fabricating 139 ETH scores on 0.80 ETH trades
-([details](docs/analytics-db.md#native-prices-can-be-plain-wrong)). Every solution is
-therefore cross-checked by valuing its executed amounts through both tokens' prices,
-and an auction where the two sides of a trade disagree by more than 2× is **excluded
-from every statistic** — the report names the excluded auction ids (0.6% of the
-2026-08-01..04 window, which carried 82% of Sector's Δsurplus, all fabricated).
-`--include-price-suspects` keeps them in instead; the ids are printed either way.
+The server drops a client silent for about six minutes, so a Mac that sleeps loses the
+run. `loo` notices within about two minutes and exits 6 with `lost the connection to the
+analytics DB … This is the network, not the data`: rerun unchanged. `caffeinate -i`
+prevents idle sleep for the command's duration (closing the lid still sleeps)
+([details](docs/analytics-db.md#dead-connections-and-long-statements)).
 
 ### compare
 
 ```bash
-uv run loo compare out/*.json
+uv run loo compare out/*.json [--markdown] [--out FILE] [--skip-usd]
 ```
 
-Aggregates `analyse --out` reports into the comparison: one column per solver-window,
-the `assume-settled` scenario beside the `inherited` headline, medians, the sign split
-and the largest auction's share beside every sum, and the caveats and sign convention
-attached. Give every outcome-rule run of a solver-window together; a group without an
-`inherited` run is refused rather than silently led by another rule. Reports from an
-older `analyse` (the format marker is checked) are refused with "re-run analyse" —
-the files are cheap to regenerate and a silently misread one is not.
+One column per solver-window, the `assume-settled` scenario beside the `inherited`
+headline. Give every rule's run of a solver-window together; a group without `inherited`
+is refused. Reports carry a format marker and older ones are refused with "re-run
+analyse" — files are cheap to regenerate, a misread one is not. `--skip-usd` needs no DB.
 
-Beside the absolute Δsurplus, the table reads the price-movement slice in relative
-terms: on the fill-or-kill orders that trade on both sides and whose surplus moved,
-the volume-weighted price change in basis points of the baseline received value, with
-the median moved order beside it. Partially fillable orders are excluded — their two
-sides can execute different amounts, which would mix quantity into a price figure —
-and within an order the ratio is immune to a wrong native price, since surplus and
-volume are valued through the same buy-token price, which cancels. A companion row
-averages the same Δsurplus over the window's whole executed fill-or-kill volume (the
-recorded winners' executions, every analysed auction), so unmoved orders count as
-zero price change: "when a price moves" and "the average traded unit" are different
-questions, and the table answers both under their own labels.
-
-USD columns are display-only conversions at each auction's own stablecoin-implied rate
-(the analytics DB has no USD table —
-[details](docs/analytics-db.md#no-usd-prices--stablecoin-native-prices-imply-the-rate)).
-
-| flag | |
-| --- | --- |
-| `--skip-usd` | no DB connection, no USD columns |
-| `--markdown` | render as a GitHub table |
-| `--out FILE` | also write the rendering to a file |
-
-## Validating the implementation
-
-Everything above trusts that the pipeline reproduces the recorded competition. That is
-not assumed — it is gated, and the gates are re-runnable. For using the analysis you
-never need these; run them when the code, the window's data shape, or the network is
-new, and before believing a surprising result:
+### validate and validate-rewards
 
 ```bash
-uv run loo validate --start 2026-08-01 --end 2026-08-04
-uv run loo validate-rewards --start 2026-08-01 --end 2026-08-04
+uv run loo validate --start 2026-11-18 --end 2026-11-19
+uv run loo validate-rewards --start 2026-11-18 --end 2026-11-19
 ```
 
-### validate
+`validate` reproduces the recorded competition — winners, fairness filter, reference
+scores — and names a cause for every difference. Exit 0 when every difference has a
+named cause, 1 no auctions, 2 something unexplained, 3 a bad cross-check window, 6 DB.
+`--cross-check-surplus` also diffs per-order surplus against
+`int_backend_data__proposed_solution_data`; that model lags the raw tables by days, so it
+fails loudly on an uncovered window rather than checking nothing.
 
-Reproduces the recorded competition — winners, fairness filter, reference scores — and
-accounts for every difference. Exit code is 0 when every difference has a named cause,
-1 if the window has no auctions, 2 when something is unexplained, 3 on a bad
-cross-check window, 6 on a lost DB connection or statement timeout.
+`validate-rewards` recomputes every winner's uncapped and capped reward from the mart's
+own inputs and diffs `fct_solver_rewards_per_auction` row by row. Nothing on that path is
+approximated, so anything but an exact match exits 2 (1 empty window, 3 mart does not
+cover the window, 6 DB). It has no mechanism cut-off.
 
-| flag | |
+## Reading a run
+
+### Signs and denominators
+
+Every delta is **counterfactual − actual** (without minus with): negative Δsurplus means
+users would have received less, negative Δprotocol fee that the protocol would have
+collected less, positive Δrewards that it would have paid more. The convention is printed
+with every table and stamped into the JSON.
+
+Auctions the solver never bid in stay in every denominator, so rates describe the window.
+"Of N compared" is relative to the solver's own auctions and overstates window-level
+dependence for a selective bidder, so coverage also has a window-level share: only-with
+executions over every user-order execution the recorded winners traded, partially
+fillable orders included.
+
+### The outcome rule
+
+A winner that never won for real never settled either, and 14.9% of winners never settle
+while carrying half of all winning score
+([measured](docs/analytics-db.md#observed-outcomes-what-actually-settled)), so the rule is
+an explicit choice:
+
+- `inherited` (**default**) — settlement belongs to the **slot**: a replacement inherits
+  the recorded outcome of the token pairs it claims, so settlement cancels out and what
+  is left is the competition's decision. The one scenario grounded in the record.
+- `assume-settled` — everything lands in time on both sides; proposals alone.
+
+Executed amounts are always the proposed ones (a settled proposal is exact to the atom),
+and "settled" means **in time**, so late batches' real surplus is reported as `of which
+merely late` rather than absorbed.
+
+### Surplus and price
+
+Beside the absolute Δsurplus, `compare` gives the price change in bps on the fill-or-kill
+orders that trade on both sides and whose surplus moved (median moved order beside it),
+and the same Δsurplus spread over the window's whole executed fill-or-kill volume, so
+"when a price moves" and "the average traded unit" are both answered under their own
+labels. Partially fillable orders are excluded from these, since their sides can execute
+different amounts. The per-order ratio is immune to a wrong native price, which cancels.
+
+An order executed **only without** the removed solver is real: a single-order winner can
+block a whole batch ([why](docs/winner-selection.md#a-blocked-batch-keeps-orders-unexecuted)).
+
+### Protocol fees
+
+| row | meaning |
 | --- | --- |
-| `--limit N` | only the first N auctions — start here, a full day is ~2,700 |
-| `--cross-check-surplus` | also diff per-order surplus against the dbt model |
-| `--out report.json` | write the full report, including every disagreeing auction |
-| `--network` | defaults to `mainnet`; see `loo/db.py` for the rest |
+| **Δprotocol and partner fees** | the gross amount the mechanism charges — the headline |
+| Δpartner fee | passed straight through to the app that declared it |
+| **Δprotocol fee** | what the protocol keeps |
 
-`--cross-check-surplus` needs `int_backend_data__proposed_solution_data`, which lags the
-raw tables by over a week. It fails with a clear message rather than checking nothing:
+Partner fees are volume policies: they survive a rival winning the same order and are
+lost only when the order stops trading. On mainnet they were most of the fee *level* (33.9
+of 64.7 ETH over 2026-08-01..04) but almost none of its movement, while on chains where a
+removal costs coverage they move with the orders (74% of Baseline's polygon fee delta,
+July 2026); hence the gross headline with the split one tier down. Fee deltas run over the
+union of orders either side traded, so an order that stops trading contributes its whole
+fee. Δprotocol fee is gross revenue and belongs beside Δrewards, not netted against it:
+fees are exact and uncapped rewards are not the payout. Auctions whose executed orders
+lack fee policies are dropped from both sides and counted
+([rule](docs/analytics-db.md#fee-policies-cover-every-order-of-every-kept-solution)).
 
-```bash
-uv run python -c "from loo import db; c = db.connect('mainnet'); print(db.fetch(c, 'select max(auction_id) from dbt.int_backend_data__proposed_solution_data'))"
-```
+### Rewards (score mode)
 
-Everything else reads the staging tables and works up to the present.
+- **Uncapped** — the mechanism's exact accounting; not a payout (a failed win is charged
+  `−reference_score` uncapped against a real CIP-87 penalty of a median 0.000069 ETH,
+  mainnet 2026-10-12).
+- **Capped (estimate)** — each reward clamped into the caps a replacement inherits from
+  the slot it displaced; a winner with nothing to inherit drops its auction from the
+  capped sum and is counted
+  ([details](docs/rewards.md#the-slot-inheritance-estimate-and-why-the-caps-cannot-be-skipped)).
 
-### validate-rewards
+Both convert native → COW per auction at the accounting-period rate, where snapshotted.
 
-Recomputes every winning solver's uncapped *and* capped reward from the DB's own
-inputs — winning solutions, settlement flags, caps, reference scores — and diffs
-against `fct_solver_rewards_per_auction`, row by row. Unlike `validate` there is no
-accepted-difference category: nothing in this path is approximated, so anything but an
-exact match on every row exits non-zero. Exit code 0 when every row matches, 1 on an
-empty window, 2 on a mismatch, 3 when the mart does not cover the window, 6 on a lost
-DB connection or statement timeout.
+### Price sanity
+
+An auction whose trades value differently through their two tokens by more than 2x is
+**excluded from every statistic** and named; a wrong native price fabricates every number
+it touches ([details](docs/analytics-db.md#native-prices-can-be-plain-wrong)). A pair
+mispriced by the same factor passes: check valued volumes for absurd figures.
+
+### USD
+
+Display only, each auction at its own stablecoin-implied rate, because one window rate
+misstates long windows on volatile chains
+([source](docs/analytics-db.md#no-usd-prices--stablecoin-native-prices-imply-the-rate)).
+
+### The quote side
+
+`--quotes` re-runs each linked order's quote competition without the solver and reports
+`window_bps` (quote degradation over executed quoted volume), `no_quote` (orders that
+would not exist), and the price-improvement fee recharged against the replacement quote.
+That recharge is its own figure and is **not** in Δprotocol fee, which uses the recorded
+quotes on both sides. Executions and ranking stay as recorded, checked per auction. Every
+run reports its pick reproduction and link rates; a drop means a rule change or a missed
+tie-break. Quote bps are heavy-tailed: read the median and the ⚠ on a largest-order share
+of 30% or more. See [docs/quotes.md](docs/quotes.md).
 
 ### Reading a validate run
 
 ```
-=== 7745 auctions, 98669 solutions ===
-winner set matches:         7745/7745
-filtered-out set matches:   7745/7745
-reference scores (ours):    7745/7745
-reference scores (observed): 7745/7745
-pick on observed kept set:  7745/7745
+=== 4850 auctions, 88532 solutions ===
+winner set matches:         4850/4850
+filtered-out set matches:   4850/4850
+reference scores (ours):    4850/4850
+reference scores (observed): 4850/4850
+pick on observed kept set:  4850/4850
 valuation failures:         0
-
-filter differs from DB:     0/5211 multi-pair solutions (0.0000%)
-multi-pair bracket:         must_filter=4882, must_keep=66, undetermined=263
-filter verdict by:          score=5208, surplus=3  (surplus fallback 0.0576%)
-  of those, guesses that could have moved the winners: 1 auctions
-
-no disagreements.
-
-every difference has a named cause — the validation gate is met.
+filter differs from DB:     0/… multi-pair solutions
+multi-pair bracket:         must_filter=…, must_keep=…, undetermined=…
+filter verdict by:          score=…, surplus=…
+  of those, guesses that could have moved the winners: 0 auctions
 ```
 
-The two `observed` lines hold the DB's own filter decisions fixed and re-run a single step
-of the algorithm — winner picking, then reference scores — so no approximation is in their
-path and both should always be exact.
-
-The other lines are the whole mechanism run end to end, and on this window they are exact
-too. They *can* differ, because the fairness filter compares solutions **per token pair**
-and that split of a solution's score is not stored anywhere. It is recomputed from the
-recorded fee policies and anchored on the recorded score. Baselines are never approximated
-— a single-pair solution's whole score sits on its one pair — so only the left side of a
-comparison can be missing, and there user surplus stands in as a *lower bound*: clearing
-the baseline on surplus alone proves the pair fair, and failing it is the only guess the
-filter makes. `filter verdict by` counts those guesses — 3 here, none of which changed a
-decision — and the line under it counts the auctions where one *could* have, by restoring
-every guess and re-picking the winners. A zero there is a proof that no guess mattered; in
-`analyse`, where there is no recorded outcome to compare against, it is the only handle on
-the filter's residual uncertainty. `bracket` bounds how much an unknown split could possibly matter, and `cause`
-classifies any difference:
-
-- `proxy` — a guess, where the split genuinely decides and cannot be known
-- `model` — a guess, provably a deliberate consequence of comparing surplus
-- `bug` — no valid split explains it, **or** every pair was decided by a proof and it still
-  differs; the run exits 2
-
-A `SCORE ANCHOR FAILURES` line appears only when the recomputed fees contradict a recorded
-score. It should never appear; it means the fee path is wrong, not that fee coverage is
-thin.
-
-See [PLAN.md §15](PLAN.md#15-m14--fee-aware-scoring--done) for the argument, and
-[§4.1](PLAN.md#41-m1-result) for what the filter looked like before the split was
-recomputed.
+(mainnet 2026-11-18, filter counts elided.) The `observed` lines re-run one step on the
+DB's own kept set and must always be exact. The filter lines are end to end: the per-pair
+score split is recomputed, surplus stands in as a lower bound where a pair is dark, and
+`filter verdict by` counts the guesses. Causes `proxy`, `model` and `bug` are defined in
+[docs/winner-selection.md](docs/winner-selection.md#what-validate-checks-and-how-it-names-a-difference);
+a `bug` exits 2, and a `SCORE ANCHOR FAILURES` line means the fee path is wrong.
 
 ## Tests, lint, types
 
-```bash
-uv run --extra dev pytest
-uv run ruff check .
-uv run pyright
-```
-
-The tests need no DB access — `loo/winner_selection.py`, `loo/valuation.py`,
-`loo/counterfactual.py`, `loo/rewards.py` and `loo/aggregate.py` take plain dataclasses
-and files and hold no connection. Pyright runs in strict mode; both tools are
-configured in `pyproject.toml` and install with `uv sync --extra dev`.
+`uv run pytest` runs the deterministic simulation suite in `tests/`, which takes a seed;
+no DB access is needed. `uv run ruff check .` and `uv run pyright` (strict) lint and
+type-check; dev tooling installs with `uv sync --extra dev`.
 
 ## Background
 
-- **[PLAN.md](PLAN.md)** — the milestones, every design decision (D1–D15) in one
-  table, and the measured results per milestone (§4.1, §5.1, §6.1, §7.1).
-- **[docs/analytics-db.md](docs/analytics-db.md)** — DB connection, tables, join keys,
-  coverage and lag, the wrong-native-price story, the USD rate source.
-- **[docs/winner-selection.md](docs/winner-selection.md)** — the algorithm, Rust source
-  map, score/surplus formulas.
-- **[docs/rewards.md](docs/rewards.md)** — reward and cap formulas, and why the cap is
-  hard counterfactually.
+- [docs/analytics-db.md](docs/analytics-db.md) — DB connection, tables, join keys,
+  prices, fees, settlement, solver names, query cost.
+- [docs/winner-selection.md](docs/winner-selection.md) — the algorithm, Rust source map,
+  the score-split filter, the fee port, counterfactual rules.
+- [docs/rewards.md](docs/rewards.md) — reward and cap formulas, the capped estimate.
+- [docs/quotes.md](docs/quotes.md) — the quote competition and the quote side.

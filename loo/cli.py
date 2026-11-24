@@ -1,18 +1,4 @@
-"""Command line entry point.
-
-Four subcommands:
-
-- `analyse` removes one or more solvers from a window's auctions — each on its own,
-  or several together as one joint counterfactual — re-runs the competition and
-  reports what users and the protocol would have lost or saved.
-- `compare` aggregates several `analyse --out` reports into the per-solver
-  comparison table, with medians beside the sums and USD conversion.
-- `validate` reproduces the recorded competition over a date window and accounts for
-  every difference. It is the gate the counterfactual rests on.
-- `validate-rewards` recomputes every solver's uncapped reward from the DB's own
-  inputs and compares against `fct_solver_rewards_per_auction`. No approximation is in
-  its path, so it must match exactly.
-"""
+"""Command line entry point."""
 
 from __future__ import annotations
 
@@ -136,7 +122,8 @@ def main(argv: list[str] | None = None) -> int:
             "for every order created in the window, report how much worse the quotes "
             "would be and how often no quote would exist at all, and charge the "
             "price-improvement fee of the affected orders against the replacement "
-            "quote so the protocol-fee delta includes the quote effect. Needs the "
+            "quote, reported as its own recharge figure (not inside the protocol-fee "
+            "delta). Needs the "
             "CLICKHOUSE_* credentials and a network with quote data "
             f"({', '.join(sorted(ch.NETWORK_CHAIN_IDS))})"
         ),
@@ -196,8 +183,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {error}", file=sys.stderr)
         return 4
     except (db.ConnectionLostError, db.StatementTimeoutError) as error:
-        # Neither says anything about the data. A traceback ending in psycopg2 reads
-        # like a query or data bug, so the cause is printed instead, under its own code.
+        # The network, never the data: print the cause, not a psycopg2 traceback.
         print(f"ERROR: {error}", file=sys.stderr)
         return 6
 
@@ -224,9 +210,7 @@ def run_validate(args: argparse.Namespace) -> int:
             db_surplus = extract.load_db_order_surplus(conn, auction_ids)
             print(f"{len(db_surplus)} DB surplus rows for cross-check", file=sys.stderr)
             if not db_surplus:
-                # `int_backend_data__proposed_solution_data` lags the staging tables by
-                # over a week. Silently skipping a check that was explicitly asked for
-                # would let the report read as though the surplus path was verified.
+                # A requested check must not be skipped silently (the int_ model lags).
                 print(
                     "ERROR: --cross-check-surplus was requested but "
                     "int_backend_data__proposed_solution_data covers none of this "
@@ -262,20 +246,12 @@ def run_validate(args: argparse.Namespace) -> int:
         write_json(args.out, summary, surplus, fast_path)
         print(f"\nfull report written to {args.out}", file=sys.stderr)
 
-    # The gate is that every difference has a named cause, not that there are no
-    # differences: the per-pair surplus fallback is a known and accepted one, and is the
-    # only place an accepted difference can now come from.
+    # The gate: every difference has a named cause; the surplus fallback is accepted.
     return 0 if not summary.unexplained else 2
 
 
 def run_validate_rewards(args: argparse.Namespace) -> int:
-    """The rewards gate: recorded winning solutions + settlement flags + recorded
-    reference scores -> the reward formula -> compare with the dbt mart, row by row.
-
-    Nothing in this path is approximated — the inputs are the mart's own — so unlike
-    `validate` there is no accepted-difference category: anything but an exact match on
-    every row is a transcription bug or a data problem, and the run exits non-zero.
-    """
+    """Recompute uncapped rewards from the mart's own inputs; must match it exactly."""
     conn = db.connect(args.network)
     try:
         auction_ids = extract.auctions_in_window(conn, args.start, args.end)
@@ -314,8 +290,7 @@ def run_validate_rewards(args: argparse.Namespace) -> int:
                 else {}
             )
         except rewards.MissingReferenceScoreError as error:
-            # A winner without a reference score means the inputs themselves are broken —
-            # comparing anything after that would attribute a data gap to the formula.
+            # Broken inputs, not a formula error: stop before comparing.
             print(f"ERROR: auction {auction_id}: {error}", file=sys.stderr)
             return 3
         validation.check_auction(auction_id, ours, fct.get(auction_id, {}))
@@ -397,7 +372,6 @@ def write_reward_validation_json(path: str, validation: rewards.RewardValidation
 
 
 def reward_as_json(reward: rewards.SolverReward | None) -> dict[str, str | None] | None:
-    """A `SolverReward` as JSON-safe strings, keeping `None` a null rather than 'None'."""
     if reward is None:
         return None
     return {
@@ -406,18 +380,12 @@ def reward_as_json(reward: rewards.SolverReward | None) -> dict[str, str | None]
 
 
 def report_path(template: str, solver: str, rule: str) -> str:
-    """`--out` with `{solver}` substituted by the solver's slug and `{rule}` by the
-    outcome rule."""
     slug = re.sub(r"[^a-z0-9]+", "-", solver.lower()).strip("-")
     return template.replace("{solver}", slug).replace("{rule}", rule)
 
 
 def resolve_scenarios(args: argparse.Namespace, conn: db.Connection) -> list[str] | None:
-    """The `--solver` scenarios, or every bidder in the window under `--all-solvers`.
-
-    Returns `None` after printing the reason when the two flags are combined, neither is
-    given, or the window has no bidders at all.
-    """
+    """`--solver` or every window bidder (`--all-solvers`); `None` after printing why not."""
     if args.all_solvers and args.solver:
         print(
             "ERROR: --all-solvers already covers every solver that bid; drop --solver "
@@ -450,8 +418,7 @@ def resolve_scenarios(args: argparse.Namespace, conn: db.Connection) -> list[str
 
 
 def run_analyse(args: argparse.Namespace) -> int:
-    # argparse's `choices` already constrains the values; the cast restores the
-    # literal type it erased.
+    # `choices` validated the values; the cast restores the literal type.
     rules = cast(
         "list[counterfactual.OutcomeRule]", args.outcome_rules or ["inherited"]
     )
@@ -465,8 +432,7 @@ def run_analyse(args: argparse.Namespace) -> int:
 
     conn = db.connect(args.network)
     try:
-        # `--all-solvers` needs the DB to know the scenarios, so the `{solver}` check
-        # cannot happen with the other argument checks above.
+        # `--all-solvers` needs the DB, so this check follows the connect.
         solvers = resolve_scenarios(args, conn)
         if solvers is None:
             return 4
@@ -500,8 +466,7 @@ def run_analyse(args: argparse.Namespace) -> int:
             print(f"ERROR: {error.args[0] if error.args else error}", file=sys.stderr)
             return 4
         except counterfactual.MissingSettlementError as error:
-            # The settlement source does not reach this window. Reporting a partial run
-            # would understate baseline surplus in exactly the auctions it dropped.
+            # A partial run would understate baseline surplus where auctions dropped.
             print(f"ERROR: {error}", file=sys.stderr)
             return 5
     finally:
@@ -530,11 +495,7 @@ def run_analyse(args: argparse.Namespace) -> int:
         skipped = skipped or bool(solver_run.analysis.auctions_skipped)
 
     if never_bid:
-        # `resolve_solver` checks the whole window, so `--limit` can still slice down to
-        # auctions the solver never bid in. Every delta is then trivially zero, which reads
-        # as "removing this solver costs users nothing" — the one misreading worth an exit
-        # code. Checked here rather than at resolution time so it holds for any reason the
-        # solver ends up absent.
+        # All-zero deltas from a solver that never bid would read as "costs users nothing".
         print(
             f"\nERROR: {', '.join(never_bid)} did not bid in any of the "
             f"{len(window.auction_ids)} auctions analysed, so every delta above is "
@@ -542,9 +503,7 @@ def run_analyse(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     for label, absent in reduced.items():
-        # The same misreading, one level down: the group's numbers are real, but with a
-        # member absent from every analysed auction they are the smaller group's numbers
-        # wearing the full group's label.
+        # Likewise a group with an absent member reports the smaller group's numbers.
         print(
             f"\nERROR: {', '.join(absent)} (of the removal group {label!r}) did not "
             f"bid in any of the {len(window.auction_ids)} auctions analysed, so the "
@@ -554,9 +513,6 @@ def run_analyse(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     if never_bid or reduced:
-        # Under `--all-solvers` the list came from the window, so nobody asked for the
-        # absent solver by name and there is no misreading to guard against: the run
-        # covers every solver that *could* be analysed, and says which could not.
         if args.all_solvers:
             print(
                 "(reported rather than fatal: --all-solvers derived the list from the "
@@ -566,18 +522,11 @@ def run_analyse(args: argparse.Namespace) -> int:
         else:
             return 4
 
-    # A valuation failure means an auction could not be arbitrated at all, so its
-    # contribution to every number above is silently missing. Validation measured zero
-    # of them, so any at all is worth a non-zero exit rather than a line in the report.
+    # A skipped auction is silently missing from every number above.
     return 2 if skipped else 0
 
 
 def run_compare(args: argparse.Namespace) -> int:
-    """The per-solver comparison table, from `analyse --out` files.
-
-    Pure post-processing of the reports; the only DB work is fetching the stablecoin
-    prices behind the USD columns, and `--skip-usd` removes even that.
-    """
     try:
         reports = [aggregate.load_report(path) for path in args.reports]
         windows = aggregate.group_reports(reports)
@@ -587,8 +536,7 @@ def run_compare(args: argparse.Namespace) -> int:
 
     usd_by_network: dict[str, aggregate.UsdContext] = {}
     if not args.skip_usd:
-        # One rate query per network, over the union of every report's changed
-        # auctions — those are the only auctions that carry a non-zero delta.
+        # Only changed auctions carry a non-zero delta.
         by_network: dict[str, set[int]] = {}
         for report in reports:
             by_network.setdefault(report.network, set()).update(
@@ -599,8 +547,7 @@ def run_compare(args: argparse.Namespace) -> int:
             try:
                 rates = extract.load_usd_rates(conn, sorted(auction_ids), network)
             except KeyError as error:
-                # No curated stablecoins for this network — USD is display sugar, so
-                # say so and carry on rather than failing the comparison.
+                # No curated stablecoins; USD is display only, so carry on.
                 print(f"note: no USD rates for {network}: {error}", file=sys.stderr)
                 continue
             finally:
@@ -631,12 +578,6 @@ def run_compare(args: argparse.Namespace) -> int:
 
 
 def report_quote_side(analysis: quotes.QuoteAnalysis) -> None:
-    """The quote side of one run: three figures and what they rest on.
-
-    The fee consequence is deliberately absent — it is inside the protocol-fee delta
-    printed above, because the counterfactual quote is what the recorded execution's
-    price-improvement fee was recomputed against.
-    """
     print(f"\n--- quote competition ({analysis.ranking}) ---")
     if not analysis.quote_wins:
         print(
@@ -983,8 +924,7 @@ def report_summary(summary: validate.Summary, args: argparse.Namespace) -> None:
         f"{summary.auctions_guess_could_matter} auctions"
     )
     if summary.score_anchor_failures:
-        # Never expected. Loud, because it means the fee port disagrees with the recorded
-        # score — a different problem from a policy simply not being recorded.
+        # Never expected: the fee port contradicts the recorded score.
         print(
             f"SCORE ANCHOR FAILURES:      {summary.score_anchor_failures} solutions "
             f"whose recomputed fees contradict proposed_solutions.score"

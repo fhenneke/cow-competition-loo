@@ -1,213 +1,78 @@
 # Leave-one-out solver analysis
 
-Counterfactual analysis of CoW Protocol solver competition: remove one solver — or
-several jointly — from past auctions, re-run winner selection, and measure the impact
-on user surplus, solver rewards, and order coverage.
+Remove one solver, or several jointly, from past CoW Protocol auctions, re-run winner
+selection, and measure the impact on user surplus, solver rewards, fees and coverage.
+`loo` replays only the mechanism live since `extract.MECHANISM_START` (2026-10-28).
 
-- **[PLAN.md](PLAN.md)** — what to build, milestone by milestone. Start here.
-- **[docs/analytics-db.md](docs/analytics-db.md)** — DB connection, tables, join keys,
-  coverage, date→auction mapping, reading dbt model source.
-- **[docs/winner-selection.md](docs/winner-selection.md)** — the algorithm, Rust source
-  map, score/surplus formulas.
-- **[docs/rewards.md](docs/rewards.md)** — reward and cap formulas.
-- **[docs/quotes.md](docs/quotes.md)** — the quote competition: ClickHouse coverage, how
-  the winner is actually picked, the order↔request match, and what the quote side does and
-  does not measure.
-- **[solver-value-artifact skill](.claude/skills/solver-value-artifact/SKILL.md)** —
-  writing a run up as a published artifact: which four measures lead, what stays
-  visually quiet, and the neutral register the pages are written in. Read it before
-  drafting any results page.
+Facts about the data and the protocol that the code cannot show live in `docs/`:
+[analytics-db](docs/analytics-db.md), [winner-selection](docs/winner-selection.md),
+[rewards](docs/rewards.md), [quotes](docs/quotes.md). Commands: [README](README.md).
+Results pages: the [solver-value-artifact skill](.claude/skills/solver-value-artifact/SKILL.md).
 
-Keep the split: `PLAN.md` is the concrete work, `docs/` is durable context. When you learn
-something reusable about the data or the protocol, it goes in `docs/`.
+## Traps that silently give wrong answers
 
-## Local repos this analysis depends on
+1. `proposed_trade_executions.solution_uid` joins `proposed_solutions.uid`, not `.id`.
+2. `proposed_solutions.uid` is assigned best-to-worst and is the arbitrator's only
+   tie-break record. It is not plain score order.
+3. Surplus and score are not interchangeable, so never stand one in for the other.
+4. Auction membership comes from `competition_auctions.order_uids`. Fee policies are
+   not membership.
+5. `int_backend_data__proposed_solution_data` lags staging by days, so query its
+   `max(auction_id)`. It has no `filtered_out` column. Other models are level with staging.
+6. `order_surplus_atoms_in_surplus_token` can be one atom high. Use exact integer ceiling
+   division.
+7. Executed (`tx_hash is not null`) is not settled in time (`is_settled_in_time`). `loo`
+   uses `is_settled_in_time` for both surplus and reward.
+8. Match solver names exactly (`Arc` is a substring of `Arctic`). One name can cover
+   several addresses, and all of them go together.
+9. Partner fees are the trailing `n` fee policies, with
+   `n = array_length(app_data.partner_fee_recipients, 1)`. `partner_fee_item_count` is
+   always NULL.
+10. The mart's native fees use corrected prices, but scoring did not, so diff atoms, not
+    native values.
+11. Native prices come only from the `competition_auctions` price arrays. Go through
+    `extract.fetch_prices`.
+12. JIT orders are not read. That is exact only while `surplus_capturing_jit_order_owners`
+    is empty.
+13. Fast-path auctions (`fast_path_quote_id` non-NULL) are excluded, not arbitrated.
+14. `int_backend_data__solution_data.lower_reward_cap` is not the floor, so read it through
+    `rewards.lower_reward_cap`.
+15. Quotes: link an order to its competition by `quote_id` from
+    `raw_prod_<chain>.order_quotes`, and read only `raw_quotes`, never `gold_quotes`. The
+    quote winner need not have bid on its order, and quote-side guards run after the
+    did-the-solver-win test.
+16. A price check that compares two feeds for the same token passes a token both feeds
+    get wrong. Instead, compare what was sold with what was bought, at that auction's
+    prices.
+17. Bound any join against `proposed_solutions` to the window's `auction_id` min/max, or
+    it becomes a sequential scan of the whole table.
+18. The reference checkouts `~/Work/Code/services` and `~/Work/Code/cow-dagster` are
+    read-only and go stale. Compare them against `git ls-remote origin main` before
+    trusting either.
 
-| Path | Use |
-| --- | --- |
-| `~/Work/Code/services` | autopilot + `winner-selection` crate — the algorithm being replicated |
-| `~/Work/Code/cow-dagster` | the dbt project — the only place model SQL can be read |
+## Working here
 
-Both are read-only references here. Do not modify them.
+- Check with `uv run ruff check .`, `uv run pyright` (strict) and `uv run pytest`. Dev
+  tooling installs with `uv sync --extra dev`.
+- **No unit tests.** `tests/` is a deterministic simulation: seeded synthetic worlds run
+  through the real pipeline and are checked by invariants and by a naive winner-selection
+  oracle. When you find a bug, extend the generator or an invariant until a seed finds
+  it, then pin that seed. Check against production with `loo validate` and
+  `loo validate-rewards`.
+- Run ad-hoc queries with `uv run python` and `loo.db.connect(network)`. The DB user is
+  read-only. Bound every query with an `auction_id` range or a `LIMIT`, and add
+  `set statement_timeout = '120s'`.
+- Runs wait on the DB, and their runtimes drift by 2x or more from day to day. Quote a
+  range with the date it was measured. Launch long runs as `caffeinate -i uv run loo …`.
+  Exit 6 means the network failed, not the data, so rerun unchanged.
+- Do not edit `loo/` while a run is in flight, because each run re-imports from disk.
+- `.env` stays out of commits.
 
-## Gotchas that cost time
+## Committing
 
-1. `ANALYTICS_DB_URL` in `.env` is `user:pass@host:port` — **no scheme, no dbname**.
-   `psycopg2.connect(url)` fails on it.
-2. `proposed_trade_executions.solution_uid` joins `proposed_solutions.uid`, **not `.id`**.
-   The two collide for some rows, so the wrong join half-works silently.
-3. `stg_backend_data__fee_policies` has rows for every auction order of every
-   **non-filtered-out** solution — not just executed orders, as this line used to claim.
-   It is still not a test for auction membership (use `competition_auctions.order_uids`),
-   but protocol fees *can* be recomputed for 98.9% of proposed executions
-   ([rule and measurement](docs/analytics-db.md#fee-policies-cover-every-order-of-every-kept-solution)).
-4. Surplus and score are **not** interchangeable — median score/surplus is 1.08, p90 is
-   2.70, and 3.2% of bids are fee-dominated. See
-   [docs/winner-selection.md](docs/winner-selection.md#measured-divergence--surplus-is-not-a-stand-in-for-score).
-5. `int_backend_data__proposed_solution_data` lags the raw tables **badly and variably** —
-   7.5 days when measured on 2026-08-11. Query its `max(auction_id)` rather than assuming.
-   It also has no `filtered_out` column, so the fairness-filter ground truth only comes
-   from `stg_backend_data__proposed_solutions`.
-6. `order_surplus_atoms_in_surplus_token` is up to one atom too high: Postgres `numeric`
-   division rounds the quotient before the model's `ceil()` sees it. Use exact integer
-   ceiling division. See
-   [docs/analytics-db.md](docs/analytics-db.md#order_surplus_atoms_in_surplus_token-rounds).
-7. `proposed_solutions.uid` is assigned best-to-worst and is the only record of the
-   arbitrator's tie-breaks. Reference scores depend on that ordering, which is *not* plain
-   score order — see
-   [docs/winner-selection.md](docs/winner-selection.md#ranked-order-is-load-bearing).
-8. `is_settled_in_time` is **not** "did this execute" — 16 winners in the M1 window landed
-   late, so their orders traded and users kept the surplus while the solver earned no
-   reward. The two flags genuinely differ (`tx_hash is not null` vs `is_settled_in_time`), so
-   pick deliberately. The counterfactual picks `is_settled_in_time` for *both* the surplus
-   and the reward side, so the two agree on which winners delivered
-   ([why](loo/extract.py), `Settlement.counts_as_executed`).
-9. The lag in gotcha 5 is specific to `int_backend_data__proposed_solution_data`. Every
-   other model on that path is level with staging — check the model, don't avoid `int_` as
-   a class ([table](docs/analytics-db.md#coverage-and-lag)).
-10. Solver names need **exact** matching: `Arc` is a substring of `Arctic` and both bid in
-    the M1 window, so any `ilike '%…%'` silently removes two competitors. One name can also
-    mean several addresses (key rotations) and all of them must go together
-    ([traps](docs/analytics-db.md#resolving-a-solver-name)).
-11. Partner fees are **most** of the protocol fee (33.9 of 64.7 ETH over 2026-08-01..04),
-    and they are identified by **position** — the trailing `n` policies in application
-    order — not by policy kind. `n` is `array_length(app_data.partner_fee_recipients, 1)`;
-    the `partner_fee_item_count` column that looks made for this is NULL in all 888,760
-    rows ([rule](docs/analytics-db.md#partner-fees-are-the-trailing-policies-and-they-are-most-of-the-total)).
-12. The DB's `protocol_fee_native` / `partner_fee_native` are computed with a **corrected**
-    price feed (`stg_auction_prices_corrections`, overlaid in
-    `int_backend_data__price_data`); the score the competition was decided on is not. So
-    never diff our native fees against the mart's — diff the **atoms**, which is what the
-    M13 cross-check does. On 2026-08-30 the table had 20 rows and every auction in it
-    was independently caught by `price_imbalanced`; it has since grown to 7,184 archived
-    rows on mainnet and that check has not been re-run
-    ([detail](docs/analytics-db.md#the-accounting-path-corrects-these-prices-the-scoring-path-must-not)).
-13. **JIT orders are not read, and that is exact only while
-    `surplus_capturing_jit_order_owners` is empty.** Since services#4902 (live
-    2026-10-27) a JIT order earns no score, is ignored by the fairness filter and claims
-    no token pair, so `extract.EXECUTIONS_SQL` returns only the auction's own orders.
-    The array was empty on all ten chains over 2026-10-24..11-23; if CoW AMMs or any
-    other surplus-capturing owner return, those orders score again and the trim is
-    wrong. This replaced the D17 exclusion, which had reached 27% of mainnet's auctions
-    ([rule](docs/winner-selection.md#loo-replays-the-current-mechanism-only)).
-14. An order's quote competition is a **join by quote id**, the only link `loo` has
-    (ids exist from 2026-09-29 17:16 UTC). Read `quote_id` from
-    `raw_prod_<chain>.order_quotes`: the staging model's copy is NULL on every row built
-    before ~2026-10-06. Even linked, a streamed quote's order can carry a *non-winning*
-    estimate, an ethflow order's stored quote can come from a request-less re-quote the
-    backend ran at indexing, and `order_quotes.solver = 0x0` is an unwrap with no
-    competition at all
-    ([details](docs/quotes.md#quote-ids-link-an-order-to-its-competition-exactly--from-2026-09-29)).
-15. A price sanity check that compares two feeds for the **same** token passes a token
-    both feeds price wrong: on bnb 2026-10-05..12, 26 orders carried 28.68 M of 28.70 M
-    BNB of quote-side volume that way. Compare what was sold with what was bought, at the
-    prices of the auction each trade settled in — not at window medians, which fail
-    honest trades of any token that moved during the window
-    ([details](docs/quotes.md#two-price-checks-both-at-the-orders-own-auctions)).
-14. Native prices come from the `price_tokens` / `price_values` arrays of
-    `stg_backend_data__competition_auctions` and from nowhere else: the legacy
-    `stg_backend_data__auction_prices` was **dropped on 2026-11-05**. The arrays are
-    NULL before 2026-09-15, where `load_auctions` raises `MissingPricesError`. Go
-    through `extract.fetch_prices`
-    ([coverage](docs/analytics-db.md#native-prices-the-competition_auctions-arrays)).
-14. **The quote winner need not bid on its order.** `analyse_auction` skips auctions the
-    removed solver never bid in, so anything wired through it that does not depend on the
-    solver's bid — the recharged price-improvement fee is the case in hand — has to be
-    routed past that early return, or it is dropped exactly where quoting and solving
-    solvers differ (D33). Likewise a quote-side *guard* (price suspect, gas over input) is
-    an excluded win and must run **after** the did-the-solver-win test; run first, it makes
-    every suspect order a win of every solver
-    ([both](docs/quotes.md#traps)).
-15. **`gold_quotes` does not hold every competition, so `loo` reads `raw_quotes` only.**
-    The gold tables are built off the `quote_requested` event, and a competition whose
-    event never arrived is in neither — 0.6% of requests, but the competitions behind a
-    quarter of a day's orders (API callers). Do not reach for them in new queries
-    ([measured](docs/quotes.md#the-gold-tables-do-not-hold-every-competition--link-through-the-raw-layer)).
-16. **A window CTE joined against `proposed_solutions` is planned as a sequential scan
-    of the whole table** (13.4M rows on mainnet): the planner cannot size a CTE whose
-    bounds are subqueries. `ALL_SOLVERS_SQL` and `SOLVER_SQL` did exactly this — once
-    per solver under `--all-solvers` — and a cold cache or a busy DB turned each scan
-    into minutes, which is where the "`--all-solvers` never returns" reports came from.
-    Both now bound `ps.auction_id` to the window's min/max, which puts the join on the
-    index; keep that bound on any new query of the same shape
-    ([rule](docs/analytics-db.md#bound-joins-against-proposed_solutions-to-the-windows-auction-id-range)).
-17. **Runtime claims in this repo are DB-bound and drift.** A `loo analyse` process sits
-    at ~4% CPU; the same window has measured 2x apart on different days. Quote a range
-    and the day it was measured, never one number, and re-measure before planning a
-    sweep.
-18. **`int_backend_data__solution_data.lower_reward_cap` is not the floor since
-    2026-09-08.** It still carries the flat −0.01 ETH; the mart floors at the failed
-    solutions' CIP-87 `penalty_cap_native` (median 0.000069 ETH on mainnet 2026-10-12),
-    where NULL means "no cap, use the flat one" and 0 is a real cap. Read both through
-    `rewards.lower_reward_cap`, never the column alone
-    ([rule](docs/rewards.md#since-2026-09-08-the-lower-cap-is-per-order-cip-87)).
-
-19. **`loo` replays only the mechanism live since 2026-10-28** (`extract.MECHANISM_START`);
-    `validate` and `analyse` refuse an earlier window with exit 4. Before that date JIT
-    orders claimed token pairs, and before 2026-09-15 there are no prices. A zero-score
-    solution is **kept** if it trades an auction order (services#4753) — only a solution
-    with no auction order is dropped. `validate-rewards` has no such limit. Reports are
-    format 15; `compare` refuses older files, which excluded the JIT auctions.
-20. **Fast-path auctions are excluded, not arbitrated** (`fast_path_quote_id` non-NULL,
-    ~0.5% of auctions since 2026-11-08): one order settled from its quote competition,
-    losing quotes stored as zero-score solutions below the order's limit. They are
-    counted as `fast_path_auctions`; anything that iterates `competition_auctions`
-    directly has to skip them itself
-    ([why](docs/winner-selection.md#fast-path-auctions-are-excluded)).
-21. **The reference checkouts go stale.** On 2026-11-23 `~/Work/Code/services` sat on a
-    feature branch from 2026-09-15 and `cow-dagster` was 12 commits behind, which hid a
-    dropped table and two winner-selection changes. Compare against
-    `git ls-remote origin main` before reading either as current; a scratch
-    `git clone --shared` plus `git fetch <url> main` reads upstream without touching them.
-
-## Environment
-
-- Lint and typecheck before committing: `uv run ruff check .` and `uv run pyright`.
-  Pyright runs in strict mode (configured in `pyproject.toml`, which VS Code's Pylance
-  also picks up); dev tooling installs with `uv sync --extra dev`.
-- No `psql`; `psycopg2` is not in the system Python. Use `uv run --with psycopg2-binary`.
-- The DB user is `<db-user>` — read-only, and it should stay that way.
-- `.env` is gitignored and must stay out of commits.
-- **Bound every ad-hoc query.** Aggregates over a whole multi-day window without an
-  `auction_id` range run for many minutes or hang. Always add a range or a `LIMIT`, and
-  `set statement_timeout = '120s'` so a bad query fails instead of stalling. Note there is
-  no `timeout` binary on this machine.
-- **Do not edit `loo/` while a run is in flight.** A full-window `analyse` or `validate`
-  takes ~5 minutes and each invocation re-imports from disk, so a background run that
-  started before an edit picks up half of it and dies on an `AttributeError`. Finish the
-  edit first, or wait — a lost run costs five minutes and reads like a data problem.
-- **Launch long runs under `caffeinate -i`** (`caffeinate -i uv run loo analyse ...`). A
-  Mac that sleeps for more than ~6 minutes loses the DB session. That now fails within
-  ~2 minutes, with exit 6 and `ConnectionLostError`, instead of hanging forever, but
-  the run is lost either way. Exit 6 is the network, never the data: rerun the run
-  unchanged ([details](docs/analytics-db.md#dead-connections-and-long-statements)).
-
-## Committing and merging
-
-Each milestone gets its own branch and lands on `main` as **one squashed commit** — not a
-fast-forward, not a merge commit. `main` is one commit per milestone, and the milestone
-branches are kept afterwards rather than deleted (`m1-extraction-baseline`,
-`m2-loo-counterfactual`).
-
-```bash
-git checkout main
-git merge --squash m<N>-<slug>      # stages everything, deliberately makes no commit
-```
-
-Then write one commit message covering the whole milestone. Check the squash carries the
-branch exactly with `git diff main m<N>-<slug>`, which must come back empty.
-
-Commits are signed with a YubiKey and need a physical tap, which makes the commit itself
-the fiddly part:
-
-- **Never bare `git commit`.** It opens an editor and the prepared message is lost. Use
-  `git commit -F -` with a heredoc.
-- Better, put it in a **re-runnable script** — a failed tap is then retried by running the
-  same script again, with no message to retype. Two rules: keep *staging out of it* (a
-  script that re-stages would undo its own commit on a second run), and guard the commit
-  with `git diff --cached --quiet` so a second run is a no-op instead of an empty commit.
-- Run it as a **background** command and ask for the tap in the **very next message, as the
-  entire message** — the signing prompt times out in ~15-25s and streaming a summary first
-  burns that window.
-
-Failure modes and full rationale: [.claude/hardware-key-signing.md](.claude/hardware-key-signing.md).
+Each milestone is a branch that lands on `main` as one squashed commit, and the branch
+is kept: `git merge --squash <branch>`, then one message, then check that
+`git diff main <branch>` is empty. Commits are signed with a YubiKey tap. Use
+`git commit -F -` from a re-runnable script that does no staging and is guarded by
+`git diff --cached --quiet`. Run it in the background, and ask for the tap as the
+entire next message. Details: [.claude/hardware-key-signing.md](.claude/hardware-key-signing.md).

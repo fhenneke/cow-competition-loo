@@ -1,14 +1,6 @@
-"""The library entry point: leave-one-out analysis for solvers over one window.
+"""Leave-one-out analysis of removal scenarios over one window (`analyse` CLI core).
 
-`analyse_window` is the whole pipeline as one call — resolve the solvers, pull the
-window's auctions, arbitrate each one with and without every removal scenario,
-convert reward deltas to COW — and the `analyse` CLI subcommand is a thin rendering
-around it. A scenario is one solver, or a comma-separated group removed **together**
-as one joint counterfactual (D25).
-
-Extraction dominates the cost (nearly all of a ~5-minute window run; the arbitration
-itself is milliseconds per auction), so all scenarios share a single pass over the
-auctions: analysing five costs one extraction, not five.
+All scenarios and outcome rules share one extraction pass, which dominates cost.
 """
 
 from __future__ import annotations
@@ -37,15 +29,12 @@ from .valuation import Mode
 
 
 class GroupMember(NamedTuple):
-    """One solver of a removal scenario, as the caller named it and as it resolved."""
-
     given: str
     addresses: frozenset[str]
 
 
 def parse_removal_group(entry: str) -> list[str]:
-    """The solver names of one `solvers` entry: one name, or several separated by
-    commas, which are removed **together** as one joint counterfactual."""
+    """Comma-separated names are removed together as one joint counterfactual."""
     names = [part.strip() for part in entry.split(",") if part.strip()]
     if not names:
         raise extract.SolverResolutionError(
@@ -56,22 +45,17 @@ def parse_removal_group(entry: str) -> list[str]:
 
 
 class CowConversion(NamedTuple):
-    """Δrewards converted native -> COW at each auction's accounting-period rate."""
-
     cow_wei: Decimal
     cow_wei_capped: Decimal
     converted_native: int
-    """The part of the native uncapped delta the conversion covers."""
     auctions_without_rate: int
     native_without_rate: int
     capped_without_rate: Decimal
-    """Auctions whose accounting period has no snapshotted rate yet, with the native
-    uncapped and capped delta they carry — left unconverted rather than guessed at."""
+    """Left unconverted: the accounting period has no rate yet."""
 
 
 def moved_auctions(analysis: Analysis) -> list[AuctionCounterfactual]:
-    """Only auctions retained in `changed` can carry a non-zero reward delta: rewards
-    move only when the winner set or a reference score does, and both retain (D8)."""
+    """Reward deltas need a winner-set or reference-score change, which `changed` retains."""
     return [
         r
         for r in analysis.changed
@@ -82,11 +66,7 @@ def moved_auctions(analysis: Analysis) -> list[AuctionCounterfactual]:
 def convert_delta_rewards(
     analysis: Analysis, rates: Mapping[int, Decimal | None]
 ) -> CowConversion:
-    """Convert one run's reward deltas at each auction's accounting-period rate.
-
-    `rates` maps block deadlines to rates and is loaded once per window for all runs
-    (`load_conversion_rates`), not per run: the rates table is expensive to touch and
-    identical across solvers and outcome rules."""
+    """`rates` maps block deadline -> rate; load once per window, the table is costly."""
     moved = moved_auctions(analysis)
     cow_wei, cow_wei_capped = Decimal(0), Decimal(0)
     converted, missing, missing_native = 0, 0, 0
@@ -110,60 +90,35 @@ def convert_delta_rewards(
 
 @dataclass
 class SolverRun:
-    """One removal scenario's leave-one-out result over the window."""
-
     solver: str
-    """The scenario as the caller gave it — a solver name or address, or the
-    comma-joined members of a removal group — and the report's identity."""
+    """Scenario label as given (comma-joined for a group); the report's identity."""
     addresses: frozenset[str]
-    """The union over the members: everything in it is removed at once."""
     matches: list[extract.SolverMatch]
     members: tuple[GroupMember, ...]
-    """One entry per name the caller gave. The joint counterfactual attributes nothing
-    to them; they are kept so a member's absence from the analysed auctions can be
-    reported per member (`absent_members`)."""
+    """Only for `absent_members`; deltas are never attributed to members."""
     analysis: Analysis
     cow: CowConversion | None = None
-    """Native -> COW conversion of the reward deltas; `None` in surplus mode, where no
-    rewards exist to convert."""
     quote_substitutions: Mapping[str, Quote] = MappingProxyType({})
-    """`order_uid -> counterfactual quote`, cached off `quote.counterfactual_quotes` so
-    the auction loop does not rebuild it per auction."""
     quote: QuoteAnalysis | None = None
-    """The quote side of this scenario; `None` when the run had no quote pass, which is
-    the state a network without quote data is always in (Q-D10). Rule-independent — the
-    quote competition has no settlement — so the runs of one scenario under two outcome
-    rules share it."""
+    """Rule-independent (quotes have no settlement): shared across a scenario's rules."""
 
 
 def absent_members(solver_run: SolverRun) -> list[str]:
-    """Members of the scenario that bid in no clean analysed auction.
-
-    `resolve_solver` guarantees every member bid somewhere in the window, but
-    `--limit` can slice those auctions away and the price-suspect exclusion can eat
-    the rest. A report labelled "A,B" when B never influenced an analysed auction
-    would pass a single-solver result off as a joint finding, so the CLI treats a
-    non-empty return the way it treats an all-zero single-solver run: an error, not
-    a number."""
+    """Members that bid in no clean analysed auction; the CLI treats any as an error."""
     seen = solver_run.analysis.addresses_seen
     return [m.given for m in solver_run.members if not (m.addresses & seen)]
 
 
 @dataclass
 class WindowAnalysis:
-    """Everything one `analyse_window` call produced."""
-
     network: str
     start: str
     end: str
     auction_ids: list[int]
     runs: list[SolverRun]
     quote_window: QuoteWindow | None = None
-    """The quote competition over the same window, loaded once for every scenario;
-    `None` when the quote pass was off or the network has no quote data."""
     fast_path: list[int] = field(default_factory=list[int])
-    """Fast-path auctions, excluded before arbitration: there is no solver competition
-    in them to re-run. A property of the window as well."""
+    """Excluded before arbitration: no solver competition to re-run."""
 
 
 def analyse_window(
@@ -182,27 +137,10 @@ def analyse_window(
     quote_ranking: QuoteRanking = "effective-sell",
     log: Callable[[str], None] | None = None,
 ) -> WindowAnalysis:
-    """Remove each scenario's solvers from every auction in `[start, end)` and diff
-    the outcomes.
+    """Remove each scenario's solvers from every auction in `[start, end)` and diff.
 
-    Each `solvers` entry is one removal scenario: a single name/address, or several
-    separated by commas, which are removed **together** — one counterfactual with all
-    of them absent, whose deltas are never attributed to individual members (D25).
-    Overlapping scenarios are legitimate (`["Fractal", "Fractal,Sector"]` compares a
-    single removal with a joint one); only two entries resolving to the *same* address
-    set are rejected as a duplicate run, and one competitor may not appear twice
-    within one group.
-
-    One extraction serves every scenario **and every outcome rule**: the auction
-    bundles are solver- and rule-independent, so each is arbitrated once per
-    (scenario, rule) as it streams past. Extraction is nearly all of a run's cost, so
-    asking for the second rule costs minutes of arbitration, not a second pass over
-    the DB. Solvers are resolved before anything is extracted — a bad `--solver`
-    fails in seconds, not after five minutes.
-
-    Raises `extract.SolverResolutionError` when a solver does not resolve to exactly
-    one competitor that bid in the window, and `counterfactual.MissingSettlementError`
-    when the settlement source does not cover the window under the `inherited` rule.
+    Each `solvers` entry is one scenario; comma-separated names are removed jointly.
+    Overlapping scenarios are fine; identical address sets are rejected as duplicates.
     """
     if not outcome_rules:
         raise ValueError("outcome_rules must name at least one rule")
@@ -233,9 +171,7 @@ def analyse_window(
                     f"{match.winning_solutions} winning"
                 )
             if len(member_matches) > 1:
-                # A key rotation: the same competitor under two submission addresses.
-                # All of them have to go together, or reference scores would treat one
-                # half of the rotation as a rival of the other.
+                # Key rotation: removing only some addresses leaves the solver as its own rival.
                 emit(
                     f"note: {len(member_matches)} addresses resolved; removing all of "
                     f"them as one solver"
@@ -250,8 +186,6 @@ def analyse_window(
                 f"counterfactual, with nothing attributed to individual members"
             )
         for earlier_label, _, earlier_addresses, _ in resolved:
-            # Overlap is legitimate — removing A alone and {A,B} together are two
-            # different scenarios — but the same address set twice is the same run.
             if earlier_addresses == group_addresses:
                 raise extract.SolverResolutionError(
                     f"{label!r} and {earlier_label!r} resolve to the same removal "
@@ -293,9 +227,6 @@ def analyse_window(
     if not auction_ids:
         return window
 
-    # The quote side, loaded once for every scenario and every rule: the ladder and the
-    # order match are scenario-independent, exactly as the auction bundles are (D18).
-    # A network without quote data is refused here rather than silently reporting zeros.
     if with_quotes:
         if not ch.has_quote_data(network):
             raise ch.NoQuoteDataError(
@@ -358,13 +289,10 @@ def analyse_window(
             )
 
     for run in runs:
-        # The exclusion is a property of the window, not of the solver being removed.
         run.analysis.fast_path_auctions = list(window.fast_path)
 
     if mode == "score":
-        # One rate query for every run together: the rates are identical across
-        # solvers and rules, and the table behind them must be touched sparingly
-        # (see CONVERSION_RATES_SQL).
+        # One rate query for all runs; the table must be touched sparingly.
         rates = extract.load_conversion_rates(
             conn,
             sorted(
@@ -381,10 +309,7 @@ def analyse_window(
     return window
 
 
-# --- the report file ----------------------------------------------------------------
-# One JSON per (solver, window, rule), consumed by `loo compare` and the notebook via
-# `aggregate.load_report`. The payload is derived from the dataclasses, so a statistic
-# is named once — on its field or property — and the file follows.
+# --- the report file: one JSON per (scenario, window, rule), read by `aggregate.load_report`
 
 _FEE_PROPERTIES = (
     "delta_protocol_and_partner_fees",
@@ -417,8 +342,6 @@ _AUCTION_PROPERTIES = (
 
 
 def _fields_and_properties(obj: Any, properties: Sequence[str]) -> dict[str, Any]:
-    """Every field and the named properties, except fields declared
-    `metadata={"report": False}` — bookkeeping behind a reported count, not a result."""
     data = {
         f.name: getattr(obj, f.name)
         for f in fields(obj)
@@ -429,17 +352,9 @@ def _fields_and_properties(obj: Any, properties: Sequence[str]) -> dict[str, Any
 
 
 def _json_default(value: Any) -> Any:
-    """JSON encoding for the report's non-primitive values.
-
-    Decimals become strings (their exactness must survive the file); sets become
-    sorted lists; nested dataclasses (`SolverReward`, `OrderDiff`) become dicts.
-    Integers stay integers — JSON has no precision limit and every consumer of these
-    files is Python. Anything else is a bug, not a value to coerce.
-    """
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, frozenset | set):
-        # The cast restores the element type the isinstance check erased from `Any`.
         return sorted(cast("Iterable[Any]", value))
     if hasattr(value, "__dataclass_fields__"):
         return _fields_and_properties(value, ())
@@ -454,10 +369,6 @@ _QUOTE_PROPERTIES = (
 
 
 def _quote_payload(analysis: QuoteAnalysis) -> dict[str, Any]:
-    """One run's quote side, with the per-order diffs reduced to what a reader of the
-    file needs: the leaf, its weight and its bps. The counterfactual `Quote` itself is
-    dropped — it is an input to the fee path, not a result, and it is the one field that
-    would double the file."""
     data = {
         f.name: getattr(analysis, f.name)
         for f in fields(analysis)
@@ -482,8 +393,6 @@ def _quote_payload(analysis: QuoteAnalysis) -> dict[str, Any]:
 
 
 def _quote_window_payload(quote_window: QuoteWindow) -> dict[str, Any]:
-    """The window's quote metadata — shared by every scenario, so it says what the
-    quote side could see rather than what one solver did with it."""
     validation = quote_window.validation
     return {
         "ranking": quote_window.ranking,
@@ -530,12 +439,6 @@ def _quote_window_payload(quote_window: QuoteWindow) -> dict[str, Any]:
 
 
 def report_payload(window: WindowAnalysis, run: SolverRun) -> dict[str, Any]:
-    """The `analyse --out` payload for one run.
-
-    Keys are the `Analysis` and `AuctionCounterfactual` field and property names —
-    single-sourced from the dataclasses — plus the window metadata and format markers
-    `aggregate.load_report` verifies.
-    """
     analysis = run.analysis
     payload: dict[str, Any] = {
         "format": REPORT_FORMAT,

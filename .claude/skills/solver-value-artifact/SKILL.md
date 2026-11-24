@@ -97,7 +97,7 @@ uv run loo analyse --network mainnet \
   with ten chains gets ten rows, including the rows that came back zero. Silently
   dropping a chain overstates concentration. `--all-solvers` derives the list from the
   window instead of naming solvers by hand, which is also one query rather than one per
-  solver (D26).
+  solver.
 - **Both outcome rules**, always — they share the extraction pass, so only the arbitration
   repeats. Measured on a 26-solver mainnet month: **16.3 min for two rules against 11.9
   for one, 1.38x** — on a fast DB day; the absolute figures move 2x with the DB's

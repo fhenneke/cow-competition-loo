@@ -1,18 +1,6 @@
-"""Per-order surplus and per-solution totals, in native wei.
+"""Per-order surplus and per-solution valuation in native wei (`arbitrator.rs`).
 
-Mirrors the surplus half of `arbitrator.rs`. The fee half is `fees.py`, and passing a
-`FeeContext` here adds the per-order protocol-fee decomposition alongside surplus — the
-two are exactly additive, `surplus_native + fee_native == compute_order_score(order)`.
-
-Solution *totals* still come from `proposed_solutions.score` rather than from
-`surplus + fees`: the recorded score needs no reconstruction, and the fee path has a
-narrow coverage gap the score does not. What the fee decomposition *does* buy is the
-per-pair **score** split the fairness filter compares — `pair_score_split`, M14. Where
-that split cannot be determined the filter falls back to per-pair surplus, which is what
-it compared everywhere before.
-
-Integer arithmetic throughout, except where `fees.py` reproduces the Rust's own `f64`
-detours.
+Invariant: `surplus_native + fee_native == compute_order_score(order)` to the wei.
 """
 
 from __future__ import annotations
@@ -33,15 +21,7 @@ Mode = Literal["score", "surplus"]
 
 
 class ValuationError(Exception):
-    """A per-order valuation failed.
-
-    Mirrors `MathError` plus the missing-native-price case. In the Rust any such
-    failure discards the **whole solution**, not just the order (`arbitrator.rs:155`),
-    and callers here must do the same.
-
-    Overflow has no Python analogue — ints are unbounded — so only division-by-zero and
-    negative surplus can occur.
-    """
+    """Any order failing discards the whole solution (`arbitrator.rs:155`)."""
 
 
 @dataclass(frozen=True)
@@ -52,14 +32,13 @@ class Order:
     sell_token: str
     buy_token: str
     sell_amount: int
-    """Limit sell amount, from the original order."""
+    """Limit amount."""
     buy_amount: int
-    """Limit buy amount, from the original order."""
+    """Limit amount."""
     executed_sell: int
     executed_buy: int
     side: Side
     partially_fillable: bool = False
-    """Not used by the algorithm; carried for discrepancy triage."""
 
 
 @dataclass(frozen=True)
@@ -69,23 +48,15 @@ class ClearingPrices:
 
 
 def custom_prices_from_executed(order: Order) -> ClearingPrices:
-    """`arbitrator.rs:505`. The swap is in the Rust and is not a typo: the price *of*
-    the sell token is expressed in buy-token units."""
+    """`arbitrator.rs:505`. The swap is deliberate, as in the Rust."""
     return ClearingPrices(sell=order.executed_buy, buy=order.executed_sell)
 
 
 def surplus_over(
     order: Order, prices: ClearingPrices, limit_sell: int, limit_buy: int
 ) -> int:
-    """Surplus in the surplus token over arbitrary price limits (`arbitrator.rs:337`).
-
-    Limits are scaled by the executed amount so partial fills work. The sell side uses
-    **ceiling** division on both the scaled limit and the bought amount; the buy side
-    floors. That asymmetry is the expected source of off-by-one differences.
-
-    Raises `ValuationError` when the result would be negative — the Rust's
-    `MathError::Negative`, which propagates up and discards the solution.
-    """
+    """Surplus in the surplus token (`arbitrator.rs:337`). Sell side ceils, buy side
+    floors; negative raises `ValuationError`."""
     executed = order.executed_buy if order.side == "buy" else order.executed_sell
 
     if order.side == "buy":
@@ -116,21 +87,13 @@ def surplus_over_limit_price(order: Order, prices: ClearingPrices) -> int:
 
 
 def order_surplus(order: Order) -> int:
-    """User surplus in the surplus token: buy token for sell orders, sell token for buy
-    orders. Excludes protocol fees — this is the same quantity as
-    `int_backend_data__proposed_solution_data.order_surplus_atoms_in_surplus_token`."""
+    """User surplus in atoms of the surplus token (buy token for sells, sell token for buys)."""
     return surplus_over_limit_price(order, custom_prices_from_executed(order))
 
 
 def to_native(order: Order, amount_in_surplus_token: int, native_prices: dict[str, int]) -> int:
-    """Convert a surplus-token amount to native, following `compute_order_score`
-    (`arbitrator.rs:208`).
-
-    Sell orders are already denominated in the buy token. Buy orders are denominated in
-    the sell token and are converted through the order's own limit ratio
-    (`buy_amount / sell_amount`) before the native conversion — which is why buy orders
-    need limit amounts and sell orders do not.
-    """
+    """Surplus-token atoms to native wei (`arbitrator.rs:208`); buy orders go through
+    their limit ratio first."""
     price = native_prices.get(order.buy_token)
     if price is None:
         raise ValuationError(f"order {order.uid}: missing native price for buy token")
@@ -145,22 +108,12 @@ def to_native(order: Order, amount_in_surplus_token: int, native_prices: dict[st
 
 
 def order_surplus_native(order: Order, native_prices: dict[str, int]) -> int:
-    """Per-order user surplus in native wei.
-
-    This is `compute_order_score` with the protocol fee term set to 0.
-    """
     return to_native(order, order_surplus(order), native_prices)
 
 
 def order_volume_native(order: Order, native_prices: dict[str, int]) -> int:
-    """Native value of the order's received leg: `executed_buy` at the buy-token price.
-
-    The denominator for relative price statements (Δsurplus / volume). Deliberately
-    valued through the same buy-token price `to_native` puts into the numerator, so the
-    per-order ratio is exact even when that native price is wrong — a wrong price scales
-    surplus and volume equally and cancels. Only the weighting *across* orders still
-    trusts the price level, and price-suspect auctions are excluded upstream anyway.
-    """
+    """`executed_buy` in native wei, at the same buy-token price as the surplus, so a
+    wrong price cancels in surplus/volume."""
     price = native_prices.get(order.buy_token)
     if price is None:
         raise ValuationError(f"order {order.uid}: missing native price for buy token")
@@ -169,37 +122,21 @@ def order_volume_native(order: Order, native_prices: dict[str, int]) -> int:
 
 @dataclass(frozen=True)
 class SolutionValuation:
-    """Surplus decomposition of one solution."""
-
     pair_surplus: dict[Pair, int]
-    """Native surplus per **raw** directed token pair."""
+    """Keyed by raw directed pair."""
     order_surplus_native: dict[str, int]
-    """Native surplus per order."""
     winner_pairs: frozenset[Pair]
-    """`as_erc20`-normalised pairs of the same orders — what `pick_winners` claims."""
+    """`as_erc20`-normalised: what `pick_winners` claims."""
     order_uids: frozenset[str]
     order_volume_native: dict[str, int] = field(default_factory=dict[str, int])
-    """Native value of each order's received leg — the denominator for
-    relative price statements. Same keys as `order_surplus_native`."""
     order_fee_native: dict[str, int] = field(default_factory=dict[str, int])
-    """Native protocol fee per order, **including** partner fees — the
-    quantity `arbitrator.rs` adds to surplus to reach the score. Absent for orders whose
-    policies are not recorded for this auction; those uids are in `fees_unknown`."""
+    """Protocol fee including partner fees; orders in `fees_unknown` are absent."""
     order_partner_fee_native: dict[str, int] = field(default_factory=dict[str, int])
-    """The partners' share of `order_fee_native`. What the DAO keeps is the difference,
-    which is non-negative because the native conversion is monotone."""
     pair_fee_native: dict[Pair, int] = field(default_factory=dict[Pair, int])
-    """Native protocol fee per **raw** directed token pair, over the orders
-    whose fee could be computed. `pair_surplus + pair_fee_native` is the pair's score —
-    on the pairs not in `pairs_fees_unknown`."""
+    """Short by an unknown amount on `pairs_fees_unknown`."""
     pairs_fees_unknown: frozenset[Pair] = frozenset()
-    """Pairs carrying at least one order with an unrecorded fee, so
-    `pair_fee_native` is short for them by an unknown amount. Derived from
-    `fees_unknown`; kept separately because the filter works per pair, not per order."""
     fees_unknown: frozenset[str] = frozenset()
-    """Orders whose fee could not be computed — their policies are not
-    recorded for this auction. Every order of a solution the arbitrator *kept* is
-    recorded, so this is only ever non-empty for solutions that were filtered out."""
+    """Orders with no recorded policies; empty for every solution the arbitrator kept."""
 
     @property
     def total(self) -> int:
@@ -207,7 +144,6 @@ class SolutionValuation:
 
     @property
     def fee_native(self) -> int:
-        """Total protocol fee of the solution, partner fees included."""
         return sum(self.order_fee_native.values())
 
     @property
@@ -225,20 +161,10 @@ def value_solution(
     weth: str,
     fee_context: FeeContext = EMPTY_FEE_CONTEXT,
 ) -> SolutionValuation:
-    """Value one solution (`score_by_token_pair`, `arbitrator.rs:176`).
+    """`score_by_token_pair`, `arbitrator.rs:176`.
 
-    `orders` are the auction's orders the solution trades. JIT orders never reach here
-    (`extract.EXECUTIONS_SQL`): the mechanism gives them no score and no pair claim.
-
-    `fee_context` is optional: with the default every fee reads as unrecorded, and the
-    valuation is the surplus-only one this module has always produced. Passing a real
-    one adds the protocol-fee decomposition without changing any surplus number.
-
-    Raises `ValuationError` if any order cannot be valued; the caller must
-    then discard the entire solution. A fee that cannot be computed is **not** such a
-    failure — `arbitrator.rs` would have discarded the solution, but here the total comes
-    from the recorded score either way, so the order is recorded in `fees_unknown` and
-    the surplus side stays intact.
+    Raises `ValuationError`; the caller must discard the whole solution. An
+    uncomputable fee is not an error: the order goes to `fees_unknown`.
     """
     pair_surplus: dict[Pair, int] = {}
     native: dict[str, int] = {}
@@ -273,16 +199,8 @@ def value_solution(
             fees_unknown.add(order.uid)
             pairs_fees_unknown.add(pair)
         else:
-            # Each share is converted as a *difference of conversions* rather than on
-            # its own, so the decomposition is exactly additive:
-            #
-            #     surplus_native + fee_native == compute_order_score(order)
-            #
-            # to the wei, and `0 <= dao <= fee` follows from `to_native` being monotone.
-            # Converting the fee directly instead loses up to one surplus-token atom per
-            # order to the intermediate floor in `to_native` — on a six-decimal token
-            # that is ~5e8 wei, small but not nothing, and it would put a systematic
-            # gap between this decomposition and the recorded score.
+            # Convert as differences of conversions, so surplus + fee equals the score to
+            # the wei and 0 <= dao <= fee (to_native is monotone but floors).
             score_native = to_native(order, surplus_atoms + split.total, native_prices)
             protocol_native = (
                 to_native(order, surplus_atoms + split.protocol, native_prices) - surplus_native
@@ -306,57 +224,22 @@ def value_solution(
 
 
 class PairScores(NamedTuple):
-    """The outcome of splitting one solution's score across its pairs."""
-
     pairs: dict[Pair, int]
-    """Score per pair, for the pairs where it is known. Possibly empty, possibly partial."""
+    """Possibly partial."""
     anchor_failed: bool
-    """The recomputation contradicted the recorded score, so nothing was trusted. A
-    different thing entirely from a pair's policies being unrecorded, and reported
-    separately: this one says the fee path is wrong here, and if it ever becomes common on
-    some chain it must not read as that chain having thin fee coverage."""
+    """Recomputation contradicted the recorded score; distinct from unrecorded fees."""
 
 
 def pair_score_split(valuation: SolutionValuation, db_score: int) -> PairScores:
-    """The solution's score per directed token pair, for the pairs where it is known.
+    """Per-pair score (`arbitrator.rs:176`), anchored to the recorded `db_score`.
 
-    This is the quantity the fairness filter compares (`score_by_token_pair`,
-    `arbitrator.rs:176`), and the one thing the DB does not record: scores are stored per
-    solution. Recomputing protocol fees supplies it — a pair's score is its user surplus
-    plus the fees of the orders on it — and the recorded score anchors it, so what comes
-    back is never a reconstruction floating free of the record.
-
-    The result is **partial by design**. The fairness test is a conjunction of independent
-    per-pair comparisons, so a pair needs an exact score only if it has a baseline to
-    clear; knowing three pairs out of four is worth exactly as much as knowing four when
-    the fourth has no baseline. Returning what is known, pair by pair, lets the filter
-    decide each comparison as well as it can (`winner_selection.is_fair`) instead of
-    discarding a decidable solution because some unrelated pair is dark.
-
-    How each pair lands, in order of how much it leans on the recomputation:
-
-    1. **One pair in the solution.** The whole score sits on it. Exact from the record
-       alone, no fee needed. (Baselines do not come through here — they read `total`
-       directly, `winner_selection.compute_baseline_scores` — so this case only keeps the
-       `sum(pairs) == db_score` invariant true for every solution.)
-    2. **A priced pair.** `surplus + fee`, both of which are the protocol's own
-       per-order quantities. Where *every* pair is priced the sum must return the
-       recorded score to the wei; it does for every solution the arbitrator kept, whose
-       orders' policies are all recorded by construction (M12/M13).
-    3. **The last unpriced pair.** With exactly one pair dark the residual
-       `db_score - sum(priced pairs)` is its score exactly.
-
-    Every branch is checked against the record, and every check fails the same way — an
-    `anchor_failed` result with no pairs at all, because a solution whose arithmetic
-    contradicts its recorded score has no trustworthy pair in it. Protocol fees are
-    non-negative, so each check is some form of "the parts cannot exceed the whole, and no
-    part can fall below its own surplus".
+    Partial by design: the filter is per pair, so dark pairs fall back individually.
+    One pair gets `db_score`; priced pairs get surplus + fee; a single dark pair gets the
+    residual. Any contradiction with `db_score` returns no pairs and `anchor_failed`.
     """
     pairs = valuation.pair_surplus
     if len(pairs) <= 1:
-        # Cheap, but not free: a single pair whose surplus already exceeds the recorded
-        # score means our order set disagrees with the autopilot's, and this
-        # is the one branch with an invariant to check rather than an arithmetic one.
+        # Surplus above the recorded score: our order set disagrees with the autopilot's.
         if any(surplus > db_score for surplus in pairs.values()):
             return PairScores({}, anchor_failed=True)
         return PairScores({pair: db_score for pair in pairs}, anchor_failed=False)
@@ -374,9 +257,7 @@ def pair_score_split(valuation: SolutionValuation, db_score: int) -> PairScores:
             return PairScores({}, anchor_failed=True)
         return PairScores(priced, anchor_failed=False)
 
-    # Fees are non-negative, so the priced pairs plus the dark pairs' own surplus cannot
-    # exceed the recorded total. This is the residual bound with every dark pair held at
-    # its floor, and it is the only check available once more than one pair is dark.
+    # Fees >= 0, so priced pairs plus dark pairs' surplus cannot exceed the record.
     dark_floor = sum(pairs[pair] for pair in unknown)
     if priced_total + dark_floor > db_score:
         return PairScores({}, anchor_failed=True)
@@ -388,15 +269,7 @@ def pair_score_split(valuation: SolutionValuation, db_score: int) -> PairScores:
 
 
 def solution_total(valuation: SolutionValuation, mode: Mode, db_score: int | None = None) -> int:
-    """The value that ranks a solution and feeds reference scores.
-
-    Score mode takes it from `proposed_solutions.score`, so protocol fees are included
-    without having to be recomputed. Surplus mode sums the surplus decomposition instead,
-    answering the user-value question self-consistently.
-
-    The per-pair values the fairness filter compares are `pair_score_split` in score
-    mode and `valuation.pair_surplus` in surplus mode — see `build_solutions`.
-    """
+    """Score mode: the recorded `proposed_solutions.score`. Surplus mode: summed surplus."""
     if mode == "surplus":
         return valuation.total
     if db_score is None:
@@ -406,8 +279,6 @@ def solution_total(valuation: SolutionValuation, mode: Mode, db_score: int | Non
 
 @dataclass(frozen=True)
 class ValuedBid:
-    """A bid, its valuation, and the `Solution` the arbitrator sees."""
-
     bid: Bid
     solution: Solution
     valuation: SolutionValuation
@@ -421,17 +292,10 @@ def build_solutions(
     mode: Mode = "score",
     fee_context: FeeContext = EMPTY_FEE_CONTEXT,
 ) -> tuple[list[ValuedBid], dict[int, str]]:
-    """Value every bid in an auction, in `bid` order.
+    """Value every bid; failures are left out, as in the Rust, and returned by uid.
 
-    Returns the valued bids and the per-uid valuation failures. A bid whose valuation
-    fails is left out entirely, which is what the Rust does (`compute_scores_by_solution`
-    discards the whole solution when any of its orders cannot be scored). Because
-    the DB only ever stores solutions whose score computation succeeded, any failure
-    here is a defect in this reproduction rather than a property of the data, and every
-    caller reports rather than swallows it.
-
-    Bids arrive in `uid` order, which is best-to-worst, so ties in `total` break the way
-    the autopilot recorded them — see docs/analytics-db.md.
+    The DB stores only solutions that scored, so a failure is a defect here, never data.
+    Bids must arrive in uid order, the arbitrator's tie-break.
     """
     valued: list[ValuedBid] = []
     failures: dict[int, str] = {}
@@ -444,10 +308,7 @@ def build_solutions(
             failures[bid.uid] = str(error)
             continue
 
-        # Surplus mode deliberately gets no score split: its whole point is to answer
-        # the user-value question in one currency, and a filter comparing scores inside
-        # a surplus ranking would be neither of the two answers. An empty map leaves
-        # every pair on the surplus scale, which is that answer.
+        # Surplus mode keeps every pair on the surplus scale: one currency throughout.
         scores = (
             pair_score_split(valuation, bid.score)
             if mode == "score"

@@ -1,87 +1,45 @@
 # Analytics DB — connection, tables, join keys
 
-Reference context. The concrete work is in [../PLAN.md](../PLAN.md).
-
 ## Connecting
 
-`.env` holds `ANALYTICS_DB_URL` in the form `user:password@host:port` — **no URL
-scheme and no database name**. `psycopg2.connect(url)` fails on it; parse it and pass
-`dbname` explicitly.
+`.env` holds `ANALYTICS_DB_URL` as `user:password@host:port`: **no scheme, no database
+name**, so `psycopg2.connect(url)` fails on it. Use `loo.db.connect(network)`, which parses
+it, picks `prod_<network>`, pins the session to UTC and adds the guards below. Ad-hoc
+scripts run under `uv run --with psycopg2-binary` (no `psql` on the machine). The user is
+`<db-user>`, read-only.
 
-There is no `psql` on this machine and `psycopg2` is not in the system Python. Use `uv`:
-
-```bash
-uv run --with psycopg2-binary python your_script.py
-```
-
-```python
-import os, psycopg2
-from dotenv import load_dotenv
-
-load_dotenv()
-creds, hostport = os.environ["ANALYTICS_DB_URL"].split("@")
-user, password = creds.split(":", 1)
-host, port = hostport.split(":")
-
-conn = psycopg2.connect(
-    host=host, port=port, user=user, password=password,
-    dbname="prod_mainnet",       # required — not in the URL
-    connect_timeout=20,
-)
-```
-
-The user is `<db-user>`. Treat the DB as read-only.
-
-`loo.db.connect(network)` does the parsing and adds the two guards below; ad-hoc scripts
-get them by calling it instead of the snippet above.
+The session timezone is pinned because the quote side compares Postgres
+`creation_timestamp` (rendered in the session's zone) with ClickHouse UTC timestamps
+inside windows of minutes; an inherited zone or a `PGTZ` would empty every match silently.
 
 ### Dead connections and long statements
 
 psycopg2 sets no read timeout and libpq no keepalives, so a query whose connection dies
-under it waits forever. After a sleep the client's kernel still holds the socket as
-ESTABLISHED while the server dropped the session long ago. A `loo analyse` sat 7.5 hours
-that way on 2026-10-22, at 0.6 s of CPU and with an empty log. `connect()` now sets:
+waits forever (a run sat 7.5 hours that way on 2026-10-22). `connect()` sets:
 
-- **TCP keepalives**: 60 s idle, then 6 probes 10 s apart, so a dead peer raises about
-  two minutes after the line goes quiet. A live server's kernel answers the probes
-  however long its query runs, so slow is never taken for dead: a `pg_sleep(130)`
-  returned normally through two probe rounds. With the server unplugged mid-query (two
-  Linux containers), a client with these settings raised about 100 s after the line went
-  silent, and one without them was still blocked 450 s later. `tcp_user_timeout=120000`
-  covers data sent and never acknowledged, on Linux only. libpq accepts it on macOS but
-  skips it, because the socket option does not exist there; the kernel's retransmission
-  limit gives up after minutes instead.
-- **`statement_timeout = 30min`**. The server default is `0`, no limit. The slowest
-  statement measured on the default analyse path is the quote side's `ORDERS_SQL`, which
-  grows with the window: 81 s for 310,567 rows over mainnet 2026-08-01..10-20, measured
-  2026-10-22. On the same window the session's first `SOLVER_SQL` took 23 s cold, and
-  every chunked extraction query (200 auctions) took at most 0.6 s. Not timed: the
-  `--quote-ranking autopilot` token-price median, which runs over every auction in the
-  window at once.
+- **TCP keepalives**: 60 s idle, then 6 probes 10 s apart, so a dead peer raises about two
+  minutes after the line goes quiet. A live server answers the probes however long its
+  query runs, so slow is never taken for dead. `tcp_user_timeout=120000` covers
+  unacknowledged sends on Linux only; macOS accepts and ignores it.
+- **`statement_timeout = 30min`** (server default: none). The slowest statement measured
+  on the default path is the quote side's `ORDERS_SQL`, 81 s for 310,567 rows over mainnet
+  2026-08-01..10-20 (measured 2026-10-22); chunked extraction queries take under a second.
 
-`fetch` and `run` re-raise the failures as `loo.db.ConnectionLostError` and
-`loo.db.StatementTimeoutError` instead of the `OperationalError` psycopg2 uses for both.
-The test for a lost connection is `conn.closed`, not the message, whose wording depends
-on SSL and the OS. The CLI prints the cause and exits 6.
+`fetch` and `run` re-raise these as `db.ConnectionLostError` / `db.StatementTimeoutError`
+(tested via `conn.closed`, not the message), and the CLI exits 6.
 
-The server's own settings bear on this. `tcp_keepalives_idle=300`,
-`tcp_keepalives_interval=30` and `tcp_keepalives_count=2` mean it drops a client that has
-been silent for about six minutes, which is exactly what a sleeping laptop is. So a run
-that sleeps longer than that is lost either way; the client-side keepalives only make
-it fail fast instead of hang. `idle_in_transaction_session_timeout=1d`: a run's read
-transaction stays open through the hours of ClickHouse work on the quote side and is
-well inside that.
+The server drops a client silent for about six minutes (`tcp_keepalives_idle=300`,
+`interval=30`, `count=2`) — a sleeping laptop — so such a run is lost either way; the
+client keepalives only make it fail fast. `idle_in_transaction_session_timeout=1d`
+comfortably covers a read transaction held open through hours of ClickHouse work.
 
 ## Databases and schema
 
-**One database per network.** Models live in schema `dbt` in each.
-
-`prod_mainnet`, `prod_xdai`, `prod_base`, `prod_arbitrum-one`, `prod_avalanche`,
-`prod_polygon`, `prod_bnb`, `prod_ink`, `prod_linea`, `prod_plasma`, `prod_lens`,
-`prod_sepolia` — each with a `staging_*` counterpart.
-
-`prod_mainnet` also carries personal dev schemas (`felix`, `bram`, `nitish`, …) and
-`dbt_staging`. Use `dbt` unless you have a reason not to.
+One database per network, models in schema `dbt`: `prod_mainnet`, `prod_xdai`,
+`prod_base`, `prod_arbitrum-one`, `prod_avalanche`, `prod_polygon`, `prod_bnb`,
+`prod_ink`, `prod_linea`, `prod_plasma`, `prod_lens` (stopped 2026-03-03), `prod_sepolia`,
+each with a `staging_*` counterpart. Raw backend tables are mirrored in
+`raw_prod_<network>`. `prod_mainnet` also has personal dev schemas; use `dbt`.
 
 ## Tables
 
@@ -89,255 +47,162 @@ Bids and their executions:
 
 | Table | Grain | Notes |
 | --- | --- | --- |
-| `stg_backend_data__proposed_solutions` | solution | `auction_id, uid, id, solver, score, is_winner, filtered_out` |
+| `stg_backend_data__proposed_solutions` | solution | `auction_id, uid, id, solver, score, is_winner, filtered_out`; indexed on `(auction_id, uid)` only |
 | `stg_backend_data__proposed_trade_executions` | solution × order | `auction_id, solution_uid, order_uid, executed_sell, executed_buy` |
-| `int_backend_data__proposed_solution_data` | solution × order | the two above joined, plus `sell_token, buy_token, bid_score, is_winner, winning_score, order_surplus_atoms_in_surplus_token` |
+| `int_backend_data__proposed_solution_data` | solution × order | the two joined, plus tokens, `bid_score`, `order_surplus_atoms_in_surplus_token`; **lags**, no `filtered_out` ([below](#coverage-and-lag)) |
 
 Auction context:
 
 | Table | Notes |
 | --- | --- |
-| `stg_backend_data__competition_auctions` | `order_uids` (array — auction membership), `surplus_capturing_jit_order_owners` (empty since the CoW AMMs were retired; not read), `block_number`, `block_deadline`, `penalty_caps_native`, `fast_path_quote_id` (non-NULL marks a [fast-path auction](winner-selection.md#fast-path-auctions-are-excluded)) |
-| `stg_backend_data__competition_auctions` `price_tokens`, `price_values` | parallel arrays: the auction's native prices. **NULL before 2026-09-15** ([source rules](#native-prices-the-competition_auctions-arrays)) |
-| `stg_backend_data__auction_prices` | **dropped on 2026-11-05** on every network (cow-dagster sqitch migration 24). It was the only copy of prices before 2026-07-30 |
-| `stg_backend_data__orders` | `uid, owner, kind` (buy/sell), `sell_token, buy_token, sell_amount, buy_amount`, `partially_fillable`, `app_data`, `signing_scheme`, `creation_timestamp, valid_to`. **No order class column** — market vs limit is not stored here |
-| `stg_backend_data__app_data` | `contract_app_data → app_code, partner_fee_recipients`, joined on `orders.app_data` ([who placed an order](#who-placed-an-order-app-code-owner-token-symbols)) |
-| `stg_backend_data__jit_orders` | same shape for JIT orders. **Not read by `loo`**: JIT orders are left out at extraction ([why](winner-selection.md#loo-replays-the-current-mechanism-only)) |
-| `stg_backend_data__fee_policies` | `(auction_id, order_uid, application_order) → kind, factors`, and `origin` (`protocol` / `partner`) from auction 14230909 on mainnet (2026-11-12), NULL before |
+| `stg_backend_data__competition_auctions` | `order_uids` (auction membership), `price_tokens`/`price_values` ([prices](#native-prices-the-competition_auctions-arrays)), `penalty_caps_native` (parallel to `order_uids`), `block_number`, `block_deadline`, `surplus_capturing_jit_order_owners` (empty; not read), `fast_path_quote_id` ([fast path](winner-selection.md#fast-path-auctions-are-excluded)) |
+| `stg_backend_data__orders` | `uid, owner, kind, sell_token, buy_token, sell_amount, buy_amount, partially_fillable, app_data, signing_scheme, creation_timestamp, valid_to`. No order-class column |
+| `stg_backend_data__app_data` | `contract_app_data → app_code, partner_fee_recipients`, joined on `orders.app_data` |
+| `stg_backend_data__fee_policies` | `(auction_id, order_uid, application_order) → kind, factors`; `origin` (`protocol`/`partner`) from mainnet auction 14230909 (2026-11-12), NULL before |
+| `stg_backend_data__jit_orders` | JIT orders, recorded only when their batch settles. Not read by `loo` |
+| `stg_backend_data__auction_prices` | **dropped 2026-11-05** (cow-dagster sqitch migration 24) |
 
 Outcomes and ground truth:
 
 | Table | Notes |
 | --- | --- |
-| `stg_backend_data__reference_scores` | `(auction_id, solver) → reference_score` — winners only |
-| `int_backend_data__solution_data` | **winning solutions only**: `score, reference_score, is_settled_in_time, upper_reward_cap, lower_reward_cap, penalty_cap_native, is_excluded, block_deadline`. `lower_reward_cap` is the *flat* floor; since CIP-87 the applied one is built in the mart from `penalty_cap_native` (NULL = no cap, 0 = a cap of 0) — [rewards.md](rewards.md#since-2026-09-08-the-lower-cap-is-per-order-cip-87) |
-| `fct_solver_rewards_per_auction` | `competition_score, observed_score, reference_score, uncapped_reward, batch_reward_native, upper_reward_cap, lower_reward_cap` — the last NULL on rows built before it was added (the August 2026 rows) |
-| `pre_stg__orders_per_auction_with_at_least_one_bid` | `(auction_id, block_deadline, order_uid)` — the canonical auction list |
+| `stg_backend_data__reference_scores` | `(auction_id, solver) → reference_score`, winners only |
+| `int_backend_data__solution_data` | winning solutions only: `score, reference_score, is_settled_in_time, upper_reward_cap, lower_reward_cap` (the *flat* floor, see [rewards](rewards.md#since-2026-09-08-the-lower-cap-is-per-order-cip-87)), `penalty_cap_native, is_excluded, block_deadline` |
+| `fct_solver_rewards_per_auction` | `competition_score, observed_score, reference_score, uncapped_reward, batch_reward_native, upper_reward_cap, lower_reward_cap` (NULL on rows built before the column existed) |
+| `pre_stg__orders_per_auction_with_at_least_one_bid` | `(auction_id, block_deadline, order_uid)` — the auction universe the reward models use |
 | `stg_rpc_data__block_timestamp` | `block_number → time` |
-| `dune_data__cow_protocol__solvers` | `address ↔ name`, `active`, `environment` |
+| `dune_data__cow_protocol__solvers` | `address ↔ name, active, environment` ([traps](#resolving-a-solver-name)) |
 | `reward_config` | per-network caps, `service_fee_factor`, reward token |
+
+Settlement tables are under [observed outcomes](#observed-outcomes-what-actually-settled).
+Auction ids are sparse but monotone.
 
 ## Join keys
 
 **`proposed_trade_executions.solution_uid` joins `proposed_solutions.uid`, not `.id`.**
+`uid` is a per-auction 0-based index, `id` the solver's own id; they collide for a
+minority of rows, so the wrong join returns plausible data for part of an auction and
+nothing for the rest (auction 13509867: uid 2 / id 11 matched by coincidence).
 
-`uid` is a per-auction 0-based index; `id` is the solver's own solution id. They collide
-for a minority of rows, so joining on `id` returns plausible data for part of an auction
-and nothing for the rest — a silent, partial failure. Verified on auction `13509867`:
-
-```
-uid | id      | rows matched via uid | via id
-0   | 3295600 | 1                    | 0
-2   | 11      | 1                    | 1     <- coincidental collision
-```
-
-Other joins are unsurprising: `orders.uid = order_uid`, prices on
-`(auction_id, token)` once unnested, `reference_scores` on `(auction_id, solver)`. Addresses and uids
-are `bytea` — compare with `decode(...,'hex')` or `\x…` literals, and render with
-`encode(col,'hex')`.
+Otherwise: `orders.uid = order_uid`; prices on `(auction_id, token)` once unnested;
+`reference_scores` on `(auction_id, solver)`. Addresses and uids are `bytea` — compare
+with `decode(…, 'hex')` or `\x…` literals.
 
 ## `proposed_solutions.uid` encodes the ranking
 
-`uid` is not an arbitrary index. The autopilot assigns it **best to worst**
-(`services/crates/database/src/solver_competition_v2.rs:147`, "uids get assigned from
-best to worst"), so ordering by `uid` reproduces the arbitrator's own output order:
+The autopilot assigns `uid` **best to worst** (`crates/database/src/solver_competition_v2.rs`,
+"uids get assigned from best to worst"), so `uid` order is the arbitrator's output order:
 
 ```
 [winners, by descending score] ++ [non-winners, by descending score] ++ [filtered_out]
 ```
 
-Verified over 2,531 solutions (auctions 13509000–13509867): `uid` order matches that
-ordering for every row, and filtered-out solutions come after every kept one in all 299
-auctions that had any.
+Verified on 2,531 solutions (auctions 13509000–13509867). It is the only record of the
+autopilot's tie-breaks — bids are shuffled before the sort, and 54 auctions in that range
+had two equal non-zero scores — so `loo` extracts solutions in `uid` order and every sort
+after that is stable. The order is also not plain score order, and reference scores
+depend on it ([why](winner-selection.md#ranked-order-is-load-bearing)).
 
-Two consequences worth having:
+## Native prices: the competition_auctions arrays
 
-- The recorded order is the only surviving record of the autopilot's tie-breaks. It
-  shuffles bids before sorting by score (`run_loop.rs:636`), so equal scores are split
-  randomly; feeding solutions in `uid` order is the only way to reproduce it. 54 auctions
-  in that same range had two solutions with identical non-zero scores.
-- The `ranked` ordering is *not* plain score order, and reference scores depend on it —
-  see [winner-selection.md](winner-selection.md#ranked-order-is-load-bearing).
+A price converts atoms to native wei as `native = amount * price / 1e18` (`price_in_eth`,
+`crates/winner-selection/src/primitives.rs`). Prices are per auction and come **only**
+from the parallel `price_tokens` / `price_values` arrays of
+`stg_backend_data__competition_auctions`, read through `extract.fetch_prices`.
 
-Also note that solutions dropped by the arbitrator never reach the table: there are no
-rows with `score = 0` or `score is null` (checked over auctions 13505000–13509867), which
-is consistent with `arbitrator.rs:72` discarding zero-score solutions before ranking.
-Every stored row therefore had a *successful* score computation — so a valuation that
-fails while reproducing one is a bug in the reproduction, not a property of the data.
-
-## Native prices
-
-A price converts a token amount to the native token as
-
-```
-native_amount = token_amount * price / 1e18
-```
-
-matching `price_in_eth` (`services/crates/winner-selection/src/primitives.rs:20`). Prices
-are per auction; there is no global price table. They are read from the
-[`competition_auctions` arrays](#native-prices-the-competition_auctions-arrays).
+- The staging arrays are populated from **2026-09-15 00:00 UTC** on every network (linea,
+  plasma and ink within 90 minutes of it) and NULL before; an auction with bids and NULL
+  arrays raises `MissingPricesError`. `raw_prod_<net>.competition_auctions` has them from
+  2026-07-30 (measured 2026-11-23); prices before that exist nowhere in the DB.
+- No array repeats a token, has a length mismatch or a NULL element. While the legacy
+  table existed the two sources agreed to the wei on 780,240 of 780,240 sampled prices.
+- The row is wide, so unnesting costs more than an index lookup: +0.25 s per 200-auction
+  `PRICES_SQL` chunk, and 57 s for the quote side's window-wide median
+  (`quotes.TOKEN_PRICES_SQL`) over a week (mainnet, cold, September 2026).
+- **Do not use `int_backend_data__auction_prices`** instead: it holds only tokens of
+  *settled* trades, so losing bids, unsettled winners and untraded stablecoins have no
+  price there.
 
 ## Native prices can be plain wrong
 
-`auction_prices` values can be off by orders of magnitude, and everything denominated
-in native — score, surplus, reference scores, rewards — is fabricated with them.
-Found on the 2026-08-01..04 window: token `050362ab1072cb2ce74d74770e22a3203ad04ee5`
-was priced **~15,300× too high for essentially the whole window** (7,747 auctions:
-median price 6.51e21 — the *wrong* value — with the plausible 4.25e17 appearing only
-occasionally). Selling 1,500 USDC (≈0.80 ETH) for it produced recorded scores of
-**~139 ETH**; the window's five largest winning scores were all this one token, and
-they dominated every whale-sensitive number in M2 and M3 before being caught.
+A native price can be off by orders of magnitude, and everything denominated in native —
+score, surplus, reference scores, rewards — is fabricated with it. On mainnet
+2026-08-01..04 one token was priced ~15,300x too high in nearly every auction (the wrong
+value *was* the median), turning a 0.80 ETH trade into a recorded score of ~139 ETH; the
+window's five largest winning scores were all that token.
 
-Two lessons on detection:
-
-- **Value each trade through both tokens and compare.** `executed_sell ×
-  price(sell_token)` and `executed_buy × price(buy_token)` describe the same trade, so
-  they must roughly agree — measured healthy winners sit within 1.04×, while the
-  artefacts were 14,000× apart. This is `counterfactual.price_imbalanced`
-  (threshold 2×), and every `analyse` headline is reported with and without the
-  flagged auctions.
-- **A cross-auction median or spike check does not work here**: the wrong price was
-  the persistent one, so the median *is* the error. Only the counterparty token inside
-  the same trade anchors reality.
-
-The check needs both tokens' prices, so `PRICES_SQL` loads sell tokens too even though
-the valuation itself converts through the buy token only.
+- **Value each trade through both tokens.** `executed_sell × price(sell)` and
+  `executed_buy × price(buy)` describe the same trade; healthy winners agree within
+  1.04x. `counterfactual.price_imbalanced` flags a >2x disagreement, and `analyse`
+  excludes such an auction **from every statistic** and names it
+  (`--include-price-suspects` keeps them). The 2x threshold separates 1.04x from
+  14,000x, not signal from noise, and suspect auctions can carry most of a solver's
+  apparent Δsurplus (82% of Sector's over 2026-08-01..04, all fabricated).
+- **A cross-auction median or spike check does not work**: the persistent price is the
+  wrong one. Only the counterparty token inside the same trade anchors reality, which is
+  why sell-token prices are loaded although valuation converts through the buy token.
+- **The check misses a pair whose two tokens are mispriced by the same factor** (bnb
+  2026-09-22/23 produced 1e8-BNB deltas that way), and any error under 2x. Scan a run's
+  valued volume for absurd figures before quoting it. The quote side has the same hole
+  ([quotes](quotes.md#two-price-checks-both-at-the-orders-own-auctions)).
 
 ### The accounting path corrects these prices; the scoring path must not
 
-The payout side does **not** read `auction_prices` raw. `int_backend_data__price_data`
-overlays a curated table first:
+`int_backend_data__price_data` overlays `stg_auction_prices_corrections`
+(`coalesce(apc.price, ap.price)`), and everything downstream inherits it: the DB's
+`protocol_fee_native` and `partner_fee_native` are **corrected**, while the score the
+competition was decided on is not.
 
-```sql
-coalesce(apc.price, ap.price) as price
-from auction_prices ap
-left join stg_auction_prices_corrections apc using (auction_id, token)
-```
+- **Scoring, filtering, winners**: raw prices only — they are what the autopilot ran on.
+- **Fees in ETH**: the corrected price is the better number. `loo` sidesteps the conflict
+  by excluding price-suspect auctions, so it never diffs native fees against the mart —
+  cross-checks compare **atoms**.
 
-Everything downstream inherits it — `int_backend_data__fees_per_trade.fee_amount_native`
-is `protocol_fee_amounts[i] * pd.protocol_fee_token_native_price`, so the DB's own
-`protocol_fee_native` and `partner_fee_native` are **corrected** figures while the score
-the competition was decided on is not.
-
-So there really are two price feeds for the same fee, and using the wrong one here would
-be a defect in either direction:
-
-- **Scoring, filtering, winners.** Raw `auction_prices` is the only correct input: it is
-  what the autopilot ran on. Applying corrections would make the reproduction diverge from
-  the record on purpose.
-- **Quoting a fee in ETH.** The corrected price is the better number, since the raw one is
-  wrong by construction wherever a correction exists.
-
-The pipeline resolves this by never quoting the disputed cases: it scores on raw prices
-(right for the decision) and excludes price-suspect auctions from every statistic (right
-for the ETH figure), so it neither diverges from the record nor prints a fabricated amount.
-
-The table has grown far past what the next two paragraphs measured: on 2026-11-23 the
-mainnet DB holds 3 live rows (from auction 14212188) and **7,184 archived** ones
-(`auction_prices_corrections_archived`; the live seed is rotated weekly). The check
-below, that `price_imbalanced` catches every corrected auction, has **not** been re-run
-on those.
-
-**Measured, whole table, 2026-08-30: 20 rows, 20 auctions, 2 tokens**, all mainnet/prod and
-all in auctions 13639326–13658320. The corrections are large — the raw price is 10x to 92x
-too high — and 19 of the 20 are one token across a run of consecutive auctions, the same
-shape as the 15,300x case above.
-
-**Every one of those 20 auctions is independently flagged by `price_imbalanced` and
-excluded** (verified: 20 caught, 0 missed, and in each the mispriced token is actually
-traded). Two mechanisms derived by different routes agree exactly on which auctions are
-untrustworthy, so the corrections table is redundant for this pipeline rather than a gap
-in it.
-
-Two caveats worth keeping:
-
-- The corrections table is **curated and retrospective** — it grows as people notice bad
-  prices, so a fresh window can contain a mispricing nobody has corrected yet.
-  `price_imbalanced` does not depend on that curation, which is why it is the primary
-  defence and not the fallback.
-- Both mechanisms only catch *gross* errors. The threshold is 2x and the observed
-  corrections are 10x+; a price wrong by 50% would pass both, and would move a fee delta
-  by 50% of that token's share of it.
-
-No correction row falls inside any window analysed so far — the M1 calibration window is
-13480599–13517908 and July 2026 is 13266727–13488348, both entirely below 13639326 — so
-the influence of the price-feed difference on every fee delta reported to date is
-**exactly zero**.
+On 2026-08-30 the table had 20 rows (10–92x corrections), and `price_imbalanced`
+independently flagged all 20 auctions. On 2026-11-23 mainnet holds 3 live and **7,184
+archived** rows (`auction_prices_corrections_archived`, the live seed rotates weekly);
+that agreement has **not** been re-checked on them. The table is curated after the fact,
+so a fresh window can hold an uncorrected error; `price_imbalanced` does not depend on
+that curation.
 
 ## No USD prices — stablecoin native prices imply the rate
 
-The analytics DB has **no USD price table** (checked: no `dbt` table matches
-`%price%`/`%usd%`/`%rate%` beyond the native `auction_prices` and the COW→native
-accounting rates; the USD models in `dune_dbt` live on Dune, not in this Postgres).
-
-For display-only USD figures there is no need for one: `auction_prices` carries a
-native price for every token in the auction, so a major stablecoin's native price
-implies the rate, per auction, from the source every other number already uses:
+The analytics DB has no USD price table and no token-metadata table. USD figures are
+**display only** — nothing on the valuation or reward path reads one — and are derived per
+auction from the auction's own prices:
 
 ```
 usd_per_native = 10^(36 − decimals) / price(stablecoin)
 ```
 
-(1 USD = `10^decimals` atoms = `10^decimals × price / 1e18` wei.) Measured over
-2026-08-01..04 on mainnet, the three reference stablecoins agree to ~0.1% — USDC
-1914.9, USDT 1916.9, DAI 1915.1 USD/ETH — and each is priced in essentially every
-auction (3,521 of 3,521 sampled). `loo.extract.load_usd_rates` takes the per-auction
-median across USDC/USDT/DAI so no single wrong price can set the rate (the
-[wrong-native-price](#native-prices-can-be-plain-wrong) lesson, applied to the one
-place a price has no counterparty in the same trade to cross-check against). The
-curated per-network token list is `loo.primitives.USD_REFERENCE_TOKENS`; networks
-without one fail loudly and the USD columns are skipped (D15).
+`extract.load_usd_rates` takes the per-auction median across the network's curated
+reference stablecoins (`primitives.USD_REFERENCE_TOKENS`), so no single wrong price sets
+the rate, with a window median where an auction priced none of them. A network without a
+list skips the USD columns rather than guessing; an external feed would be a second trust
+domain for a cosmetic number. On mainnet USDC/USDT/DAI agreed within ~0.1% (2026-08).
 
-Display only: nothing on the valuation or reward path consumes a USD number.
-
-All nine non-mainnet networks were curated in August 2026 from July-2026 samples
-(~200 auctions each), since the DB carries **no token metadata table** to look a
-symbol up in. The acceptance test, per network: every candidate is priced in every
-sampled auction, the candidates agree with each other on the implied USD/native rate
-to 0.1–0.7%, and that rate matches an independent anchor — mainnet's verified USD/ETH
-carried through the two chains' COW accounting rates (`usd_per_cow / native_per_cow`,
-same snapshot on both sides) — to a few percent. Two lessons from that pass:
-
-- **Bridged stables can genuinely diverge**: polygon's USDC.e priced ~6% below native
-  USDC/USDT/DAI all month and was rejected. Mutual agreement is the test, not the name.
-- **ink and plasma have no nameable majors**: their entries are dollar tokens verified
-  purely by the three-way agreement + anchor (plasma's `b8ce59fc…` is USDT0; the
-  others are unnamed). BNB-chain stables have **18 decimals**, not 6.
+The lists were curated in August 2026 by mutual agreement (0.1–0.7%) plus an independent
+anchor (mainnet USD/ETH through both chains' COW accounting rates), not by name: polygon's
+USDC.e sat ~6% below the others and was rejected; ink and plasma entries are unnamed
+dollar tokens (plasma `b8ce59fc…` is USDT0); BNB-chain stables have **18 decimals**.
 
 ## Coverage and lag
 
-- `int_backend_data__proposed_solution_data` starts at auction `12709602` and **lags the
-  raw staging tables badly and by a varying amount** — measured at **7.5 days** on
-  2026-08-11: its frontier is auction `13509867`, block deadline timestamp
-  2026-08-03 23:59 UTC, while `stg_backend_data__proposed_solutions` reaches `13563642`
-  and block timestamps run to 2026-08-11 12:32 UTC. Measure the gap, do not assume it:
+`int_backend_data__proposed_solution_data` **lags the staging tables badly and
+variably** — 7.5 days when measured on 2026-08-11. Measure it rather than assume:
 
-  ```sql
-  select (select max(auction_id) from dbt.int_backend_data__proposed_solution_data) as int_max,
-         (select max(auction_id) from dbt.stg_backend_data__proposed_solutions)      as stg_max
-  ```
+```sql
+select (select max(auction_id) from dbt.int_backend_data__proposed_solution_data) as int_max,
+       (select max(auction_id) from dbt.stg_backend_data__proposed_solutions)      as stg_max
+```
 
-  For anything that must cover recent auctions, join
-  `stg_backend_data__proposed_solutions` × `…__proposed_trade_executions` directly. The
-  intermediate model also lacks `filtered_out`, so the staging join is the only route to
-  the fairness-filter ground truth regardless of the window.
+It also lacks `filtered_out`, so the fairness-filter ground truth comes only from
+`stg_backend_data__proposed_solutions` joined to `…__proposed_trade_executions`.
 
-  **The lag is specific to that one model — it is not a property of `int_` models.**
-  Measured on 2026-08-11, every other model on the path is level with staging:
-
-  | model | `max(auction_id)` |
-  | --- | --- |
-  | `stg_backend_data__proposed_solutions` | 13565433 |
-  | `stg_backend_data__settlements` | 13565433 |
-  | `int_backend_data__winning_solutions_with_onchain_status` | 13565433 |
-  | `int_backend_data__solution_data` | 13565433 |
-  | `int_backend_data__trade_with_tx_hash` | 13565433 |
-  | `int_backend_data__proposed_solution_data` | **13509867** |
-
-  So check the specific model rather than avoiding intermediate models as a class.
-- `stg_rpc_data__block_timestamp` covers block `24178030` onward (2026-01-06). Earlier
-  windows need `stg_dune_data__block_timestamp`.
-- Auction ids are sparse — do not assume consecutive integers.
+The lag is specific to that model: on the same day `stg_backend_data__settlements`,
+`int_backend_data__winning_solutions_with_onchain_status`, `int_backend_data__solution_data`
+and `int_backend_data__trade_with_tx_hash` were level with staging. Check the model, do not
+avoid `int_` as a class.
 
 ## Mapping a date window to auctions
 
@@ -349,237 +214,83 @@ where block_deadline between
   and (select max(block_number) from dbt.stg_rpc_data__block_timestamp where time <  :end)
 ```
 
-This is the same auction universe the dbt reward models use.
+The same auction universe the dbt reward models use.
 
 ## `order_surplus_atoms_in_surplus_token` rounds
 
-The surplus column of `int_backend_data__proposed_solution_data` uses the same formula as
-the Rust — `executed_buy - ceil(executed_sell * buy_amount / sell_amount)` for sell orders
-— but computes it in Postgres `numeric`, and **`/` on two integral numerics rounds the
-quotient before `ceil()` ever sees it**. Postgres picks a result scale from the operands;
-for amounts of this magnitude it comes out as 0, so the quotient is rounded half-up to an
-integer and `ceil` becomes a no-op. Where the true fraction is in `(0, 0.5)` the model
-lands one atom above the exact value.
-
-Traced on auction `13488353`, solution `0`:
-
-```
-executed_sell 90888722591939552      buy_amount   105000028207312463683085
-executed_buy  954600229483096975804  sell_amount  10000000000000000000
-
-exact numerator      9543318435880250535850911543951604877920   (40 digits)
-exact floor          954331843588025053585   remainder 911543951604877920  (frac ≈ 0.09)
-exact ceil           954331843588025053586
-postgres quotient    954331843588025053585   <- scale 0, already rounded down
-postgres ceil        954331843588025053585   <- no-op
-
-model surplus  268385895071922219      exact surplus  268385895071922218
-```
-
-Over three days of mainnet (2026-08-01 to 2026-08-04, 94,565 orders) **624 orders differ
-and every single difference is exactly −1** — the exact value is always the smaller one,
-and nothing else diverges at all. So the column is
-fine for aggregate work and wrong by up to one atom per order for anything that has to
-match the protocol. Reproduce integer ceiling division exactly (`-(-a // b)` in Python,
-`div()` plus a remainder test in SQL) rather than `ceil(a / b)`.
-
-## Native prices: the competition_auctions arrays
-
-**Read prices from the `price_tokens` / `price_values` arrays of
-`stg_backend_data__competition_auctions`, through `extract.fetch_prices`.** There is no
-other source left, and `loo` reads no other.
-
-| Source | Populated for |
-| --- | --- |
-| `stg_backend_data__competition_auctions` arrays | **2026-09-15 00:00 UTC onward**, on every network; NULL before that, bar one 31-auction island on linea (2026-08-31) |
-| `raw_prod_<net>.competition_auctions` arrays (the dbt source) | from 2026-07-30 (mainnet: auction 13478258, 14:11 UTC), complete from there: 127,267 of 127,267 mainnet auctions up to 2026-09-15 have them (measured 2026-11-23). `loo` does not read them; a pre-September window would need this and the pre-#4902 rules back |
-| `stg_backend_data__auction_prices` | **dropped 2026-11-05.** It held the whole history up to 2026-09-21; prices before 2026-07-30 are now nowhere in the analytics DB |
-
-Where the staging arrays start (first auction of the populated run): mainnet 13810689,
-xdai 17248560, base 29101262, arbitrum-one 8918187, avalanche 33827839, polygon 40364192,
-bnb 25462762 — all within a minute of 2026-09-15 00:00 UTC — then linea 36358462 (00:07),
-plasma 9113987 (01:15), ink 5078289 (01:30). Lens stopped on 2026-03-03.
-
-No array repeats a token (the property cow-dagster's
-`assert_price_tokens_unique_per_auction` test guards), and none has a length mismatch or
-a NULL element. While the legacy table existed the two agreed to the wei on 780,240 of
-780,240 sampled (auction, token) prices across nine networks.
-
-How it behaves:
-
-- An auction with bids and NULL arrays raises `MissingPricesError` rather than becoming
-  a valuation failure that `analyse` would report as abandoned while exiting 0. Windows
-  before `extract.MECHANISM_START` (2026-10-28) are refused before any query runs.
-- `stg_backend_data__competition_auctions` is a wide row (`order_uids`, two ~900-element
-  arrays), and unnesting it costs more than an indexed lookup. Measured cold on mainnet
-  in September 2026: +0.25 s per 200-auction `PRICES_SQL` chunk, and the quote path's
-  window-wide median (`quotes.TOKEN_PRICES_SQL`) took 57 s for a week of ~25k auctions.
-
-Do not use `int_backend_data__auction_prices` in place of the arrays. It is the new
-indexed `(auction_id, token) → price` model, but it only holds tokens of **settled**
-trades, so it has no prices for losing bids, unsettled winners, or stablecoins nobody
-traded.
+The model computes `executed_buy - ceil(executed_sell * buy_amount / sell_amount)` (sell
+orders) in Postgres `numeric`, and `/` on two integral numerics picks result scale 0 at
+these magnitudes, so the quotient is rounded half-up **before** `ceil` sees it. Where the
+true fraction is in `(0, 0.5)` the column is one atom too high (traced on auction
+13488353, solution 0). Over mainnet 2026-08-01..04, 624 of 94,565 orders differ, every one
+by exactly −1. Use exact integer ceiling division (`-(-a // b)` in Python, `div()` plus a
+remainder test in SQL).
 
 ## Fee policies cover every order of every kept solution
 
-An earlier version of this section claimed the table "only has rows for orders that were
-executed". That is wrong, and it understates the coverage by an order of magnitude. The
-autopilot writes policies for the orders of every **non-filtered-out** solution
-(`autopilot/src/run_loop.rs:551`), which iterates `ranking.ranked()` — the kept set, with
-`Ranking::filtered_out` a separate field — and looks each order up in `auction.orders`.
-So the rule is:
+The autopilot writes policies for the orders of every **non-filtered-out** solution
+(`autopilot/src/run_loop.rs`, iterating `ranking.ranked()`):
 
-> An auction order has its fee policies recorded for auction `a` **iff** it appears in at
-> least one solution of `a` with `filtered_out = false`.
+> An auction order has fee policies for auction `a` **iff** it appears in at least one
+> solution of `a` with `filtered_out = false`.
 
-Executed-ness never enters. Verified over auctions 13480599–13517908 with no exceptions in
-either direction: all 20,210 (auction, order) pairs appearing in a kept solution have
-policy rows, none of the 1,638 appearing only in filtered-out solutions do, and there are
-zero policy rows for an order with no trade execution in that auction.
+Executed-ness never enters. Verified over auctions 13480599–13517908 with no exception
+either way (20,210 kept pairs all covered, none of 1,638 filtered-only pairs). So:
 
-Consequences:
+- It is not a test for auction membership — use `competition_auctions.order_uids`.
+- Protocol fees can be recomputed for 98.9% of proposed executions and 100% of those in
+  kept solutions; `loo/fees.py` reproduces `proposed_solutions.score` from them to the wei.
+- A covered order with no rows has genuinely no policies (fee 0).
+- Policies are stable across auctions for the same order (1,485 of 1,485 identical), so an
+  uncovered order could be backfilled from another auction. `loo` does not need to.
+- `application_order` is a **global** serial: only its order within one order is
+  meaningful. Sort ascending for the application sequence (`protocol_fees` walks it in
+  reverse).
 
-- Still not a test for "is this an auction order" — use `competition_auctions.order_uids`.
-  An order in a filtered-out-only solution *is* an auction order with no rows.
-- Protocol fees **can** be recomputed for the great majority of proposed executions,
-  including unexecuted ones — 98.9% of execution rows in that window, and 100% of those in
-  kept solutions. See
-  [PROPOSAL-fee-aware-scoring.md](../PROPOSAL-fee-aware-scoring.md), which measures the gap
-  and reproduces `proposed_solutions.score` wei-exactly from the table.
-- JIT orders are never in `auction.orders`, so they never carry policies and their protocol
-  fee is exactly 0. That is the right answer, not a gap.
-- A covered order with no rows means "genuinely no policies, fee 0". The coverage test
-  above is what separates that from "not recorded".
-- Where policies are needed for an uncovered order, backfill from another auction
-  containing the same `order_uid` — policies derive from order class, app data, and the
-  quote, so they are stable across auctions. Measured exactly stable: of 1,485 orders
-  appearing with policies in more than one auction in that window, **all 1,485** have
-  identical policy lists in every one.
-
-`application_order` is a **global** serial, not a per-order index, so only its relative
-order within one order is meaningful — sort ascending to get the application sequence
-(which `protocol_fees` then walks in reverse).
+An auction where an *executed* order's policies are missing on either side (possible only
+when a recorded-filtered-out solution wins the counterfactual) is dropped from both sides
+of the fee sums and counted in `auctions_fees_incomplete`: 0.07–0.17% of auctions per
+solver over 2026-08-01..04.
 
 ## Partner fees are the trailing policies, and they are most of the total
 
-An order's fee policies are not all the protocol's. The list ends with one entry per
-partner declared in the order's app data, and those are passed straight on, so a
-"protocol fee" that includes them roughly doubles what the protocol actually keeps.
-Measured
-over 2026-08-01..04 on `int_backend_data__fees_per_trade`: **33.9 ETH partner against
-30.8 ETH protocol**.
+An order's policy list ends with one entry per partner declared in its app data, passed
+straight on. Over 2026-08-01..04 on mainnet (`int_backend_data__fees_per_trade`):
+**33.9 ETH partner against 30.8 ETH protocol**, so a "protocol fee" including them roughly
+doubles what the protocol keeps. The split is **positional**, not by kind (volume
+policies appear on both sides):
 
-The split is **positional**, and policy kind does not encode it — volume policies appear
-on both sides (16,337 protocol, 4,592 partner), and even price improvement shows up as a
-partner fee occasionally (42 rows). The rule
-(`int_backend_data__fees_per_trade.sql`) is:
+> With `L` policies in application order and `n` partner recipients, the **trailing `n`**
+> are partner fees and the rest the protocol's — except that `L = 1` is always the
+> protocol's.
 
-> With `L` fee policies in application order and `n` partner recipients declared in the
-> order's app data, the **trailing `n`** are partner fees and the rest are the
-> protocol's — except that `L = 1` is always the protocol's, whatever `n` says.
+`n = coalesce(array_length(app_data.partner_fee_recipients, 1), 0)`, joining
+`orders.app_data = app_data.contract_app_data`. **`partner_fee_item_count` is NULL on all
+888,760 rows** — do not use it. The join is on app data, not on a settlement, so it answers
+for orders that never traded, which a counterfactual needs (99.6% of traded user orders
+have a row; the rest default to zero partners). `loo.fees.fee_split` implements the rule;
+it reproduced the model's split on 16,431 of 16,431 settled trades.
 
-`n` comes from `stg_backend_data__app_data`, joined `orders.app_data =
-app_data.contract_app_data`:
-
-```sql
-coalesce(array_length(ad.partner_fee_recipients, 1), 0)
-```
-
-Two traps in that one line:
-
-- **`partner_fee_item_count` is dead** — NULL for all 888,760 rows. It looks like exactly
-  the column you want. Use `array_length` on `partner_fee_recipients`, which is populated
-  (111,537 rows with one recipient, 979 with two).
-- The join is on **app data, not on a settlement**, so unlike
-  `int_backend_data__trade_data_unprocessed` it answers for orders that never traded —
-  which is what a counterfactual needs. Coverage is 17,813 of 17,877 traded user orders
-  (99.6%); the missing rows default to zero partners.
-
-Verified by reproducing the model's own split from `stg_backend_data__fee_policies` plus
-this count: **16,431 of 16,431 settled trades match exactly**, and the policy-list length
-agrees with the model's fee count on every one of them. `loo.fees.fee_split` implements
-it.
+Naming: the DB and `arbitrator.rs` say "protocol fee" for the gross amount and
+`protocol_fee_without_partner_fee_native` for the net. `loo` says "protocol fee" for what
+the protocol keeps.
 
 ### `partner_fee_cut` is NULL on older rows
 
-`int_backend_data__fees_per_trade.partner_fee_cut` is the protocol's share of a partner
-fee: per-recipient config, else 0.25. The model is incremental with
-`on_schema_change='append_new_columns'`, and rows built before the column was added were
-never rebuilt. Measured 2026-10-14, every partner row is NULL below auction
-**26,089,387 on bnb** and **29,403,168 on base** (about 2026-10-06). Every row after that is
-populated.
-
-So `coalesce(partner_fee_cut, 1)` counts those partner fees as entirely the DAO's, and
-`fee_amount_native * partner_fee_cut` drops them. Fill it the way the model does, with
-`coalesce(partner_fee_cut, pc1.partner_fee_cut, pc2.partner_fee_cut, 0.25)`, joining
-`stg_partner_fees_config` on `processed_fee_recipient` (with `app_code`, then without).
-On bnb orders created 2026-10-05..12 the configured cuts average 16% of gross, not 25%.
-
-## JIT orders are recorded only when the batch settles
-
-**No longer a constraint.** `loo` does not read JIT orders since 2026-11-23, because the
-current mechanism ignores them entirely
-([winner-selection.md](winner-selection.md#loo-replays-the-current-mechanism-only)). The
-exclusion described below (D17) had grown from 0.8% of a month to **27% of mainnet's
-auctions on 2026-11-18** (1,319 of 4,873) and is gone: all 1,582 missing orders that day
-were non-contributing JIT orders. The section stays as the record of why reports before
-format 15 carry a `missing_data_auctions` count.
-
-`stg_backend_data__jit_orders` is populated from settlements, so the JIT orders of
-solutions that never settled — losing bids, and winners that reverted or landed late —
-are recorded **nowhere**: their execution rows sit in `proposed_trade_executions`, but
-tokens, limit amounts, kind and fillability are unrecoverable. Measured over
-2026-07-12..2026-08-12 on mainnet (78,271 auctions):
-
-| | count | note |
-| --- | --- | --- |
-| orders in neither `orders` nor `jit_orders` | 653, in 685 solutions across ~600 auctions (0.8%) | |
-| of which surplus-capturing | 387 (59%) | owner in `surplus_capturing_jit_order_owners`, so they contributed to score and the filter |
-| in *winning* solutions | 235 rows across ~230 auctions | winners that reverted or landed late |
-| solutions with **all** orders missing | 143 | nothing about their pair claims is known |
-
-A losing solution's JIT order *can* still be recorded: when the same order settled via
-the winner, the row exists and every proposer's join works.
-
-The M1–M4 window (2026-08-01..04) sits in a stretch with zero missing orders and no JIT
-activity among winners at all (between auctions 13480599 and 13517908) — pure luck, so
-the M1 gate never saw one.
-
-Consequence (D17): even one missing order leaves a solution's `pick_winners` pair claims
-unknowable — and JIT-only pair claims measurably change the pick
-([winner-selection.md](winner-selection.md#a-jit-leg-can-block-another-solutions-execution--and-the-filter-never-sees-it)) —
-so `extract.load_auctions` excluded the whole auction and reported it
-(`missing_data_auctions`). The exclusions are not random: they are JIT-heavy and
-reverted-winner auctions. Revision path: CoW AMMs — the surplus-capturing case — were
-deprecated around late July 2026, so for windows past the deprecation a
-zero-surplus/zero-score reading of a missing order is exact for score and filter; the
-missing pair claim, and with it the blocking bias, remains either way.
+`int_backend_data__fees_per_trade.partner_fee_cut` (the protocol's share of a partner fee:
+per-recipient config, else 0.25) is NULL on rows built before the column existed — below
+auction 26,089,387 on bnb and 29,403,168 on base, about 2026-10-06 (measured 2026-10-14).
+Fill it as the model does: `coalesce(partner_fee_cut, pc1.partner_fee_cut,
+pc2.partner_fee_cut, 0.25)` joining `stg_partner_fees_config` on `processed_fee_recipient`
+(with `app_code`, then without). On bnb 2026-10-05..12 the configured cuts averaged 16%.
 
 ## Observed outcomes: what actually settled
 
-Everything above describes what solvers *proposed*. Three tables carry what happened on
-chain:
-
 | Table | Grain | Notes |
 | --- | --- | --- |
-| `stg_backend_data__settlements` | settlement event | `(block_number, log_index, solver, tx_hash, auction_id, solution_uid)`. No row means no settlement. |
-| `int_backend_data__winning_solutions_with_onchain_status` | **winning solution** | `(auction_id, solution_uid, solver, score, block_deadline, block_number, tx_hash, is_settled_in_time)` |
-| `int_backend_data__trade_with_tx_hash` | auction × order | the actual on-chain `sell_amount`, `buy_amount`, `fee_amount` per traded order, plus `solution_uid` |
-
-`…winning_solutions_with_onchain_status` is the one to use for "did this winner settle". It
-**left-joins** settlements onto the winners, so every winning solution has a row and a
-winner that never settled is a row with a null `tx_hash` rather than a missing row. That
-distinction is what lets a *missing* row mean "no data" and fail loudly. Verified over
-2026-08-01..2026-08-04:
-
-```
-winners                       10301
-rows in the status model      10301   <- exact 1:1, no gaps
-settled at all                 8768   (85.1%)
-settled in time                8752
-duplicate settlement rows         0
-status rows for non-winners       0
-```
+| `stg_backend_data__settlements` | settlement event | `(block_number, log_index, solver, tx_hash, auction_id, solution_uid)` |
+| `int_backend_data__winning_solutions_with_onchain_status` | winning solution | `tx_hash, block_number, is_settled_in_time`; left-joins settlements, so every winner has a row and an unsettled one has a NULL `tx_hash` — a missing row means missing data |
+| `int_backend_data__trade_with_tx_hash` | auction × order | on-chain amounts per traded order; filtered to auction orders, so no JIT orders |
 
 ### `settled` and `settled_in_time` come apart, and which one you want depends
 
@@ -587,190 +298,102 @@ status rows for non-winners       0
 is_settled_in_time = coalesce(block_number <= block_deadline and tx_hash is not null, false)
 ```
 
-**16 winners in that window settled late.** Their orders *did* trade — all 16 have rows in
-`int_backend_data__trade_with_tx_hash` — so the users got their fills, but the solver earns
-no reward (`observed_score` is 0 without `is_settled_in_time`, see
-[rewards.md](rewards.md)). Literally, then:
+`tx_hash is not null` answers "did it execute"; `is_settled_in_time` answers "did the
+protocol pay for it". 16 winners over 2026-08-01..04 landed late: users got their fills,
+the solver earned nothing. `loo` uses **`is_settled_in_time` for both surplus and
+rewards** (`extract.Settlement.counts_as_executed`, consumed by both sides), so the two
+views of one auction never disagree about which winners delivered; the real surplus of
+late batches is reported as `orders_lost_to_lateness` rather than absorbed.
 
-- `tx_hash is not null` answers "did this execute at all";
-- `is_settled_in_time` answers "did the protocol pay for it".
-
-**The leave-one-out analysis uses `is_settled_in_time` for both questions**, so a late batch
-is carried as a failure with zero surplus. That is knowingly not what happened, and it is the
-one such place in the pipeline. The reason is consistency across milestones: a batch the
-protocol did not reward cannot be credited to the mechanism on the surplus side and written
-off on the reward side. The cost is those 16 winners' real user surplus, and it is reported
-as `orders_lost_to_lateness` rather than absorbed. Anyone asking a pure "what did users
-actually receive" question wants `tx_hash is not null` instead.
+On 2026-11-03 11:44 UTC mainnet's settle deadline went from two blocks to one, and
+not-landed winners rose from 6–13% a day to 20–28%. In-time rates are not comparable
+across that date; `inherited` deltas are unaffected by construction.
 
 ### Failures are concentrated in the biggest solutions
 
-The 14.9% failure rate is not spread evenly, and anything that treats settlement as a small
-correction will be badly wrong:
-
-| | winners | Σ score | share of score |
-| --- | --- | --- | --- |
-| never settled | 1,533 (14.9%) | 439.6 ETH | **50.2%** |
-| settled | 8,768 (85.1%) | 435.5 ETH | 49.8% |
-
-**One seventh of the winners carry half the winning score and none of it executed.** The
-largest single unsettled winner scored 143.6 ETH. So a counterfactual that assumes winners
-settle roughly doubles the surplus on both sides of its comparison, and how it treats a
-*replacement* winner — for which no settlement was ever recorded — moves the headline by
-several ETH. The leave-one-out analysis therefore attaches settlement to the token pair
-rather than to the solver, with everything-lands-in-time as the one alternative
-scenario ([PLAN.md §5](../PLAN.md#5-m2--loo-ranking-and-surplus-deltas--done), D4).
+Over 2026-08-01..04, the 14.9% of winners that never settled carried **50.2%** of winning
+score (largest: 143.6 ETH). How a counterfactual treats settlement therefore moves its
+headline by several ETH. `loo` attaches settlement to the **slot**: a replacement winner
+inherits the recorded outcome of the token pairs it claims (`inherited`), so a batch that
+reverted stays reverted whoever replaces it and settlement cancels out of the comparison.
+`assume-settled` (everything lands, both sides) is the one alternative kept. Attaching
+settlement to the solution — real reverts charged to the baseline, every replacement
+credited — was dropped because it is not a counterfactual anyone would defend.
 
 ### A settled proposal is exact — the only divergence is settling at all
 
-Over the same window, comparing `int_backend_data__trade_with_tx_hash` against
-`stg_backend_data__proposed_trade_executions` on `(auction_id, solution_uid, order_uid)`:
-
-```
-order rows compared                                          9061
-sell_amount = executed_sell and buy_amount = executed_buy    9061   <- all of them
-trades with a non-zero fee_amount                               0
-proposed orders of a settled winner missing from the trades      0
-```
-
-A solver commits its clearing prices in the settlement calldata, so **when a batch settles
-the proposed execution *is* the observed one**, to the atom. The entire content of
-"observed versus proposed" is the binary did-it-settle. A counterfactual therefore needs
-only the settlement flag plus the proposed amounts — there is no separate observed-amount
-lookup to build.
-
-Two caveats on `trade_with_tx_hash`: it filters trades to orders in
-`pre_stg__orders_per_auction_with_at_least_one_bid`, so **JIT orders are absent from it**;
-and `fee_amount` on the `Trade` event has been 0 since fees moved into the clearing price
-(`observed_fee` is marked `DEPRECATED after June 23, 2026` in
-`int_backend_data__trade_data_unprocessed`).
+Over 2026-08-01..04, 9,061 of 9,061 settled order rows have on-chain `sell_amount`/
+`buy_amount` equal to the proposed `executed_sell`/`executed_buy`, and no proposed order of
+a settled winner is missing from the trades. A solver commits its clearing prices in the
+calldata, so the observed execution *is* the proposal. `loo` reads executed amounts from
+`proposed_trade_executions` and only the settlement status from chain. `fee_amount` on
+the `Trade` event has been 0 since fees moved into the clearing price (June 2026).
 
 ## Resolving a solver name
 
-`dune_data__cow_protocol__solvers` is the only bridge from a submission address to a human
-name. `address` is **`bytea`**, so it joins `proposed_solutions.solver` directly with no
-`encode`. 267 rows on mainnet, one per address, 67 distinct names. Per network: xdai 89,
-base 98, only 10 addresses shared with mainnet.
+`dune_data__cow_protocol__solvers` is the only address → name bridge; `address` is `bytea`
+and joins `proposed_solutions.solver` directly. It is a current-state snapshot with no
+time dimension (`active` = latest allow-list event was an add).
 
-Four traps, all of them live in the 2026-08-01..2026-08-04 window:
-
-1. **Exact matching only.** `Arc` is a substring of `Arctic` and **both bid in the
-   window**; `Quasi` ⊂ `Quasilabs`, `Sector` ⊂ `Sector_Finance`, `Tsolver` ⊂ `TestSolver1`.
-   Any `ilike '%…%'` silently removes two competitors. Case-insensitive *exact* match is
-   safe — there are no `lower(name)` collisions.
-2. **One name, several addresses.** `Barter`, `Kipseli`, `Rizzolver` and `Tsolver` have
-   rotated submission keys, and neither `environment = 'prod'` nor `active` disambiguates
-   (Kipseli has three prod+active addresses). The ranges never overlap — no two same-name
-   addresses ever bid in the same auction — so intersecting with "addresses that actually
-   bid in the window" collapses it to one in practice. When a window straddles a rotation
-   it genuinely is one competitor under two addresses and **all of them must be removed
-   together**, or `compute_reference_scores` treats one half of the rotation as a rival of
-   the other.
-3. **`Uncatalogued` is not a solver.** The model does `coalesce(name, 'Uncatalogued')` and
-   `coalesce(environment, 'new')` for addresses missing from the Dune seed
-   (`dune_dbt/macros/general/solvers.sql`), so 36 addresses share that name, including
-   `0x000…0000`. Three of them really did bid at some point; those must be given by
-   address.
-4. **Do not write `ltrim(arg, '0x')`** to strip an address prefix — `ltrim` strips a
-   character *set*, so `0x0000…` loses every leading zero and mismatches silently. Use
+1. **Exact matching only.** `Arc` ⊂ `Arctic` and both bid; also `Quasi` ⊂ `Quasilabs`,
+   `Sector` ⊂ `Sector_Finance`, `Tsolver` ⊂ `TestSolver1`. Case-insensitive *exact*
+   matching is safe.
+2. **One name, several addresses** (rotated keys: `Barter`, `Kipseli`, `Rizzolver`,
+   `Tsolver`). Neither `environment` nor `active` disambiguates. Same-name addresses never
+   bid in the same auction, but a window can straddle a rotation, and then **all of them
+   must be removed together** or one half is treated as a rival of the other.
+3. **`Uncatalogued` is not a solver**: the model coalesces missing names to it (36
+   addresses on mainnet, including `0x0`). Such solvers are named by address.
+4. **Never `ltrim(arg, '0x')`** — it strips a character set and eats leading zeros. Use
    `case when arg like '0x%' then substr(arg, 3) else arg end`.
-
-The table is a current-state snapshot with **no time dimension**: `active` means "the
-latest allow-list event for this address was an add". It cannot answer "was X active on
-2026-08-02".
 
 ## `int_accounting_period_data__conversion_rates` is per-block and unindexed
 
-The COW→native conversion-rate model materializes **one row per block** of the whole
-synced history (incremental, `unique_key='block_number'`), even though the rate itself
-only changes once per weekly accounting period (Tuesday to Tuesday) and is NULL until
-the period is snapshotted after payout. dbt creates **no index** on the table — true of
-dbt-materialized tables generally unless an `indexes` config says otherwise — so every
-predicate is a sequential scan over millions of rows per chain.
+The COW→native rate model has **one row per block** of the synced history although the
+rate changes once per weekly accounting period (Tuesday 00:00 UTC to Tuesday). dbt
+created no index on it, so every predicate scans millions of rows, and
+`block_number = any(<thousands of blocks>)` evaluates the array against every row — a
+sweep of those drove a DB CPU alert on 2026-08-14. `extract.CONVERSION_RATES_SQL` asks
+at the real grain instead: one `between` range scan grouped to
+`(first_block, last_block, rate)` per period, blocks mapped client-side, loaded once per
+window.
 
-The failure mode that made this a section: `where block_number = any(<array>)` with
-thousands of block numbers evaluates the array against **every row of the scan**, and a
-multi-invocation sweep of such queries drove a DB CPU alert on 2026-08-14 (the on-call
-offer that followed: an index on `block_number`, which would also help). The fix on our
-side is to ask for the information at its real grain — one range scan with a group-by
-returns one `(first_block, last_block, rate)` row per period, and blocks map to periods
-client-side (`extract.CONVERSION_RATES_SQL`, D21).
-
-The general lesson applies to any dbt-backed table here: check the model's
-materialization before shipping a large `= any(array)` probe against it, and prefer a
-`between` range plus client-side filtering when the table is unindexed — a range
-predicate costs two integer comparisons per row, an N-element array costs N.
+Generally: check a dbt model's materialization before an `= any(array)` probe, and
+prefer a range plus client-side filtering on an unindexed table.
 
 ## Bound joins against `proposed_solutions` to the window's auction-id range
 
-`stg_backend_data__proposed_solutions` is indexed on `(auction_id, uid)` only. Every
-extraction query reaches it through `auction_id = any(<chunk of ids>)`, which the planner
-turns into index probes. The two solver-resolution queries did not: they joined the table
-against a `window_auctions` CTE (`pre_stg__orders_per_auction_with_at_least_one_bid`
-bounded by two block-number subqueries). The planner cannot see how large that CTE is
-— it estimated 13,805 rows for a 3-day and a 7-day window alike — and chose a **hash
-join over a sequential scan of all 13.4M rows** for both windows.
-
-Measured 2026-09-15 on mainnet, 7-day window (20,415 auctions), the DB partly warm:
+A join between `proposed_solutions` and a CTE whose bounds are subqueries is planned as a
+**sequential scan of the whole table** (13.4M rows on mainnet): the planner cannot size
+the CTE (it estimated 13,805 rows for a 3- and a 7-day window alike). Measured 2026-09-15,
+mainnet, 7-day window, partly warm:
 
 | query | plan | time |
 | --- | --- | --- |
-| `ALL_SOLVERS_SQL`, as written | seq scan + hash join | 2.7–10 s |
-| `SOLVER_SQL`, as written, per solver | seq scan + hash join | 1.6–2.1 s |
-| either, with `ps.auction_id between (min) and (max)` of the window | index scan | 0.3–0.6 s |
-| window ids first, then `auction_id = any(ids)` | index probes | 0.35–0.64 s |
+| `ALL_SOLVERS_SQL` / `SOLVER_SQL`, CTE join | seq scan + hash join | 1.6–10 s each |
+| with `ps.auction_id between (min) and (max)` of the window | index scan | 0.3–0.6 s |
 
-Warm, the difference is a factor of five and 26 solvers cost 45 s of scans per run. Cold
-or with other sessions loading the DB, each scan is minutes, and that is the mechanism
-behind the "`--all-solvers` did not return in 34 minutes" and "a week took 2.5 hours"
-observations of 2026-09-15: nothing in that run was pathological in the plan, it was
-27 sequential scans of a large table on a contended server. Both queries now carry the
-range bound. Auction ids are sparse but monotone, so the window's `[min, max]` covers
-the window and little else, and the results are row-for-row identical (checked on
-seven names including a rotated key, an uncatalogued address and the Arc/Arctic pair,
-and on July as a 31-day window).
-
-The lesson generalises the one above: on this DB a CTE-bounded join is as blind to the
-planner as an unindexed table, so give any query that touches a large staging table an
-explicit `auction_id` predicate — a range or an array of ids — and check with `explain`
-that no `Seq Scan on stg_backend_data__…` appears.
+Cold or on a busy server each scan takes minutes, which was the whole of the
+"`--all-solvers` never returns" reports. Both queries carry the range bound now (results
+identical row for row). Give any query touching a large staging table an explicit
+`auction_id` range or id array, and check `explain` for `Seq Scan on stg_backend_data__…`.
 
 ## Who placed an order: app code, owner, token symbols
 
-Reading a coverage count ("orders only this solver executed") needs to know what the
-orders were. Three sources, none of them a token table:
-
-- **App code**: `stg_backend_data__app_data.app_code`, joined
-  `orders.app_data = app_data.contract_app_data` — `CoW Swap`, `Trust wallet`,
-  `aave-v3-interface-collateral-swap`, `Jumper CoW` and so on.
-- **The protocol's own orders.** Orders owned by the settlement contract (`9008d19f…`),
-  app code `CoWFeeModule`, presigned and partially fillable, convert fees the protocol
-  collected. They are tiny and they count as coverage like any user order: 84 of the
-  132 orders only Gnosis_0x executed on avalanche over 2026-10-01..29 were these, carrying
-  9% of those orders' surplus. Ethflow orders are owned by `ba3cb449…`
-  ([quotes.md](quotes.md)).
-- **Token symbols are not in this database.** Use ClickHouse
-  `raw_quotes.quote_requested.sell_token_symbol` / `buy_token_symbol` (the backend's own
-  token-info cache, one symbol per address), filtered by `chain_id` and a day-bounded
-  `event_timestamp` so the partitions prune. There is no source for decimals; value
-  amounts through the auction's native prices instead.
+- **App code**: `stg_backend_data__app_data.app_code` via `orders.app_data`.
+- **The protocol's own orders** are owned by the settlement contract (`9008d19f…`, app
+  code `CoWFeeModule`, presigned, partially fillable) and convert collected fees. They
+  count as coverage like any user order (84 of the 132 orders only Gnosis_0x executed on
+  avalanche, 2026-10-01..29). Ethflow orders are owned by `ba3cb449…` (also `40a50cf0…`
+  on mainnet).
+- **Token symbols** are not in this DB: use ClickHouse
+  `raw_quotes.quote_requested.sell_token_symbol` / `buy_token_symbol`, filtered by
+  `chain_id` and a day-bounded `event_timestamp`. There is no decimals source; value
+  amounts through native prices.
 
 ## Reading the dbt model source
 
-The models are defined in a separate repo, cloned locally at `~/Work/Code/cow-dagster`:
-
-```
-cow_dagster/cow_dbt/models/solver_accounting/marts/         # fct_*
-cow_dagster/cow_dbt/models/solver_accounting/intermediary/  # int_*
-cow_dagster/cow_dbt/models/solver_accounting/staging/       # stg_*
-cow_dagster/cow_dbt/seeds/solver_accounting/                # reward_config.csv etc.
-```
-
-To find how any table is built:
-
-```bash
-find ~/Work/Code/cow-dagster -name "<table_name>.sql"
-```
-
-Materialised tables carry no SQL in the database, so this repo is the only way to read
-their definitions.
+Materialised tables carry no SQL in the DB; the models are in `~/Work/Code/cow-dagster`
+(`cow_dagster/cow_dbt/models/solver_accounting/{staging,intermediary,marts}/`, seeds in
+`cow_dagster/cow_dbt/seeds/solver_accounting/`). `find ~/Work/Code/cow-dagster -name
+"<table>.sql"`. Check the checkout against `origin/main` first.

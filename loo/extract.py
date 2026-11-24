@@ -1,19 +1,7 @@
-"""Pull one auction's worth of bids, orders and prices out of the analytics DB.
+"""Load bids, orders and prices from the analytics DB.
 
-Written against the **current** DB and mechanism only (`MECHANISM_START`): native prices
-come from the `competition_auctions` price arrays, and solver-provided (JIT) orders are
-left out at the source, because since services#4902 they affect neither score, fairness
-filter nor winner picking. Windows before `MECHANISM_START` are refused rather than
-replayed under rules that no longer match them.
-
-Reads the raw staging tables rather than `int_backend_data__proposed_solution_data`:
-the intermediate model lags the staging tables by 2-3 days and carries no
-`filtered_out` column, which the validation comparison needs. The intermediate model is still
-used, optionally, as an independent check on the surplus computation
-(`load_db_order_surplus`).
-
-Joins follow docs/analytics-db.md — in particular `proposed_trade_executions.solution_uid`
-joins `proposed_solutions.uid`, never `.id`.
+Reads staging, not `int_backend_data__proposed_solution_data` (lags; no `filtered_out`).
+`proposed_trade_executions.solution_uid` joins `proposed_solutions.uid`, never `.id`.
 """
 
 from __future__ import annotations
@@ -42,11 +30,7 @@ CHUNK_SIZE = 200
 
 
 MECHANISM_START = "2026-10-28"
-"""First day this code replays faithfully. services#4902 (JIT liquidity orders no longer
-claim token pairs in `pick_winners`) went live on mainnet on 2026-10-27 — the first
-auction with two winners on one directed pair is 14118229, 21:34 UTC — and everything
-here assumes it. Two older limits sit behind it and never bind: the staging price arrays
-begin 2026-09-15, and zero-score solutions are kept since services#4753 (August 2026)."""
+"""First day replayed faithfully: services#4902 (JIT orders claim no token pairs)."""
 
 
 class UnsupportedWindowError(Exception):
@@ -54,11 +38,6 @@ class UnsupportedWindowError(Exception):
 
 
 def require_current_mechanism(start: str) -> None:
-    """Refuse a window that begins before the rules this code replays were live.
-
-    An older window would still run — and be wrong only in the handful of auctions a
-    day where a JIT order used to block another solution — so it has to fail by name
-    rather than report numbers under the wrong mechanism."""
     if start[:10] < MECHANISM_START:
         raise UnsupportedWindowError(
             f"the window starts {start}, before {MECHANISM_START}: this code replays "
@@ -68,31 +47,17 @@ def require_current_mechanism(start: str) -> None:
 
 
 class MissingOrderError(Exception):
-    """A traded auction order is not in `stg_backend_data__orders`.
-
-    Only orders of the auction are read at all — JIT orders are left out by
-    `EXECUTIONS_SQL` — and the staging table holds every proposed order the backend's
-    `orders` table knows, so this cannot happen short of a broken sync. Measured over
-    2026-10-24..11-23 on nine chains: zero."""
+    """A traded auction order is not in `stg_backend_data__orders`."""
 
 
 class MissingAuctionContextError(Exception):
     """An auction has proposed solutions but no `competition_auctions` row.
 
-    Tolerating it would corrupt the run silently: `EXECUTIONS_SQL` inner-joins the
-    table, so every execution would vanish and every bid would be dropped as having no
-    order the mechanism cares about."""
+    Fatal: `EXECUTIONS_SQL` inner-joins that table, so its bids would silently vanish."""
 
 
 class MissingPricesError(Exception):
-    """An auction with bids has NULL price arrays in `competition_auctions`.
-
-    Every real auction has a price vector — the autopilot cannot run one without — so
-    this is always a gap in the source, and it comes as a range of auctions, not one:
-    the staging arrays are NULL before 2026-09-15 and no other copy of those prices is
-    left in the analytics DB. Tolerating it would be silent: every such auction becomes
-    a valuation failure, the run reports it as abandoned and exits 0 with numbers over
-    whatever is left
+    """An auction with bids has NULL price arrays in `competition_auctions`
     ([docs](../docs/analytics-db.md#native-prices-the-competition_auctions-arrays))."""
 
 
@@ -102,43 +67,24 @@ class SolverResolutionError(Exception):
 
 @dataclass(frozen=True)
 class Settlement:
-    """On-chain outcome of one winning solution.
-
-    Only the *status* is read from chain. Executed amounts always come from
-    `proposed_trade_executions`, because a batch that lands executes exactly the amounts
-    its solution proposed — verified to the atom on every order row of every settled
-    winner ([docs](../docs/analytics-db.md#a-settled-proposal-is-exact--the-only-divergence-is-settling-at-all)).
-    So the only thing chain data adds is whether it landed at all.
-
-    `landed` and `in_time` come apart: a batch that arrives after its deadline still fills
-    its orders, so the user does receive surplus, but the solver earns no reward for it.
-    Measured over the 2026-08-01..04 validation window: 8,768 of 10,301 winners landed,
-    of which 16 were late.
+    """On-chain status of one winning solution; a landed batch executes exactly its
+    proposed amounts
+    ([docs](../docs/analytics-db.md#a-settled-proposal-is-exact--the-only-divergence-is-settling-at-all)).
     """
 
     landed: bool
-    """Did a settlement transaction appear on chain at all (`tx_hash is not null`)?"""
     in_time: bool
-    """Did it arrive before its deadline (`is_settled_in_time`)?"""
 
     @property
     def counts_as_executed(self) -> bool:
-        """Whether the counterfactual treats this batch as having executed.
-
-        **A late settlement counts as a failure with zero surplus**, even though its orders
-        really did fill. Deliberate, and the one place this analysis knowingly departs from
-        what happened: a batch the protocol did not reward is not a batch the mechanism can
-        be credited with, and the surplus and reward sides have to agree on which
-        winners delivered. The cost is the real surplus of 16 late winners in the window —
-        `landed and not in_time` is kept so that cost stays visible rather than becoming
-        invisible rounding.
-        """
+        """A late batch counts as failed with zero surplus, though its orders filled, so
+        the surplus and reward sides agree on which winners delivered."""
         return self.in_time
 
 
 @dataclass(frozen=True)
 class SolverMatch:
-    """One catalogue entry for a `--solver` argument, with its activity in the window."""
+    """Catalogue entry matching `--solver`, with its activity in the window."""
 
     address: str
     name: str
@@ -151,8 +97,6 @@ class SolverMatch:
 
 @dataclass(frozen=True)
 class Bid:
-    """One proposed solution, with the orders it trades."""
-
     auction_id: int
     uid: int
     solver: str
@@ -160,8 +104,7 @@ class Bid:
     is_winner: bool
     filtered_out: bool
     orders: tuple[Order, ...]
-    """The auction's orders this solution trades. JIT orders are not here: they do not
-    count toward score, are ignored by the fairness filter and claim no token pair."""
+    """Auction orders only; JIT orders are inert (services#4902)."""
 
 
 @dataclass(frozen=True)
@@ -169,16 +112,12 @@ class AuctionBundle:
     auction_id: int
     native_prices: dict[str, int]
     bids: tuple[Bid, ...]
-    """Ordered by `uid`, i.e. best-to-worst as the autopilot recorded them."""
+    """Ordered by `uid`: best-to-worst as recorded, which reference scores depend on."""
     reference_scores: dict[str, int]
-    """Ground truth from `stg_backend_data__reference_scores`, winners only."""
+    """Recorded; winners only."""
     block_deadline: int = 0
-    """The auction's deadline block. Rewards are converted native -> COW at the
-    conversion rate of the accounting period this block falls in."""
     fee_context: FeeContext = EMPTY_FEE_CONTEXT
-    """Protocol-fee inputs. `EMPTY_FEE_CONTEXT` when `load_auctions` was asked not to
-    fetch them, in which case every fee reads as unrecorded and the fee deltas are
-    reported as unavailable rather than as zero."""
+    """`EMPTY_FEE_CONTEXT` when fees were not loaded: fees read unrecorded, not zero."""
 
 
 WINDOW_SQL = """
@@ -197,12 +136,8 @@ where auction_id = any(%(ids)s)
 order by auction_id, uid
 """
 
-# Only executions of the auction's own orders. An order outside `order_uids` is a JIT
-# order — the solver's own liquidity — and the mechanism treats it as if it were an AMM
-# interaction: no score, no say in the fairness filter, no token pair claimed
-# (services#4902). `surplus_capturing_jit_order_owners`, the one exception, has been
-# empty on every chain since the CoW AMMs were retired (measured 2026-10-24..11-23, ten
-# chains, zero auctions with an owner), so it is not read.
+# Auction orders only; JIT orders are inert (services#4902). Exact only while
+# `surplus_capturing_jit_order_owners` is empty, which is not read.
 EXECUTIONS_SQL = """
 select
     pte.auction_id,
@@ -235,12 +170,7 @@ from dbt.stg_backend_data__competition_auctions
 where auction_id = any(%(ids)s)
 """
 
-# Native prices, `(auction_id, token) -> price`, come from the parallel `price_tokens` /
-# `price_values` arrays of `competition_auctions`, populated from 2026-09-15 00:00 UTC.
-# Nothing older is read: the table that held earlier prices was dropped on 2026-11-05.
-#
-# Queries over prices read the relation `{auction_prices}`, restricted to `%(ids)s`, and
-# run through `fetch_prices`, which fills it in.
+# The `{auction_prices}` relation, restricted to `%(ids)s`; filled in by `fetch_prices`.
 _ARRAY_PRICES = """
     select ca.auction_id, ap.token, ap.price
     from dbt.stg_backend_data__competition_auctions ca
@@ -248,10 +178,7 @@ _ARRAY_PRICES = """
     where ca.auction_id = any(%(ids)s)
 """
 
-# The valuation itself only needs buy-token prices — `compute_order_score` converts
-# through the buy token for both order sides — but the price-sanity check values each
-# trade through *both* tokens and compares, so sell tokens ride along. Restricting to
-# traded tokens keeps this from returning every price in every auction (~900 rows each).
+# Sell tokens too: the price-sanity check values each trade through both tokens.
 PRICES_SQL = """
 with traded as (
     select distinct pte.auction_id, t.token
@@ -280,9 +207,7 @@ where auction_id = any(%(ids)s)
 order by auction_id, order_uid, application_order
 """
 
-# The partner count is a property of the order's app data, not of any settlement, so it
-# is available for orders that never traded. Only non-zero counts are returned; the
-# default is zero and the join would otherwise repeat every order in the window.
+# Non-zero counts only; an absent order has zero partners.
 PARTNER_COUNTS_SQL = """
 select
     encode(o.uid, 'hex')                        as order_uid,
@@ -293,8 +218,6 @@ where o.uid = any(%(uids)s)
   and array_length(ad.partner_fee_recipients, 1) > 0
 """
 
-# One row per order, with no auction dimension. Only `priceimprovement` policies consult
-# it, so the caller restricts the uid list to those orders.
 QUOTES_SQL = """
 select
     encode(order_uid, 'hex') as order_uid,
@@ -320,12 +243,7 @@ from dbt.int_backend_data__proposed_solution_data
 where auction_id = any(%(ids)s)
 """
 
-# One row per *winning* solution, always — the model left-joins settlements onto the
-# winners, so a winner that never settled is a row with a null `tx_hash` rather than a
-# missing row. That distinction is what lets a missing row mean "no data" and fail loudly.
-# Verified over the 2026-08-01..04 validation window: 10,301 winners, 10,301 rows, no
-# duplicates, no rows for
-# non-winners.
+# One row per winning solution; an unsettled winner has a NULL `tx_hash`, not no row.
 SETTLEMENTS_SQL = """
 select
     auction_id,
@@ -336,15 +254,7 @@ from dbt.int_backend_data__winning_solutions_with_onchain_status
 where auction_id = any(%(ids)s)
 """
 
-# The reward formula's own inputs, straight from the model `fct_solver_rewards_per_auction`
-# builds on: one row per winning solution with its score, settlement flag and caps. Used
-# by `loo validate-rewards`, which recomputes both rewards from these and compares
-# against the mart —
-# so the only thing in the comparison's path is the formula transcription itself.
-#
-# `lower_reward_cap` here is still the flat per-chain floor (or 0 in a no-penalties
-# window); since CIP-87 the mart floors at the solver's `penalty_cap_native` instead
-# whenever every one of its solutions has one, so both are read and the rule lives in
+# `lower_reward_cap` is only the flat floor: combine with `penalty_cap_native` through
 # `rewards.lower_reward_cap` (docs/rewards.md#the-caps).
 REWARD_INPUTS_SQL = """
 select auction_id, solution_uid, encode(solver, 'hex') as solver, score,
@@ -362,19 +272,8 @@ from dbt.fct_solver_rewards_per_auction
 where auction_id = any(%(ids)s)
 """
 
-# `int_accounting_period_data__conversion_rates` carries one row per **block** with the
-# COW->native conversion rate of the accounting period (Tuesday to Tuesday) the block's
-# time falls in. The rate is snapshotted from Dune only after the period is paid out, so
-# recent blocks have a row with a NULL rate — callers must treat missing-rate as "not
-# convertible yet", not as an error.
-#
-# Queried per **period**, never per block: the table has one row per block of the whole
-# synced history and, being a plain dbt incremental table, no index — a
-# `block_number = any(<thousands of blocks>)` probe forced full scans that evaluate the
-# array against every row, and a multi-invocation sweep of those drove the shared DB's
-# CPU alert (2026-08-14). The rate is constant within a period, so one range scan with
-# a group-by returns the handful of (first_block, last_block, rate) rows the same
-# information lives in, and the block -> rate mapping happens client-side.
+# Query per period, never per block: the table is unindexed. A NULL rate means the period
+# is not paid out yet ("not convertible yet"), not an error.
 CONVERSION_RATES_SQL = """
 select
     min(block_number) as first_block,
@@ -385,41 +284,17 @@ where block_number between %(first)s and %(last)s
 group by accounting_period_start_time, conversion_rate_cow_to_native
 """
 
-# USD reference prices for display conversion. The analytics DB has no USD price
-# table; a major stablecoin's native price in the auction's own price vector implies
-# the rate — see `primitives.USD_REFERENCE_TOKENS`.
 USD_PRICES_SQL = """
 select ap.auction_id, encode(ap.token, 'hex') as token, ap.price
 from {auction_prices} ap
 where ap.token = any(%(tokens)s)
 """
 
-# `--solver` takes a name or an address. Names are matched **exactly** (case-insensitively):
-# among active solvers `Arc` is a substring of `Arctic` and both bid, so
-# any `like '%…%'` match would silently remove two competitors. `Uncatalogued` is excluded
-# because it is `coalesce(name, 'Uncatalogued')` — a bucket for addresses missing from the
-# Dune seed, not a solver; those must be named by address.
-#
-# The catalogue holds several addresses per name where a solver has rotated keys, so the
-# result is intersected with what actually bid in the window. Rotations never overlap, so
-# in practice this collapses to one address; when it does not, all of them are the same
-# competitor and all must go — `compute_reference_scores` removes *all* of a solver's
-# solutions, so splitting a rotation across two "solvers" would give wrong reference scores.
-# Every competitor that bid in the window, as a `--solver` argument would name it: the
-# catalogue name where there is one, the bare address otherwise. Grouping by *name* rather
-# than address is the point — one competitor can hold several addresses through key
-# rotations and they have to be removed together (D9), which is exactly what
-# `resolve_solver` does with a name. Uncatalogued addresses have no name to group by
-# (`dune_data__cow_protocol__solvers` calls them all "Uncatalogued"), so each is its own
-# competitor, named by its address.
-#
-# The `between` on `ps.auction_id` here and in `SOLVER_SQL` is load-bearing. The window
-# CTE's size is invisible to the planner (its bounds are subqueries), so a plain join
-# against `proposed_solutions` was planned as a hash join over a sequential scan of the
-# whole table — 13.4M rows on mainnet, 10 s warm and far longer cold or under load, and
-# repeated once per solver by `resolve_solver`. Bounding the join to the window's id
-# range gives the `(auction_id, uid)` index a leading-column range to scan: 0.5 s.
-# Auction ids are sparse but monotone, so the range holds the window and little else.
+# Names match exactly, case-insensitively (`Arc` is a substring of `Arctic`); one name can
+# hold several rotated addresses, which go together. "Uncatalogued" is a bucket, not a
+# solver: those addresses are named by address.
+# Bound `ps.auction_id` by the window's id range (here and in `SOLVER_SQL`) or the planner
+# seq-scans `proposed_solutions`.
 ALL_SOLVERS_SQL = """
 with window_auctions as (
     select distinct auction_id
@@ -494,11 +369,7 @@ order by coalesce(a.solutions, 0) desc, c.name
 
 
 def auctions_in_window(conn: Connection, start: str, end: str) -> list[int]:
-    """Auction ids with at least one bid in `[start, end)`.
-
-    This is the same auction universe the dbt reward models use. Auction ids are sparse
-    — do not assume the returned range is contiguous.
-    """
+    """Auction ids with at least one bid in `[start, end)`; sparse, not contiguous."""
     rows = fetch(conn, WINDOW_SQL, {"start": start, "end": end})
     return [row["auction_id"] for row in rows]
 
@@ -526,20 +397,10 @@ def load_auctions(
     with_fees: bool = True,
     fast_path: list[int] | None = None,
 ) -> Iterator[AuctionBundle]:
-    """Yield one `AuctionBundle` per auction, in the order given.
+    """Yield an `AuctionBundle` per auction with solutions, in the order given.
 
-    Queries are batched over chunks of auction ids; auctions with no recorded solutions
-    are skipped silently, since they carry no bids to arbitrate.
-
-    `with_fees` adds three queries per chunk — policies, partner counts and quotes — and
-    is what makes the protocol-fee deltas available. Turning it off leaves every fee
-    unrecorded, so those deltas report as unavailable rather than as zero.
-
-    Fast-path auctions are never yielded; their ids go to `fast_path` when it is given.
-    They are not auctions: one order is settled straight from its quote competition,
-    the losing quotes are stored as solutions below the order's limit, and the winner
-    earns no batch reward. Re-running winner selection on them answers nothing
-    ([docs](../docs/winner-selection.md#fast-path-auctions-are-excluded)).
+    Fast-path auctions are not yielded; their ids go to `fast_path`
+    ([why](../docs/winner-selection.md#fast-path-auctions-are-excluded)).
     """
     for chunk in chunked(list(auction_ids), chunk_size):
         ids = list(chunk)
@@ -619,13 +480,7 @@ def load_auctions(
 def _load_fee_contexts(
     conn: Connection, ids: list[int], execution_rows: list[Row], solution_rows: list[Row]
 ) -> dict[int, FeeContext]:
-    """Build one `FeeContext` per auction in the chunk.
-
-    The coverage set is derived from data already in hand rather than re-queried: an
-    auction order's policies are recorded iff it appears in a solution that was not
-    filtered out. Anything else is genuinely unrecorded and is reported rather than
-    read as zero.
-    """
+    """Policies are recorded iff the order is in a non-filtered-out solution."""
     known: dict[int, set[str]] = {}
     filtered_out = {
         (row["auction_id"], row["uid"]): bool(row["filtered_out"]) for row in solution_rows
@@ -635,8 +490,7 @@ def _load_fee_contexts(
         if not filtered_out.get(key, True):
             known.setdefault(row["auction_id"], set()).add(row["order_uid"])
 
-    # `FEE_POLICIES_SQL` orders by `application_order`, so appending preserves the
-    # application sequence, which `policy_fees` then walks in reverse.
+    # Appending keeps `application_order`, which `policy_fees` walks in reverse.
     collected: dict[int, dict[str, list[Policy]]] = {}
     needs_quote: set[str] = set()
     for row in fetch(conn, FEE_POLICIES_SQL, {"ids": ids}):
@@ -678,8 +532,7 @@ def _load_fee_contexts(
                     row["gas_amount"], row["gas_price"], row["sell_token_price"]
                 )
             except FeeError:
-                # A quote we cannot evaluate is not a quote: leaving it out makes the
-                # affected orders report unknown fees, which is the honest reading.
+                # Left out, so its orders report unknown fees.
                 continue
             quotes[row["order_uid"]] = Quote(
                 sell_amount=as_int(row["sell_amount"]),
@@ -704,8 +557,6 @@ def _build_bid(row: Row, execution_rows: list[Row]) -> Bid:
     for execution in execution_rows:
         uid = execution["order_uid"]
         if execution["sell_token"] is None:
-            # Nothing can be valued without the order's tokens and limits, and guessing
-            # would corrupt the pair decomposition silently. Loud failure instead.
             raise MissingOrderError(
                 f"auction {row['auction_id']} solution {row['uid']}: auction order "
                 f"{uid} is not in stg_backend_data__orders"
@@ -739,12 +590,7 @@ def _build_bid(row: Row, execution_rows: list[Row]) -> Bid:
 def load_settlement_outcomes(
     conn: Connection, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
 ) -> dict[int, dict[int, Settlement]]:
-    """On-chain outcome per winning solution, keyed by auction then `solution_uid`.
-
-    Only winners have rows, which is all the counterfactual needs: a solution that did not
-    win never had a chance to settle. An auction absent from the result had no recorded
-    winners at all.
-    """
+    """Outcome per winning solution, keyed by auction then `solution_uid`."""
     outcomes: dict[int, dict[int, Settlement]] = {}
     for chunk in chunked(list(auction_ids), chunk_size):
         for row in fetch(conn, SETTLEMENTS_SQL, {"ids": list(chunk)}):
@@ -757,30 +603,19 @@ def load_settlement_outcomes(
 
 @dataclass(frozen=True)
 class SolutionCap:
-    """One recorded winning solution's cap inputs from `int_backend_data__solution_data`.
-
-    `upper` is that solution's contribution to its solver's upper reward cap —
-    `scaling_factor × realised protocol fees`, so genuinely fractional (`Decimal`) and
-    **0 for a batch that never settled**, since unrealised fees are no fees. `lower`
-    (the flat floor) and `excluded` are auction-level facts that ride along on every
-    row.
-    """
+    """Cap inputs of one recorded winning solution. `upper` is 0 for a batch that never
+    settled; `lower` (the flat floor) and `excluded` are auction-level."""
 
     upper: Decimal
     lower: int
     excluded: bool
     penalty: Decimal | None = None
-    """The solution's CIP-87 penalty cap: the sum of its orders' caps, each scaled to
-    the executed fraction of a partially fillable order. Unlike `upper` it does not
-    depend on the batch landing — it is set from the auction's order list. `None` when
-    the solution has none, which is every solution before 2026-09-08; the solver's
-    floor is then the flat `lower` (`rewards.lower_reward_cap`)."""
+    """CIP-87 penalty cap, independent of landing. `None` means none (flat `lower`
+    applies); 0 is a real cap."""
 
 
 @dataclass(frozen=True)
 class RewardInputs:
-    """Everything the reward formula consumes for one auction, from the DB's record."""
-
     wins: tuple[Win, ...]
     lower_cap: int
     excluded: bool
@@ -789,7 +624,6 @@ class RewardInputs:
 def _reward_input_rows(
     conn: Connection, auction_ids: Sequence[int], chunk_size: int
 ) -> Iterator[Row]:
-    """`REWARD_INPUTS_SQL` rows, chunked — shared by the two shapes built from them."""
     for chunk in chunked(list(auction_ids), chunk_size):
         yield from fetch(conn, REWARD_INPUTS_SQL, {"ids": list(chunk)})
 
@@ -797,8 +631,7 @@ def _reward_input_rows(
 def load_reward_inputs(
     conn: Connection, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
 ) -> dict[int, RewardInputs]:
-    """The reward formula's inputs per auction — each winning solution's solver, score,
-    settled-in-time flag and caps — from the same model the dbt rewards mart reads."""
+    """Reward-formula inputs per auction, from the model the rewards mart reads."""
     rows_by_auction: dict[int, list[Row]] = {}
     for row in _reward_input_rows(conn, auction_ids, chunk_size):
         rows_by_auction.setdefault(row["auction_id"], []).append(row)
@@ -808,8 +641,6 @@ def load_reward_inputs(
         lower_caps = {as_int(r["lower_reward_cap"]) for r in rows}
         excluded = {bool(r["is_excluded"]) for r in rows}
         if len(lower_caps) != 1 or len(excluded) != 1:
-            # Both are auction-level facts; two values on one auction means the model
-            # changed shape and the comparison below would be against the wrong caps.
             raise ValueError(
                 f"auction {auction_id}: inconsistent lower_reward_cap/is_excluded "
                 f"across its winning solutions"
@@ -834,11 +665,8 @@ def load_reward_inputs(
 def load_solution_caps(
     conn: Connection, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
 ) -> dict[int, dict[int, SolutionCap]]:
-    """Cap inputs per recorded winning solution, keyed by auction then `solution_uid`.
-
-    Winners only, by construction of `int_backend_data__solution_data` — a
-    counterfactual replacement has no row here, which is exactly why its cap has to be
-    inherited from the slot it displaced."""
+    """Cap inputs per recorded winner, keyed by auction then `solution_uid`. Winners
+    only: a counterfactual replacement inherits the cap of the slot it displaced."""
     caps: dict[int, dict[int, SolutionCap]] = {}
     for row in _reward_input_rows(conn, auction_ids, chunk_size):
         caps.setdefault(row["auction_id"], {})[row["solution_uid"]] = SolutionCap(
@@ -851,16 +679,14 @@ def load_solution_caps(
 
 
 def _optional_decimal(value: Decimal | None) -> Decimal | None:
-    """A nullable `numeric` column as `Decimal`, keeping NULL `None` — for the caps,
-    where a missing value means "no cap" and must not read as a cap of 0."""
+    """NULL stays `None`: a missing cap means no cap, not 0."""
     return None if value is None else Decimal(value)
 
 
 def load_reference_scores(
     conn: Connection, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
 ) -> dict[int, dict[str, int]]:
-    """Recorded reference scores keyed by auction then solver — winners only, by
-    construction of the table."""
+    """Recorded reference scores keyed by auction then solver; winners only."""
     references: dict[int, dict[str, int]] = {}
     for chunk in chunked(list(auction_ids), chunk_size):
         for row in fetch(conn, REFERENCE_SCORES_SQL, {"ids": list(chunk)}):
@@ -893,13 +719,7 @@ def load_fct_rewards(
 def load_conversion_rates(
     conn: Connection, blocks: Sequence[int]
 ) -> dict[int, Decimal | None]:
-    """COW->native conversion rate per block, `None` where the accounting period has
-    not been snapshotted yet. A block outside every synced period also maps to `None`.
-
-    One query for the whole block range, returning one row per accounting period —
-    see the SQL comment for why this must never be a per-block lookup. Each period's
-    observed [first_block, last_block] within the range assigns its rate to the
-    requested blocks client-side."""
+    """COW->native rate per block; `None` where the period is not snapshotted or synced."""
     rates: dict[int, Decimal | None] = {block: None for block in blocks}
     if not rates:
         return rates
@@ -913,9 +733,7 @@ def load_conversion_rates(
         for first, last, rate in periods:
             if first <= block <= last:
                 if rate is not None:
-                    # The column is double precision; going through `str` keeps the
-                    # value the DB displays rather than the binary expansion of the
-                    # float.
+                    # Double precision: `str` keeps the displayed value, not the binary.
                     rates[block] = Decimal(str(rate))
                 break
     return rates
@@ -927,14 +745,8 @@ def load_usd_rates(
     network: str = "mainnet",
     chunk_size: int = CHUNK_SIZE,
 ) -> dict[int, Decimal]:
-    """USD per native token, per auction, implied by stablecoin native prices.
-
-    Per auction the median across the network's reference stablecoins is taken, so one
-    bad price cannot set the rate (the D14 lesson, applied to the one place a price is
-    used without a counterparty to cross-check it). Auctions where no reference token
-    was priced are simply absent — callers fall back to a window median rather than
-    treating that as an error, since USD figures are display only.
-    """
+    """USD per native token per auction, the median over reference stablecoins' prices.
+    Auctions with none priced are absent."""
     reference = usd_reference_tokens(network)
     token_bytes = [bytes.fromhex(token) for token in reference]
     per_auction: dict[int, list[Decimal]] = {}
@@ -957,16 +769,7 @@ def solver_matches(conn: Connection, solver: str, start: str, end: str) -> list[
 
 
 def all_solvers(conn: Connection, start: str, end: str) -> list[str]:
-    """Every competitor that bid in `[start, end)`, named as `--solver` would name it.
-
-    One entry per catalogue name — so a solver's rotated addresses stay together, which
-    is what `resolve_solver` will do with the name anyway — and one per uncatalogued
-    address, which has no name to group by.
-
-    Deliberately derived from the window rather than from the catalogue: a run should
-    cover the solvers that actually competed, not every solver ever registered, and an
-    entry that bid nowhere would fail resolution.
-    """
+    """Every competitor that bid in `[start, end)`, named as `--solver` would name it."""
     rows = fetch(conn, ALL_SOLVERS_SQL, {"start": start, "end": end})
     return [row["label"] for row in rows]
 
@@ -974,14 +777,7 @@ def all_solvers(conn: Connection, start: str, end: str) -> list[str]:
 def resolve_solver(
     conn: Connection, solver: str, start: str, end: str
 ) -> tuple[frozenset[str], list[SolverMatch]]:
-    """Submission addresses to remove for `--solver`, and the matches behind them.
-
-    Returns every matching address that bid in the window — see `SOLVER_SQL` on why a
-    single competitor can hold more than one. Raises `SolverResolutionError` when nothing
-    matched or when the matches never bid, rather than quietly analysing the removal of a
-    solver that was not there: that would produce a clean run of all-zero deltas, which
-    reads as a finding.
-    """
+    """Every address of `--solver` that bid in the window, and the matches behind them."""
     matches = solver_matches(conn, solver, start, end)
     if not matches:
         raise SolverResolutionError(
@@ -1004,12 +800,8 @@ def resolve_solver(
 def load_db_order_surplus(
     conn: Connection, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
 ) -> dict[tuple[int, int, str], int]:
-    """`order_surplus_atoms_in_surplus_token` keyed by (auction, solution uid, order).
-
-    An independent check on `valuation.order_surplus`: the dbt model computes the same
-    quantity by a different route. Only covers auctions the intermediate model has
-    caught up with.
-    """
+    """`order_surplus_atoms_in_surplus_token` by (auction, solution uid, order): an
+    independent check on `valuation.order_surplus`, for auctions the lagging model has."""
     surplus: dict[tuple[int, int, str], int] = {}
     for chunk in chunked(list(auction_ids), chunk_size):
         for row in fetch(conn, DB_SURPLUS_SQL, {"ids": list(chunk)}):

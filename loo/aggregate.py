@@ -1,26 +1,6 @@
-"""Aggregate `analyse` reports into a per-solver comparison.
-
-Consumes the JSON written by `loo analyse --out` rather than re-running the pipeline:
-a full-window run takes ~5 minutes, and the report already carries every changed
-auction's deltas, so window aggregation, medians and USD conversion are pure
-post-processing.
-
-Three shapes of statement come out of one report, and the table keeps them apart:
-
-- **Sums** answer the window question but are whale-dominated — one auction carried 82%
-  of Sector's Δsurplus — so every sum is reported with the median non-zero auction and
-  the largest auction's share next to it.
-- **The outcome rule is part of the number.** The headline is `inherited` — settlement
-  attaches to the slot, the one scenario grounded in the record; `assume-settled`
-  (everything lands in time) is the alternative reading. A figure quoted without its
-  rule would be a choice disguised as a result.
-- **Two reward figures, never one.** Uncapped is the mechanism's exact accounting,
-  three orders of magnitude away from payouts; capped is the payout answer but an
-  estimate. The net-change row is always labelled with which one it nets against.
-
-USD figures are display only. The analytics DB has no USD price table, so the rate is
-implied per auction by the median stablecoin price in the auction's own price vector
-(`primitives.USD_REFERENCE_TOKENS`); auctions without one use the window median.
+"""Aggregate `analyse --out` reports into a per-solver comparison table.
+USD is display only: each auction's rate is the median stablecoin price in its own price
+vector (`primitives.USD_REFERENCE_TOKENS`), else the window median.
 """
 
 from __future__ import annotations
@@ -32,11 +12,8 @@ from decimal import Decimal, getcontext
 from statistics import median
 from typing import Any
 
-# Capped rewards arrive as ~40-digit Decimal strings and are summed over thousands of
-# auctions; Python's default 28-digit context silently rounds those sums, which the
-# consistency check in `load_report` then misreads as file corruption. 78 digits covers
-# a full uint256 — the same setting, for the same reason, as `loo.rewards`. Set here
-# too because a notebook can import this module without ever touching that one.
+# Capped rewards are ~40-digit Decimals; 28 digits would round their sums and fail
+# `load_report`'s totals check.
 getcontext().prec = 78
 
 WEI = Decimal(10) ** 18
@@ -45,25 +22,15 @@ HEADLINE_RULE = "inherited"
 ALTERNATIVE_RULES = ("assume-settled",)
 
 REPORT_FORMAT = 15
-"""Version marker of the `analyse --out` payload, required by `load_report`. Bumped
-when the shape changes, so a stale file fails with "re-run analyse" instead of a
-KeyError deep inside a comparison. Format 15 is the current-mechanism report: JIT orders
-are not in it, fast-path auctions are listed (`fast_path_auctions`), and the quote side
-carries one link (`quote_window.link`) with no match tiers. A format-14 file excluded
-every auction with an unrecorded JIT order, so the two are not comparable."""
+"""Bump whenever the `analyse --out` payload shape changes."""
 
 SIGN_CONVENTION_ID = "counterfactual-minus-actual"
-"""Written into every `analyse --out` JSON and required by `load_report`, so a report
-from before the convention flip fails loudly instead of being tabulated with every
-sign silently inverted."""
 
 SIGN_CONVENTION = (
     "every delta is counterfactual minus actual — negative Δsurplus means users would "
     "have received less without the solver, positive Δrewards means the protocol would "
     "have paid more"
 )
-"""Stated on every rendering rather than assumed: the same numbers under the equally
-sensible with-minus-without convention would flip every sign."""
 
 CAVEATS = (
     "No behavioural response: the remaining solvers' bids are held fixed, so nothing "
@@ -147,145 +114,98 @@ CAVEATS = (
     "USD figures are display-only conversions at each auction's own stablecoin-implied "
     "rate; they inherit every caveat of the native-token figure they restate.",
 )
-"""Rendered with every comparison — the numbers are not supposed to travel without
-them. The rationale behind each lives in PLAN.md's decision table and docs/."""
 
 
 @dataclass(frozen=True)
 class AuctionMove:
-    """One changed auction's deltas, from a report's `changed` array."""
-
     auction_id: int
     delta_surplus: int
     delta_surplus_only_with: int
-    """The part of `delta_surplus` from orders executed only with the solver — orders
-    that do not trade at all on the LOO side, so the whole of their surplus is lost
-    rather than moved to a worse price."""
+    """Part of `delta_surplus` from orders that trade only with the solver."""
     delta_rewards: int
     delta_rewards_capped: Decimal | None
     delta_protocol_and_partner_fees: int = 0
     delta_partner_fees: int = 0
     delta_protocol_fees: int = 0
-    """Per-auction fee deltas, so the USD conversion uses each auction's own rate rather
-    than a window average — the same treatment Δsurplus gets. Computed with the recorded
-    quotes on both sides; the quote's own fee effect is the recharge below."""
+    """Fee deltas use the recorded quotes on both sides; the quote's effect is the recharge."""
     quote_fee_recharge: int = 0
     quote_fee_recharge_partner: int = 0
     quote_fee_recharge_protocol: int = 0
     quote_fee_recharges: tuple[int, ...] = ()
-    """The price-improvement fee the counterfactual executions pay against the replacement
-    quotes minus against the recorded ones — gross, the partners' part, the DAO's — and
-    the per-order values behind them, for the median and the concentration check."""
+    """Price-improvement fee against replacement minus recorded quotes: gross, partner,
+    DAO, per order."""
 
 
 @dataclass(frozen=True)
 class QuoteSide:
-    """The quote competition's part of one report.
-
-    Three figures lead, one per question the quote side exists to answer, and the fee
-    consequence is deliberately not among them: it is inside `delta_protocol_fees`,
-    because the counterfactual quote is what the recorded execution's
-    `priceimprovement` fee was recomputed against. One fee number, not two.
-    """
+    """The quote competition's part of one report."""
 
     ranking: str
     start: str
     end: str
     orders_total: int
-    """Every order created in the quote window that carries a recorded quote, before the
-    price-suspect exclusion."""
+    """Window orders with a recorded quote, before the price checks."""
     trivial_orders: int
-    """Of those, the unwraps no competition priced (`quotes.TRIVIAL_QUOTE_SOLVER`) —
-    not linked, so the link rate is over `orders_total − trivial_orders`."""
+    """Unwraps with no competition (`quotes.TRIVIAL_QUOTE_SOLVER`); never linked."""
     link: LinkSummary
-    """How the quote-id link fared on the window's orders."""
     window_orders: int
     window_volume_native: int
-    """Orders created in the window carrying a recorded quote **and** passing both price
-    checks, and the **executed** sell-side value of those orders in native wei — the
-    denominators of `no_quote_share` and `window_bps`. Executed rather than quoted: probe
-    orders that never trade would otherwise be most of the denominator."""
+    """Orders passing both price checks and their executed (not quoted) sell-side value:
+    the denominators of `no_quote_share` and `window_bps`."""
     window_quoted_volume_native: int
     price_suspects: int
     price_suspects_one_sided: int
     price_suspects_two_sided: int
     price_suspect_volume_native: int
-    """What was quoted whether it traded or not, and the orders excluded because a price
-    check failed — either one, then each, then the executed volume they took out of the
-    denominator at the api's price, which is the size of what the checks caught."""
+    """Orders failing either / the one-sided / the two-sided price check, and their
+    executed volume at the api's price."""
     matched: int
-    """How many orders were linked. Everything below is over `matched`."""
+    """Linked orders; the counts below are over these."""
     quote_wins: int
     no_quote: int
     no_quote_share: Decimal | None
     class_flips: int
-    """Wins where the replacement is unverified while the removed winner was verified:
-    the quote survives and may even read better in bps, while its quality falls. Its own
-    count, never netted into the bps figures."""
+    """Wins whose replacement is unverified where the winner was verified; not in bps."""
     degraded: int
     unpriced: int
     nonpositive: int
     implausible: int
-    """Wins whose replacement quote is more than 2x off the recorded one in either
-    direction — a broken estimate promoted to winner, excluded from every figure."""
+    """Wins whose replacement is >2x off the recorded quote; excluded."""
     unrecorded: int
-    """Wins on a stream dropped before the answer its user would have waited for arrived:
-    what they would have been shown was never recorded. Excluded from every figure."""
+    """Wins on a stream dropped before the user's answer arrived; excluded."""
     stream_wins: int
     commit_dependent: int
-    """Wins on orders placed from a streamed quote, and how many of their replacements
-    depend on when the user committed — the one assumption of the stream rule, counted."""
+    """Stream wins whose replacement depends on when the user committed."""
     window_bps: Decimal | None
     conditional_bps: Decimal | None
-    """The quote-side price change, spread over the window's whole quoted volume and —
-    the conditional reading — over the volume of the orders whose quote moved. Both are
-    labelled; neither substitutes for the other (D23's rule, applied to quotes)."""
+    """Over the window's executed volume, and over the moved orders' volume only."""
     median_bps: Decimal | None
     largest_share: Decimal | None
     largest_bps: Decimal | None
-    """The distribution behind those averages, because it is heavy-tailed and the
-    averages are dominated by their tail: the median moved order, and the largest single
-    order's share of the numerator with its own bps. Measured on July mainnet, one order
-    was 86.6% of one solver's figure and 84.6% of another's — the same concentration
-    check the solve side runs on Δsurplus, and the same reason it exists. Derived from
-    the stored diffs at load time, so no re-run is needed to revise the conditioning."""
     fee_recharge_partner: int
     fee_recharge_protocol: int
     fee_recharge_median: Decimal | None
     fee_recharge_largest_share: Decimal | None
-    """The quote's own fee effect: the price-improvement fee the counterfactual
-    executions pay against the replacement quotes minus against the recorded ones —
-    gross, the partners' part, the DAO's — with the median recharged order and the
-    largest single order's share of the total, from the per-order values in the moves.
-    Positive for a solver whose quotes were good, and **not** added to the fee deltas:
-    a worse quote raises the fee baseline mechanically, which is not revenue the protocol
-    would gain (D28 revised)."""
+    """Never added to the fee deltas: a worse quote raises the fee baseline mechanically."""
     substituted_orders: int
     substituted_auctions: int
     checked_auctions: int
     quote_only_auctions: int
-    """Distinct executed orders whose price-improvement fee the counterfactual side
-    charged against a replacement quote, the auctions holding them, every auction where
-    any bid's order carried a replacement quote at all, and how many of those the solver
-    never bid in (D33). The quote effect visible inside `delta_protocol_fees`."""
+    """Recharged orders, their auctions, auctions with any replacement quote, and of
+    those the ones the solver never bid in."""
     limit_unclearable: int
     shift_changed_auctions: int
     shift_changed_auction_ids: tuple[int, ...]
-    """The two checks behind holding executions and ranking fixed under a replaced
-    quote (D34): recharged orders whose execution would not have cleared the limit the
-    replacement implies, and auctions where shifting every score by the limit change
-    would move the winner set. Both are expected near zero; either being large is a
-    finding about the design, not a number to adjust by."""
+    """Checks that executions and ranking hold under a replaced quote: orders missing the
+    replacement's limit, auctions whose winners move under the limit shift."""
     pick_rate: Decimal | None
     pick_requests: int
     pick_tied: int
     pick_tie_mismatches: int
     pick_streams: int
     pick_streams_reproduced: int
-    """The gate: how often re-running the pick returns the estimator the competition
-    recorded, over the matched requests that had a recorded winner; how many of those
-    were exact ties decided by arrival order, and how many ties went to an equivalent
-    estimate other than the recorded one (not counted as failures)."""
+    """Pick reproduction over matched requests with a recorded winner; tie mismatches
+    went to an equivalent estimate and are not failures."""
 
     @property
     def linkable(self) -> int:
@@ -294,20 +214,17 @@ class QuoteSide:
 
 @dataclass(frozen=True)
 class LinkSummary:
-    """The quote-id link over a quote window (`quotes.LinkStats`, as the report stores
-    it)."""
+    """The quote-id link over a quote window, as the report stores `quotes.LinkStats`."""
 
     orders: int
     linked: int
     requoted: int
-    """Of `linked`, the ethflow orders linked to the backend's own re-quote at indexing
-    rather than through their quote id."""
+    """Ethflow orders linked via the backend's re-quote at indexing, not their quote id."""
     streamed: int
     streamed_early: int
-    """Of `linked`, the orders placed from a streamed quote, and those of them that took
-    an answer before the stream's final best."""
+    """Orders from a streamed quote, and those that took an answer before its final best."""
     unlinked: tuple[tuple[str, int], ...]
-    """`(reason, orders)` for the quote-id link's misses, largest first."""
+    """`(reason, orders)`, largest first."""
 
     @property
     def rate(self) -> Decimal | None:
@@ -316,12 +233,7 @@ class LinkSummary:
 
 @dataclass(frozen=True)
 class Report:
-    """One `analyse --out` JSON, reduced to what the comparison consumes.
-
-    Every delta is counterfactual minus actual (`SIGN_CONVENTION_ID`, checked at load):
-    negative Δsurplus means users would have received less without the solver, positive
-    Δrewards means the protocol would have paid more.
-    """
+    """One `analyse --out` JSON. Every delta is counterfactual − actual."""
 
     path: str
     solver: str
@@ -333,8 +245,7 @@ class Report:
     price_suspects_excluded: bool
     price_suspects: int
     fast_path: int
-    """Fast-path auctions, excluded before arbitration. Unlike price suspects these are
-    not part of `auctions`; the window total is their sum."""
+    """Not part of `auctions`, unlike price suspects."""
     auctions: int
     auctions_with_solver: int
     auctions_solver_won: int
@@ -343,29 +254,18 @@ class Report:
     auctions_newly_kept_won: int
     multi_pair_solutions: int
     multi_pair_filter_proxied: int
-    """The fairness filter's exactness, over the auctions actually arbitrated — the ones
-    the solver bid in, not the whole window. Multi-pair solutions the filter judged, and
-    how many of those rested on the surplus fallback rather than on a recorded score or a
-    surplus that cleared its baseline outright."""
+    """Over auctions the solver bid in: verdicts resting on the surplus fallback."""
     auctions_filter_guess_could_matter: int
-    """Of those auctions, how many where flipping the guesses would move the winners.
-    The number to read: a guess on a solution that loses either way costs nothing."""
+    """Auctions where flipping the surplus-fallback verdicts would move the winners."""
     delta_surplus: int
     delta_protocol_and_partner_fees: int
     delta_partner_fees: int
     delta_protocol_fees: int
     protocol_fees_base: int
     auctions_fees_incomplete: int
-    """How the protocol fee changes without the solver, **with the recorded quotes on both
-    sides** — what the removal does to fees through who executes; the quote's own fee
-    effect is `quote.fee_recharge`, kept apart (D28 revised). `delta_protocol_and_partner_fees` is
-    the whole fee the mechanism charges and is the headline; `delta_partner_fees` is the
-    share passed on to partners, and `delta_protocol_fees` the remainder the DAO keeps.
-    Partner fees are most of the *level* and almost none of the movement — see
-    docs/analytics-db.md. All three are over the **union** of orders traded by either
-    side, so an order that stops being executed contributes its whole fee.
-    `auctions_fees_incomplete` counts auctions left out of all three because some
-    executed order's policies are unrecorded (M13)."""
+    """Fee deltas use the recorded quotes on both sides (quote effect: `quote.fee_recharge_*`)
+    over the union of orders either side traded; protocol = whole − partner.
+    `auctions_fees_incomplete`: auctions left out for unrecorded fee policies."""
     delta_rewards: int | None
     delta_rewards_capped: Decimal | None
     auctions_capped_skipped: int
@@ -377,43 +277,24 @@ class Report:
     orders_only_without_solver: int
     orders_only_with_fok: int
     orders_only_with_partial: int
-    """Distinct orders behind `orders_only_with_solver` — which counts per-auction
-    executions — split fill-or-kill / partially fillable. The fill-or-kill count over
-    `window_orders` is `coverage_share_fok`, the distinct-order reading; the
-    partially fillable count has no distinct-order share because a partially fillable
-    order executes many times and a distinct count would understate it exactly where
-    it trades most — its weight is in `coverage_share` instead. Derived from the
-    changed auctions' order diffs at load time, like `delta_surplus_only_with`."""
+    """Distinct orders behind `orders_only_with_solver` (per-auction executions)."""
     delta_surplus_only_with: int
-    """The part of `delta_surplus` from the `orders_only_with_solver` orders — the
-    coverage slice. Without the solver these orders do not trade at all, so users lose
-    their surplus but are not handed a worse price; the rest of `delta_surplus` is
-    price movement on orders that still trade. Derived from the changed auctions'
-    order diffs at load time, so stored reports carry it without a re-run."""
+    """Part of `delta_surplus` from `orders_only_with_solver`; the rest is price movement."""
     price_impact: PriceImpact
-    """The price-movement slice in relative terms: bps of traded volume on the
-    fill-or-kill orders that trade on both sides. Derived at load time, like
-    `delta_surplus_only_with`."""
     window_volume: int
     window_orders: int
-    """The window's recorded executed fill-or-kill user volume (received leg) and
-    order count, over every clean analysed auction — solver present or not. The
-    denominator of `overall_bps`; the order count also anchors `coverage_share_fok`."""
+    """Recorded executed fill-or-kill user volume (received leg) and order count over
+    every clean analysed auction, solver present or not."""
     window_executions: int
-    """Every executed user order of the window's recorded winners, partially fillable
-    included, counted once per auction it executes in — order executions. The
-    denominator of `coverage_share` (D24)."""
+    """Executed user orders of the recorded winners, partially fillable included, once
+    per auction they execute in."""
     moves: tuple[AuctionMove, ...]
     quote: QuoteSide | None = None
-    """The quote side of the same scenario, or `None` when the run had no quote pass —
-    which is the permanent state of a network with no quote data (Q-D10). `None` and
-    "all zeroes" are different findings and the comparison renders them differently."""
+    """`None` when the run had no quote pass, which is not the same as all zeroes."""
 
     @property
     def overall_bps(self) -> Decimal | None:
-        """The moved-order Δsurplus averaged over all traded volume: what the window's
-        average traded unit of value loses, with unmoved and no-longer-trading orders
-        counting as zero price change. `None` when the window traded nothing."""
+        """Moved-order Δsurplus over all traded volume; unmoved orders count as zero."""
         if not self.window_volume:
             return None
         return (
@@ -423,31 +304,18 @@ class Report:
 
     @property
     def coverage_share(self) -> Decimal | None:
-        """Only-with executions over every user-order execution the window traded —
-        the service-degradation reading of the coverage count, the full picture with
-        partially fillable orders in. The "of N compared" companion is relative to
-        auctions the solver bid in, so it overstates window-level dependence for a
-        selective bidder; this share is over the whole window instead. Both sides
-        count per auction-order execution, so an execution lost is an execution lost
-        whatever the order's fillability. `None` when the window traded nothing."""
         if not self.window_executions:
             return None
         return Decimal(self.orders_only_with_solver) / Decimal(self.window_executions)
 
     @property
     def coverage_share_fok(self) -> Decimal | None:
-        """The distinct-order companion of `coverage_share`, where "order" keeps its
-        plain meaning: distinct fill-or-kill only-with orders over the window's
-        fill-or-kill order count (D23's denominator — it holds no partially fillable
-        orders, which is why the distinct reading exists only for fill-or-kill).
-        `None` when the window traded nothing."""
         if not self.window_orders:
             return None
         return Decimal(self.orders_only_with_fok) / Decimal(self.window_orders)
 
     @property
     def analysed(self) -> int:
-        """Auctions every statistic is over — the clean set when suspects are excluded."""
         if self.price_suspects_excluded:
             return self.auctions - self.price_suspects
         return self.auctions
@@ -459,48 +327,28 @@ class Report:
 
 @dataclass(frozen=True)
 class PriceImpact:
-    """Relative price change on the orders that trade on both sides.
-
-    The relative counterpart of the absolute Δsurplus: how much worse (or better) the
-    execution price gets on the orders the scenario still fills. Restricted to
-    fill-or-kill orders — a partially fillable order can execute different amounts on
-    the two sides, and Δsurplus over one side's volume is then a mixture of price and
-    quantity rather than a price change.
-    """
+    """Relative price change on fill-or-kill orders trading on both sides; partially
+    fillable ones can execute different amounts per side, mixing price and quantity."""
 
     orders_still_traded: int
-    """Contributing fill-or-kill orders executed on both sides."""
     orders_partially_fillable: int
-    """Contributing both-sides orders excluded for being partially fillable."""
     orders_moved: int
-    """Still-traded orders whose surplus changed — the set both bps figures are over.
-    The conditioning is deliberate: an order re-executed identically carries no price
-    information and would only dilute the average toward zero."""
+    """Still-traded orders whose surplus changed; both bps figures are over these."""
     delta_surplus: int
     volume_base: int
-    """Δsurplus and baseline received-leg volume, summed over the moved orders."""
+    """Baseline received-leg volume of the moved orders."""
     median_bps: Decimal | None
-    """Signed median of the per-order relative changes — the typical moved order,
-    beside a volume-weighted figure that whales can dominate."""
 
     @property
     def weighted_bps(self) -> Decimal | None:
-        """Σ Δsurplus / Σ baseline volume over the moved orders, in basis points."""
         if not self.volume_base:
             return None
         return Decimal(self.delta_surplus) * 10_000 / Decimal(self.volume_base)
 
 
 def _price_impact(changed: Sequence[Mapping[str, Any]]) -> PriceImpact:
-    """One report's `PriceImpact`, from the changed auctions' order diffs.
-
-    Derived at load time like `_only_with_surplus`, and complete for the same reason:
-    an order still trading in an unchanged auction is executed by the same solution on
-    both sides, so its price cannot have moved. The per-order ratio uses the baseline
-    volume — the denominator is what actually happened, matching the sign convention.
-    A moved order whose baseline volume rounds to 0 wei (dust) has no denominator and
-    stays out of `orders_moved`.
-    """
+    """Complete from `changed` alone: an unchanged auction keeps its solution, so no
+    price there moves. Per-order bps are over baseline volume; zero-volume dust is skipped."""
     still_traded = partial = moved = 0
     delta_total = volume_total = 0
     per_order: list[Decimal] = []
@@ -533,12 +381,6 @@ def _price_impact(changed: Sequence[Mapping[str, Any]]) -> PriceImpact:
 
 
 def _only_with_surplus(order_diffs: Sequence[Mapping[str, Any]]) -> int:
-    """One changed auction's Δsurplus over its orders executed only with the solver.
-
-    The same per-order delta the pipeline sums into `delta_surplus`, restricted to
-    contributing orders with `executed_base and not executed_loo` — the predicate
-    behind the `orders_only_with_solver` count. An unexecuted side has no surplus, so
-    each term is minus the order's baseline surplus."""
     return sum(
         (diff["surplus_loo"] or 0) - (diff["surplus_base"] or 0)
         for diff in order_diffs
@@ -553,13 +395,8 @@ def _decimal_or_none(value: Any) -> Decimal | None:
 def _quote_distribution(
     diffs: Sequence[Mapping[str, Any]],
 ) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
-    """`(median_bps, largest_share, largest_bps)` over the diffs the headline is built
-    from — the degraded ones.
-
-    The share is the largest single order's contribution over the signed total, so a row
-    whose contributions offset can exceed 100%, exactly as the solve side's
-    largest-auction share can. It is a prompt to open the order, not a discount factor.
-    """
+    """`(median_bps, largest_share, largest_bps)` over the degraded diffs. The share is
+    over the signed total, so offsetting contributions can push it past 100%."""
     rows = [d for d in diffs if d["leaf"] == "degraded"]
     if not rows:
         return None, None, None
@@ -575,17 +412,11 @@ def _quote_distribution(
 
 
 def median_of(values: Sequence[Decimal]) -> Decimal:
-    """`statistics.median` for `Decimal`s, kept exact on odd counts."""
     return Decimal(median(values))
 
 
 def _quote_side(payload: Mapping[str, Any]) -> QuoteSide | None:
-    """The quote block of a report, or `None` when the run had no quote pass.
-
-    `quote_window` carries what the window could see and `quote` what one scenario did
-    with it, so both are needed: the pick rate is a property of the window and belongs
-    beside every solver's figures, since a poor one invalidates all of them.
-    """
+    """`None` when the run had no quote pass."""
     quote = payload.get("quote")
     window = payload.get("quote_window")
     if quote is None or window is None:
@@ -651,8 +482,6 @@ def _quote_side(payload: Mapping[str, Any]) -> QuoteSide | None:
         quote_only_auctions=payload["auctions_quote_only"],
         limit_unclearable=payload["quote_limit_unclearable_orders"],
         shift_changed_auctions=payload["auctions_quote_shift_would_change_winners"],
-        # Optional: added after format 11 was cut. A file without it loads with no ids
-        # rather than failing, since nothing else about it differs.
         shift_changed_auction_ids=tuple(payload.get("quote_shift_auctions", ())),
         pick_rate=_decimal_or_none(window["pick_rate"]),
         pick_requests=window["pick_requests"],
@@ -664,13 +493,7 @@ def _quote_side(payload: Mapping[str, Any]) -> QuoteSide | None:
 
 
 def load_report(path: str) -> Report:
-    """Parse one `analyse --out` JSON, checking it is internally consistent.
-
-    The sums are re-derived from the per-auction moves and must equal the report's own
-    totals: an auction where nothing moved cancels identically, so the whole delta lives
-    in `changed`. A mismatch means the file is truncated, hand-edited or from an
-    incompatible version of `analyse`, and aggregating it would misstate the window.
-    """
+    """Parse one `analyse --out` JSON; its totals must equal the sums over `changed`."""
     with open(path) as handle:
         payload = json.load(handle)
 
@@ -682,9 +505,6 @@ def load_report(path: str) -> Report:
         )
     convention = payload.get("sign_convention")
     if convention != SIGN_CONVENTION_ID:
-        # Tabulating an old report would present every number with its sign silently
-        # inverted — the one corruption a totals check cannot catch, since both sides
-        # of it flip together.
         raise ValueError(
             f"{path}: sign convention is {convention!r}, expected "
             f"{SIGN_CONVENTION_ID!r} — re-run analyse"
@@ -715,9 +535,6 @@ def load_report(path: str) -> Report:
     )
     cow = payload["cow"]
 
-    # One pass over the only-with diffs serves two ends: the distinct-order split
-    # behind `coverage_share`, and the instance count that must equal the report's own
-    # total (checked below).
     only_with = 0
     fok_uids: set[str] = set()
     partial_uids: set[str] = set()
@@ -784,10 +601,7 @@ def load_report(path: str) -> Report:
         quote=_quote_side(payload),
     )
 
-    # An order executed only with the solver implies its winning solution changed, so
-    # every such order lives in a `changed` auction and the count re-derived there must
-    # equal the report's own total — the completeness assumption that
-    # `delta_surplus_only_with` and the distinct-order split rest on.
+    # The derived only-with figures assume every such order lies in a `changed` auction.
     if only_with != report.orders_only_with_solver:
         raise ValueError(
             f"{path}: orders_only_with_solver is {report.orders_only_with_solver} but "
@@ -829,11 +643,6 @@ def load_report(path: str) -> Report:
 
 @dataclass(frozen=True)
 class Distribution:
-    """How one delta is spread over a report's changed auctions.
-
-    Medians ride beside every sum because the sums are whale-dominated;
-    `largest_share` is the whale check itself."""
-
     total: Decimal
     n_nonzero: int
     n_positive: int
@@ -846,15 +655,13 @@ class Distribution:
 
     @property
     def largest_share(self) -> float | None:
-        """|largest| / |total| — the share of the headline one auction supplies."""
         if not self.total or self.largest is None:
             return None
         return float(abs(self.largest) / abs(self.total))
 
 
 def distribution(deltas: Mapping[int, int | Decimal]) -> Distribution:
-    """Distribution of `{auction_id: delta}`; zero deltas carry no information and are
-    excluded, so the median is the table's "median non-zero auction"."""
+    """Distribution of `{auction_id: delta}`, zero deltas excluded."""
     nonzero = {a: Decimal(d) for a, d in deltas.items() if d}
     total = sum(nonzero.values(), Decimal(0))
     largest_id = max(nonzero, key=lambda a: abs(nonzero[a]), default=None)
@@ -873,7 +680,7 @@ def distribution(deltas: Mapping[int, int | Decimal]) -> Distribution:
 
 @dataclass(frozen=True)
 class UsdContext:
-    """Per-auction USD rates for one network, with the window median as fallback."""
+    """Per-auction USD rates for one network; `fallback` is the window median."""
 
     rates: Mapping[int, Decimal]
     fallback: Decimal
@@ -883,16 +690,13 @@ class UsdContext:
 
 
 def usd_context(rates: Mapping[int, Decimal]) -> UsdContext | None:
-    """`None` when no auction had a rate at all — USD is then simply not offered."""
+    """`None` when no auction had a rate."""
     if not rates:
         return None
     return UsdContext(rates=dict(rates), fallback=median(rates.values()))
 
 
 def usd_total(deltas: Mapping[int, int | Decimal], usd: UsdContext) -> Decimal:
-    """Σ delta × the auction's own rate, in USD. Exact per-auction conversion, same
-    shape as D13's per-auction COW conversion and for the same reason: one window
-    rate is wrong whenever the window is long enough to be worth analysing."""
     return sum(
         (Decimal(delta) * usd.rate(auction_id) for auction_id, delta in deltas.items()),
         Decimal(0),
@@ -901,7 +705,7 @@ def usd_total(deltas: Mapping[int, int | Decimal], usd: UsdContext) -> Decimal:
 
 @dataclass(frozen=True)
 class SolverWindow:
-    """All outcome-rule runs of one solver over one window — one table column."""
+    """All outcome-rule runs of one solver over one window: one table column."""
 
     solver: str
     network: str
@@ -916,11 +720,7 @@ class SolverWindow:
 
 
 def group_reports(reports: Sequence[Report]) -> list[SolverWindow]:
-    """Group reports by (solver, window); each group must contain the headline rule.
-
-    Refusing to tabulate a group without `inherited` is deliberate: the alternative is
-    a headline number whose rule is whatever happened to be on disk.
-    `assume-settled` is optional; its row reads "not run" when absent."""
+    """Group reports by (solver, window); each group must contain `HEADLINE_RULE`."""
     grouped: dict[tuple[str, str, str, str, str], dict[str, Report]] = {}
     for report in reports:
         key = (report.solver, *report.window)
@@ -950,14 +750,11 @@ def group_reports(reports: Sequence[Report]) -> list[SolverWindow]:
     return windows
 
 
-# --- formatting -------------------------------------------------------------------
-# Shared with the CLI (cli.py imports these); display only, integer arithmetic.
+# --- formatting (also used by cli.py) ---------------------------------------------
 
 
 def eth(wei: int | Decimal, places: int = 6) -> str:
-    """Format native wei as a decimal string, by integer arithmetic only, rounding
-    half away from zero — so a 4-place quote agrees with the same number quoted at 6.
-    Decimals (the capped path) are truncated to whole wei first — display only."""
+    """Native wei as decimal text, rounding half away from zero; Decimals truncate to wei."""
     wei = int(wei)
     sign = "-" if wei < 0 else ""
     scaled = (abs(wei) * 10**places + 10**18 // 2) // 10**18
@@ -969,19 +766,15 @@ def pct(part: int, whole: int) -> str:
 
 
 def bps(value: Decimal, places: int = 2) -> str:
-    """Signed basis points; "+" only when positive, matching `signed_eth`."""
     return ("+" if value > 0 else "") + f"{value:.{places}f} bps"
 
 
 def cow_amount(wei: Decimal, places: int = 2) -> str:
-    """Format COW wei (a Decimal) as whole COW."""
     quantum = Decimal(1).scaleb(-places)
     return str((wei / Decimal(10**18)).quantize(quantum))
 
 
 def usd_amount(usd: Decimal) -> str:
-    """$ with a sign and thousands separators; more places the smaller the amount,
-    since the median auction moves fractions of a cent."""
     magnitude = abs(usd)
     places = 2 if magnitude >= Decimal("0.01") or not magnitude else 4
     return f"{'-' if usd < 0 else ''}${magnitude:,.{places}f}"
@@ -1021,9 +814,6 @@ def _fee_cell(
     total: int,
     per_auction: Callable[[AuctionMove], int],
 ) -> str:
-    """A fee delta with its USD restatement, converted **per auction** at that auction's
-    own rate — the same treatment `_surplus_cell` gives Δsurplus, which matters because
-    a month of a volatile chain is not well described by one rate."""
     cell = f"{signed_eth(total)} ETH"
     if usd:
         deltas = {move.auction_id: per_auction(move) for move in report.moves}
@@ -1035,8 +825,7 @@ def comparison(
     windows: Sequence[SolverWindow],
     usd_by_network: Mapping[str, UsdContext] | None = None,
 ) -> Table:
-    """The headline table: one column per solver-window, `inherited` leading, the
-    other rules as bounds, medians and whale shares beside every sum."""
+    """The headline table: one column per solver-window."""
     usd_by_network = usd_by_network or {}
     windows_differ = len({w.headline.window for w in windows}) > 1
     columns = tuple(_column_title(w, windows_differ) for w in windows)
@@ -1048,9 +837,7 @@ def comparison(
         rows.append((label, cells))
         return cells
 
-    # Row order is the reading order: the three headline numbers first, the two
-    # second-tier ones next, then the detail behind each. Sub-rows are indented and
-    # follow the row they qualify.
+    # Row order is display order; indented labels qualify the row above.
     auctions = row("auctions analysed")
     bid = row("solver bid")
     won = row("solver won")
@@ -1067,10 +854,7 @@ def comparison(
     partner_fees = row("Δpartner fee")
     protocol_fees = row("Δprotocol fee")
 
-    # --- the quote side. Three figures, one per question it answers: how much worse
-    # the quotes, how often no quote at all, and what that does to the price-improvement
-    # fee — reported here, never added to the fee rows above (D28 revised). The pick rate
-    # rides along because it validates all three.
+    # --- quote side; its fee recharge is never added to the fee rows above
     quote_price = row("quote price change, all executed volume")
     quote_price_conditional = row("  on the orders whose quote moved")
     quote_missing = row("orders that would not have been quoted")
@@ -1150,9 +934,6 @@ def comparison(
         else:
             surplus_whale.append("n/a")
 
-        # The headline fee number is the whole protocol fee, partner share included —
-        # that is what the mechanism charges. The split follows one tier down, because
-        # partner fees are most of the *level* but almost none of the sensitivity.
         headline = _fee_cell(
             report, usd, report.delta_protocol_and_partner_fees,
             lambda m: m.delta_protocol_and_partner_fees,
@@ -1241,8 +1022,7 @@ def comparison(
             f"(newly kept won {report.auctions_newly_kept_won})"
         )
         filter_exact.append(
-            # In surplus mode every solution is on the surplus scale by design, so the
-            # count would read as a total failure of a thing that was never attempted.
+            # Surplus mode judges every solution on surplus by design.
             "n/a (surplus mode)"
             if report.mode != "score"
             else f"{report.multi_pair_filter_proxied:,} of "
@@ -1405,10 +1185,7 @@ def _rewards_cell(report: Report, usd: UsdContext | None, *, capped: bool) -> st
 
 
 def _net_cell(report: Report, usd: UsdContext | None) -> str:
-    """Net change = Δsurplus − Δrewards, capped by caveat 5: capped is the payout-scale
-    figure, and netting user value against an accounting identity would be nonsense.
-    Under the counterfactual-minus-actual convention, negative means the scenario
-    leaves users and the protocol treasury combined worse off."""
+    """Δsurplus − capped Δrewards: only the capped figure is at payout scale."""
     if report.delta_rewards_capped is None:
         return "n/a without a capped estimate"
     net = Decimal(report.delta_surplus) - report.delta_rewards_capped
@@ -1425,9 +1202,6 @@ def _net_cell(report: Report, usd: UsdContext | None) -> str:
 
 
 def _link_cell(quote: QuoteSide) -> str:
-    """How the window's orders were tied to their competitions: how many the quote-id
-    link placed of the orders it was asked for and why the rest were not, then the
-    trivial unwraps it does not take."""
     link = quote.link
     parts: list[str] = []
     if link.orders:
@@ -1519,8 +1293,7 @@ def render_markdown(table: Table) -> str:
     divider = "| --- |" + " --- |" * len(table.columns)
     lines = [header, divider]
     for label, cells in table.rows:
-        # The two-space indent marking sub-rows is invisible in markdown; use a nested
-        # label instead.
+        # Markdown drops leading spaces.
         shown = "&nbsp;&nbsp;" + label.strip() if label.startswith("  ") else label
         lines.append("| " + shown + " | " + " | ".join(cells) + " |")
     lines.append(f"\n*Signs: {SIGN_CONVENTION}.*")
