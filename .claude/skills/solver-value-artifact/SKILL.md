@@ -11,8 +11,8 @@ context and boring to read.
 
 **[reference/template.html](reference/template.html) is the shell to start from** — it
 carries the stylesheet, the section order, and the caveats as prose with only the figures
-left as placeholders. The two pages already in `artifacts/` predate this skill and differ
-from it in layout: read them for the subject matter, not for the format.
+left as placeholders. It and the scripts in `scripts/` are the only page material in git;
+every built page and its body are run output and stay local.
 
 ## Register
 
@@ -277,6 +277,9 @@ single-chain solver's aggregate equals its own chain figures, and that a hand-su
 multi-chain solver matches. That catches an empty table before publishing, which a
 screenshot of a snapshot never will.
 
-Save to `artifacts/<window>-<slug>.html`, commit it, then publish with the Artifact tool
-(`favicon` stable across redeploys, `<title>` stable, same file path to redeploy). To
-update a page from an earlier session, pass its `url` — a new path claims a new link.
+Build the page with `scripts/build_page.py` into `artifacts/<window>-<slug>.html`, with its
+body beside it as `<window>-<slug>.body.html`. `artifacts/` is gitignored: pages and bodies
+are run output, never committed. Publish with the Artifact tool (`favicon` stable across
+redeploys, `<title>` stable, same file path to redeploy). The published page is the
+durable copy, so to update a page from an earlier session, pass its `url`, since a new
+path claims a new link.

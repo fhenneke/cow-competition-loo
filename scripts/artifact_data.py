@@ -6,7 +6,7 @@ Reads the same reports `loo compare` does, fetches the same per-auction USD rate
 prints one JSON object.
 
     uv run python scripts/artifact_data.py out/jul2026/*-inherited.json \
-        --alt out/jul2026/*-assume-settled.json > artifacts/data/jul2026-mainnet.json
+        --alt out/jul2026/*-assume-settled.json > out/jul2026/artifact-data.json
 
 `--alt` reports are the `assume-settled` scenario: not a column, but the settlement
 caveat needs them to say how far the figures move.

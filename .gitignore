@@ -15,8 +15,9 @@ venv/
 .ruff_cache/
 .mypy_cache/
 
-# analysis output
+# analysis output: run reports and the pages built from them stay local
 out/
+artifacts/
 data/
 *.parquet
 *.csv
