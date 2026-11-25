@@ -90,9 +90,9 @@ def test_missing_data_is_loud(seed: int) -> None:
     with simulate(world, faults) as sim:
         conn = sim.conn()
         bundle = next(b for b in extract.load_auctions(conn, [target.auction_id]))
-        from loo.counterfactual import price_imbalanced
+        from loo.counterfactual import price_suspects
 
-        suspect = any(price_imbalanced(b, bundle.native_prices) for b in bundle.bids)
+        suspect = bool(price_suspects(bundle.bids, bundle.native_prices))
         result = sim.cli(*analyse_args(world, label))
         assert result.code == (4 if result.code == 4 else (0 if suspect else 2)), result.err
         checked = sim.cli("validate", "--network", world.network, "--start", world.start,

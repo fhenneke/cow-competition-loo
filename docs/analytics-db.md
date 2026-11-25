@@ -133,11 +133,21 @@ window's five largest winning scores were all that token.
 
 - **Value each trade through both tokens.** `executed_sell × price(sell)` and
   `executed_buy × price(buy)` describe the same trade; healthy winners agree within
-  1.04x. `counterfactual.price_imbalanced` flags a >2x disagreement, and `analyse`
+  1.04x. `counterfactual.price_suspects` flags a >2x disagreement, and `analyse`
   excludes such an auction **from every statistic** and names it
   (`--include-price-suspects` keeps them). The 2x threshold separates 1.04x from
   14,000x, not signal from noise, and suspect auctions can carry most of a solver's
   apparent Δsurplus (82% of Sector's over 2026-08-01..04, all fabricated).
+- **Check the whole solution and each order.** Summed over a solution, a CoW that buys a
+  mispriced token for one order and sells it for another cancels the error: polygon
+  auction 41425733 priced a token ~3,500x too high and passed, giving one solver a
+  −39.5M POL Δsurplus over 2026-10-28..11-24. A fill alone does not prove a price wrong,
+  because a balanced CoW can overpay one order at correct prices, often as its only
+  fill (mainnet 14273947, xdai 17840083). So an order is suspect when every fill **and
+  its own limit** are more than 2x off the same way round; a limit selling 40M POL-worth
+  for 902 POL is the price's fault, not the bid's. Over 2026-10-28..11-24 this excluded
+  31 more mainnet auctions, 285 base (one recurring order of token `b2000000…`, ~2.9x),
+  18 bnb, 2 each on polygon, arbitrum-one and xdai, none elsewhere.
 - **A cross-auction median or spike check does not work**: the persistent price is the
   wrong one. Only the counterparty token inside the same trade anchors reality, which is
   why sell-token prices are loaded although valuation converts through the buy token.

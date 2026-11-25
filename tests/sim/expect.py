@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from . import oracle
-from .oracle import Bid, Pair, Refused
+from .oracle import Bid, Pair, Refused, Trade
 from .world import Auction, Cap, Solution, World
 
 PRICE_THRESHOLD = 2
@@ -22,18 +22,39 @@ PRICE_THRESHOLD = 2
 
 def suspect_uids(auction: Auction) -> set[int]:
     """Solutions whose sold and bought value disagree by more than 2x at the auction's
-    own prices, orders missing a price on either side skipped."""
+    own prices, orders missing a price on either side skipped; plus every solution
+    filling an order whose every priced fill, and its limit, disagree by more than 2x
+    the same way."""
+    def values(t: Trade, sold: int, bought: int) -> tuple[int, int] | None:
+        ps, pb = auction.prices.get(t.sell_token), auction.prices.get(t.buy_token)
+        if ps is None or pb is None:
+            return None
+        return sold * ps // oracle.ONE, bought * pb // oracle.ONE
+
+    def way(v: tuple[int, int]) -> int:
+        """+1 the sell side worth more, -1 the buy side, 0 within the threshold."""
+        return (v[0] > PRICE_THRESHOLD * v[1]) - (v[1] > PRICE_THRESHOLD * v[0])
+
     flagged: set[int] = set()
+    directions: dict[str, set[int]] = {}
+    limit_way: dict[str, int | None] = {}
     for s in auction.solutions:
         sold = bought = 0
         for t in s.trades:
-            ps, pb = auction.prices.get(t.sell_token), auction.prices.get(t.buy_token)
-            if ps is None or pb is None:
+            v = values(t, t.executed_sell, t.executed_buy)
+            if v is None:
                 continue
-            sold += t.executed_sell * ps // oracle.ONE
-            bought += t.executed_buy * pb // oracle.ONE
+            sold += v[0]
+            bought += v[1]
+            if v[0] and v[1]:
+                directions.setdefault(t.uid, set()).add(way(v))
+            lv = values(t, t.sell_amount, t.buy_amount)
+            limit_way[t.uid] = way(lv) if lv and lv[0] and lv[1] else None
         if sold and bought and (sold > PRICE_THRESHOLD * bought or bought > PRICE_THRESHOLD * sold):
             flagged.add(s.uid)
+    one_way = {uid for uid, ways in directions.items()
+               if ways in ({1}, {-1}) and {limit_way.get(uid)} == ways}
+    flagged |= {s.uid for s in auction.solutions if any(t.uid in one_way for t in s.trades)}
     return flagged
 
 

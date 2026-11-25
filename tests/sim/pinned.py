@@ -218,10 +218,41 @@ def split_slot() -> World:
     return world
 
 
+def cancelled_price() -> World:
+    """Polygon auction 41425733's shape: X priced 3,500x too high, and a CoW that buys X
+    for one order and sells it for another, so its summed sides agree and only the
+    orders show the wrong price; so do both orders' limits. A rival CoW fills the same
+    two orders. The first auction is the shape of mainnet 14273947 and xdai 17840083:
+    correct prices, and a balanced CoW that overpays one order 3x, its only fill, and
+    charges the other, whose loose limit allows it and which a rival fills fairly. The
+    overpaid order's limit is sane, so the imbalance is the bid's, not a price's, and
+    the auction must stay in."""
+    world = blank()
+    x_buy = order(world, "71" * 56, USDC, TOKEN_X, ONE, ONE)
+    x_sell = order(world, "72" * 56, TOKEN_X, DAI, ONE, ONE)
+    over = order(world, "73" * 56, USDC, DAI, ONE, ONE)
+    under = order(world, "74" * 56, DAI, USDC, 3 * ONE, ONE)
+    a = solver(world, "Sector", "c7" * 20)
+    b = solver(world, "Quasi", "d7" * 20)
+    c = solver(world, "Baseline", "e7" * 20)
+    wrong = dict(world.tokens)
+    wrong[TOKEN_X] = 3_500 * ONE
+    auction(world, 14273947, [
+        (a, [fill(over, ONE, 3 * ONE), fill(under, 3 * ONE, ONE)]),
+        (c, [fill(under, 3 * ONE, 3 * ONE + 10**16)]),
+    ])
+    auction(world, 41425733, [
+        (a, [fill(x_buy, ONE, ONE + 10**16), fill(x_sell, ONE, ONE + 10**16)]),
+        (b, [fill(x_buy, ONE, ONE + 5 * 10**15), fill(x_sell, ONE, ONE + 5 * 10**15)]),
+    ], prices=wrong)
+    return world
+
+
 PINNED_WORLDS = {
     "live-fee-fixture": live_fee_fixture,
     "dark-pair": dark_pair,
     "ranked-order": ranked_order,
     "blocked-batch": blocked_batch,
     "penalty-caps": penalty_caps,
+    "cancelled-price": cancelled_price,
 }

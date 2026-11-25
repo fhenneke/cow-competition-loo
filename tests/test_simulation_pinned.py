@@ -12,7 +12,7 @@ from sim.world import World
 from test_simulation import exercise, loaded
 
 from loo import extract
-from loo.counterfactual import analyse_auction
+from loo.counterfactual import analyse_auction, price_imbalanced, price_suspects
 from loo.valuation import build_solutions
 from loo.winner_selection import arbitrate, compute_reference_scores
 
@@ -101,3 +101,14 @@ def test_split_slot(tmp_path: Path) -> None:
                              settled={0: extract.Settlement(True, True)}, solution_caps=caps)
     assert len(result.loo_winner_uids) == 2 and result.cap_double_inherited == 1
     exercise(world, tmp_path, random.Random(0), ["Sector"])
+
+
+def test_cancelled_price(tmp_path: Path) -> None:
+    world = pinned.cancelled_price()
+    cow, subsidy = sorted(bundles_of(world), key=lambda b: b.auction_id, reverse=True)
+    # Summed per solution, the wrong price cancels and the cross-subsidy balances.
+    assert not any(price_imbalanced(b, cow.native_prices) for b in cow.bids)
+    assert not any(price_imbalanced(b, subsidy.native_prices) for b in subsidy.bids)
+    assert price_suspects(cow.bids, cow.native_prices) == {b.uid for b in cow.bids}
+    assert not price_suspects(subsidy.bids, subsidy.native_prices)
+    exercise(world, tmp_path, random.Random(0), ["Sector", "Quasi"])

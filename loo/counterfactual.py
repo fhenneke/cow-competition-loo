@@ -15,7 +15,7 @@ from .fees import FeeContext, Quote
 from .primitives import MAX_WINNERS, Pair, price_in_eth
 from .quotes import shifted_limit
 from .rewards import SolverReward, Win, uncapped_rewards
-from .valuation import Mode, ValuedBid, build_solutions
+from .valuation import Mode, Order, ValuedBid, build_solutions
 from .winner_selection import (
     Ranking,
     Solution,
@@ -125,6 +125,57 @@ def price_imbalanced(
     if not sell_value or not buy_value:
         return False
     return sell_value > threshold * buy_value or buy_value > threshold * sell_value
+
+
+def _order_imbalance(
+    order: Order, prices: Mapping[str, int], threshold: int, *, limit: bool = False
+) -> Literal["sell", "buy", "ok"] | None:
+    """Which side of one fill (or, with `limit`, of the signed limit) is worth more than
+    `threshold` times the other; None when a side is unpriced or worth nothing."""
+    sell_price = prices.get(order.sell_token)
+    buy_price = prices.get(order.buy_token)
+    if sell_price is None or buy_price is None:
+        return None
+    sold = price_in_eth(sell_price, order.sell_amount if limit else order.executed_sell)
+    bought = price_in_eth(buy_price, order.buy_amount if limit else order.executed_buy)
+    if not sold or not bought:
+        return None
+    if sold > threshold * bought:
+        return "sell"
+    if bought > threshold * sold:
+        return "buy"
+    return "ok"
+
+
+def price_suspects(
+    bids: Sequence[Bid], prices: Mapping[str, int], threshold: int = PRICE_IMBALANCE_THRESHOLD
+) -> frozenset[int]:
+    """Solutions whose prices are suspect: `price_imbalanced`, or filling an order whose
+    every fill and whose own limit are valued past `threshold` the same way round.
+
+    The second test catches a wrong price that cancels inside one solution, where a CoW
+    buys the mispriced token for one order and sells it for another (polygon auction
+    41425733, ~3,500x: one order's limit sells 40M POL-worth for 902 POL). A fill alone
+    is not enough, because a bid can overpay one order of a balanced CoW at correct
+    prices, often as the order's only fill (mainnet 14273947, xdai 17840083); a limit
+    no user would sign is what says the price, not the bid, is wrong."""
+    sides: dict[str, set[str]] = {}
+    limits: dict[str, str | None] = {}
+    for bid in bids:
+        for order in bid.orders:
+            side = _order_imbalance(order, prices, threshold)
+            if side is not None:
+                sides.setdefault(order.uid, set()).add(side)
+            limits[order.uid] = _order_imbalance(order, prices, threshold, limit=True)
+    mispriced = {
+        uid for uid, seen in sides.items() if seen in ({"sell"}, {"buy"}) and {limits[uid]} == seen
+    }
+    return frozenset(
+        bid.uid
+        for bid in bids
+        if price_imbalanced(bid, prices, threshold)
+        or any(order.uid in mispriced for order in bid.orders)
+    )
 
 
 def recorded_executed_volume(
@@ -499,7 +550,7 @@ class AuctionCounterfactual:
     scores are never recomputed from a counterfactual quote."""
 
     price_suspect_uids: frozenset[int] = frozenset()
-    """Solutions failing `price_imbalanced`."""
+    """Solutions failing `price_suspects`."""
     multi_pair_solutions: int = 0
     """Filter-judged solutions touching more than one directed pair."""
     multi_pair_filter_proxied: int = 0
@@ -804,9 +855,7 @@ def analyse_auction(
     db_winner_uids = frozenset(b.uid for b in bundle.bids if b.is_winner)
     removed_present = frozenset(b.solver for b in bundle.bids) & removed
     present = bool(removed_present)
-    suspects = frozenset(
-        b.uid for b in bundle.bids if price_imbalanced(b, bundle.native_prices)
-    )
+    suspects = price_suspects(bundle.bids, bundle.native_prices)
 
     valued, failures = build_solutions(
         bundle.bids,
