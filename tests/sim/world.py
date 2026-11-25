@@ -195,6 +195,19 @@ class Auction:
 
 
 @dataclass
+class Shadow:
+    """An auction of the window's accounting periods that lies outside the window: only
+    its reward rows exist, so the weekly marts have the rest of their periods."""
+
+    auction_id: int
+    time: datetime
+    rewards: dict[str, tuple[Decimal, Decimal]]
+    """`fct_solver_rewards_per_auction`: solver -> (upper cap, capped reward)."""
+    won: dict[str, tuple[int, int]]
+    """solver -> (won order executions, of them settled in time): the success rate."""
+
+
+@dataclass
 class Estimate:
     """One `price_estimates` row."""
 
@@ -252,6 +265,24 @@ class World:
     """order uid -> how the quote link should place it ('id', 'stream', 'requote') or
     why it should not (the unlinked reasons)."""
     quote_suspects: set[str] = field(default_factory=set[str])
+    shadows: list[Shadow] = field(default_factory=list[Shadow])
+    relative: dict[int, list[tuple[str, str, float]]] = field(
+        default_factory=dict[int, list[tuple[str, str, float]]])
+    """`int_backend_data__solver_relative_surplus_on_executed_orders`: auction ->
+    (solver, order uid, relative surplus)."""
+    shares: dict[int, list[tuple[str, str, float]]] = field(
+        default_factory=dict[int, list[tuple[str, str, float]]])
+    """`int_quote_data__quote_reward_shares`: auction -> (order uid, solver, share)."""
+    quote_budget: dict[int, float] = field(default_factory=dict[int, float])
+    """Σ quote budget contribution of each auction's trades."""
+    consistency_mart: dict[str, dict[str, tuple[float, float]]] = field(
+        default_factory=dict[str, dict[str, tuple[float, float]]])
+    """period -> solver -> (consistency reward, total relative surplus)."""
+    quote_mart: dict[str, dict[str, tuple[float, float, int]]] = field(
+        default_factory=dict[str, dict[str, tuple[float, float, int]]])
+    """period -> solver -> (quote reward, period budget, reward orders)."""
+    fct_cut: int | None = None
+    """Auctions above this id have no `fct_solver_rewards_per_auction` row yet."""
 
     @property
     def weth(self) -> str:
@@ -353,6 +384,8 @@ def generate(seed: int, knobs: Knobs | None = None) -> World:
         # tests nothing, so draw again from the same stream.
         _add_auctions(rng, world, replace(k, fast_path=0.0), start, end)
     _record_trades_and_periods(rng, world)
+    # Its own stream: the world above stays what it was before the accounting tables.
+    record_payouts(random.Random(seed * 7_919 + 13), world)
     return world
 
 
@@ -877,3 +910,224 @@ def _record_trades_and_periods(rng: random.Random, world: World) -> None:
         for solver in auction.mart:
             if rng.random() < 0.05:
                 world.mart_off.add((auction.auction_id, solver))
+
+
+# --- the accounting tables: the rewards a solver is paid ------------------------------
+
+
+def period_start(moment: datetime) -> datetime:
+    """The Tuesday 00:00 UTC opening the accounting period that holds `moment`."""
+    day = datetime(moment.year, moment.month, moment.day)
+    return day - timedelta(days=(day.weekday() - 1) % 7)
+
+
+def period_text(begin: datetime) -> str:
+    """`accounting_period` as the weekly marts spell it."""
+    return f"{begin:%Y-%m-%d %H:%M:%S} - {begin + timedelta(days=7):%Y-%m-%d %H:%M:%S}"
+
+
+def auction_times(world: World) -> dict[int, datetime]:
+    """When each auction id's deadline fell: auctions, shadows, and the bidless ids the
+    window query names, which take the time of the next auction."""
+    times = {a.auction_id: a.time for a in world.auctions}
+    times.update({s.auction_id: s.time for s in world.shadows})
+    ordered = sorted((a.auction_id, a.time) for a in world.auctions)
+    for extra in world.extra_window_ids:
+        later = [when for auction_id, when in ordered if auction_id > extra]
+        times[extra] = later[0] if later else ordered[-1][1]
+    return times
+
+
+def reward_rows(world: World) -> dict[int, dict[str, tuple[Decimal, Decimal]]]:
+    """`fct_solver_rewards_per_auction` as served: auction -> solver -> (upper, capped)."""
+    rows = {
+        a.auction_id: {
+            solver: (r.upper if r.upper is not None else Decimal(0),
+                     r.capped if r.capped is not None else Decimal(0))
+            for solver, r in a.mart.items()
+        }
+        for a in world.auctions
+    }
+    rows.update({s.auction_id: dict(s.rewards) for s in world.shadows})
+    return rows
+
+
+def quote_shares(errors: dict[str, float]) -> dict[str, float]:
+    """One in-scope order's `quote_reward_share`s: the five smallest errors (ties by
+    solver) share it, exact matches split it equally, otherwise by 1 / error²."""
+    ranked = sorted(errors.items(), key=lambda item: (item[1], item[0]))[:5]
+    shares = dict.fromkeys(errors, 0.0)
+    exact = [solver for solver, error in ranked if error == 0]
+    if exact:
+        for solver in exact:
+            shares[solver] = 1.0 / len(exact)
+        return shares
+    weights = sum(1 / error**2 for _, error in ranked)
+    for solver, error in ranked:
+        shares[solver] = 1 / error**2 / weights
+    return shares
+
+
+def _quote_errors(rng: random.Random, quoters: list[str]) -> dict[str, float]:
+    return {q: 0.0 if rng.random() < 0.1 else round(rng.uniform(1e-4, 5e-2), 5)
+            for q in quoters}
+
+
+def _shadow(rng: random.Random, world: World, auction_id: int, when: datetime,
+            bidders: list[str]) -> Shadow:
+    winners = rng.sample(bidders, min(len(bidders), rng.randint(1, 2)))
+    rewards: dict[str, tuple[Decimal, Decimal]] = {}
+    won: dict[str, tuple[int, int]] = {}
+    for solver in winners:
+        upper = Decimal(rng.randint(0, 4 * 10**15)) * Decimal("0.5")
+        roll = rng.random()
+        capped = (upper if roll < 0.5 else Decimal(rng.randint(0, int(upper))) if roll < 0.8
+                  else -Decimal(rng.randint(0, 10**14)))
+        rewards[solver] = (upper, capped)
+        executions = rng.randint(1, 4)
+        won[solver] = (executions, rng.randint(0, executions))
+    relative: list[tuple[str, str, float]] = []
+    shares: list[tuple[str, str, float]] = []
+    orders = [_hex(rng, 56) for _ in range(rng.randint(0, 3))]
+    for uid in orders:
+        in_scope = rng.random() < 0.85
+        surplus = {s: rng.randint(0, 10**18)
+                   for s in rng.sample(bidders, min(len(bidders), rng.randint(1, 4)))}
+        total = sum(surplus.values())
+        relative += [(s, uid, v / total if in_scope and v and total else 0.0)
+                     for s, v in surplus.items()]
+        quoters = rng.sample(bidders, min(len(bidders), rng.randint(1, 7)))
+        split = (quote_shares(_quote_errors(rng, quoters)) if in_scope
+                 else dict.fromkeys(quoters, 0.0))
+        shares += [(uid, q, v) for q, v in split.items()]
+    world.relative[auction_id] = relative
+    world.shares[auction_id] = shares
+    world.quote_budget[auction_id] = rng.uniform(0, 1e16) if orders else 0.0
+    return Shadow(auction_id, when, rewards, won)
+
+
+def record_payouts(rng: random.Random, world: World) -> None:
+    """The accounting tables behind the rewards paid: per-auction relative surplus and
+    quote reward shares — for the window's auctions and for shadow auctions filling the
+    rest of its accounting periods and the period after — and the weekly marts computed
+    from them. The window's last period and the one after may not be paid out yet."""
+    if not world.auctions:
+        return
+    by_time = [a.auction_id for a in sorted(world.auctions, key=lambda a: a.time)]
+    assert by_time == sorted(by_time), "auction ids must rise with time, as on chain"
+    start, end = datetime.fromisoformat(world.start), datetime.fromisoformat(world.end)
+    bidders = sorted(world.bidding_addresses())
+
+    for auction in world.auctions:
+        relative: list[tuple[str, str, float]] = []
+        shares: list[tuple[str, str, float]] = []
+        # `int_backend_data__trade_with_tx_hash`: the orders of every landed winner.
+        executed = [t for s in auction.winners if auction.settlements[s.uid].landed
+                    for t in s.trades]
+        for trade in executed:
+            in_scope = not world.orders[trade.uid].partially_fillable
+            surplus: dict[str, int] = {}
+            for solution in auction.solutions:
+                for t in solution.trades:
+                    if t.uid != trade.uid:
+                        continue
+                    try:
+                        value = oracle.user_surplus(t)
+                    except Refused:
+                        continue
+                    surplus[solution.solver] = max(surplus.get(solution.solver, value), value)
+            total = sum(surplus.values())
+            relative += [(s, trade.uid, v / total if in_scope and v and total else 0.0)
+                         for s, v in surplus.items()]
+            quoters = rng.sample(bidders, min(len(bidders), rng.randint(1, 7)))
+            split = (quote_shares(_quote_errors(rng, quoters)) if in_scope
+                     else dict.fromkeys(quoters, 0.0))
+            shares += [(trade.uid, q, v) for q, v in split.items()]
+        world.relative[auction.auction_id] = relative
+        world.shares[auction.auction_id] = shares
+        world.quote_budget[auction.auction_id] = rng.uniform(0, 1e16) if executed else 0.0
+
+    after = period_start(end - timedelta(seconds=1)) + timedelta(days=7)
+    before_times: list[datetime] = []
+    after_times: list[datetime] = []
+    begin = period_start(start)
+    while begin <= after:
+        finish = begin + timedelta(days=7)
+        for low, high, into in ((begin, min(finish, start), before_times),
+                                (max(begin, end), finish, after_times)):
+            if low < high:
+                span = (high - low).total_seconds()
+                into.extend(low + timedelta(seconds=rng.uniform(0, span - 1))
+                            for _ in range(rng.randint(0, 3)))
+        begin = finish
+    ids = [a.auction_id for a in world.auctions] + world.extra_window_ids
+    for i, when in enumerate(sorted(before_times, reverse=True)):
+        shadow_id = min(ids) - 100 * (i + 1) - rng.randint(0, 50)
+        world.shadows.append(_shadow(rng, world, shadow_id, when, bidders))
+    for i, when in enumerate(sorted(after_times)):
+        shadow_id = max(ids) + 100 * (i + 1) + rng.randint(0, 50)
+        world.shadows.append(_shadow(rng, world, shadow_id, when, bidders))
+    world.shadows.sort(key=lambda s: s.auction_id)
+
+    record_weekly_marts(world)
+    last = period_text(period_start(end - timedelta(seconds=1)))
+    for mart in (world.consistency_mart, world.quote_mart):
+        if rng.random() < 0.25:
+            mart.pop(last, None)
+        if rng.random() < 0.5:
+            mart.pop(period_text(after), None)
+
+
+def record_weekly_marts(world: World) -> None:
+    """`fct_consistency_rewards_per_solver_and_accounting_period` and
+    `fct_quote_rewards_per_solver_and_accounting_period`, transcribed naively from the
+    dbt models. A period with no row has no entry."""
+    periods: dict[str, list[int]] = {}
+    for auction_id, when in sorted(auction_times(world).items()):
+        periods.setdefault(period_text(period_start(when)), []).append(auction_id)
+    rewards = reward_rows(world)
+    won: dict[int, dict[str, tuple[int, int]]] = {s.auction_id: s.won for s in world.shadows}
+    for auction in world.auctions:
+        mine: dict[str, tuple[int, int]] = {}
+        for s in auction.winners:
+            n, ok = mine.get(s.solver, (0, 0))
+            settled = auction.settlements[s.uid].in_time
+            mine[s.solver] = (n + len(s.trades), ok + (len(s.trades) if settled else 0))
+        won[auction.auction_id] = mine
+    world.consistency_mart.clear()
+    world.quote_mart.clear()
+    for label, ids in periods.items():
+        budget = sum((upper - capped for a in ids
+                      for upper, capped in rewards.get(a, {}).values()), Decimal(0))
+        total: dict[str, float] = {}
+        executions: dict[str, tuple[int, int]] = {}
+        for a in ids:
+            for solver, _, rel in world.relative.get(a, []):
+                total[solver] = total.get(solver, 0.0) + rel
+            for solver, (n, ok) in won.get(a, {}).items():
+                had = executions.get(solver, (0, 0))
+                executions[solver] = (had[0] + n, had[1] + ok)
+        weighted: dict[str, float] = {}
+        for solver, t in total.items():
+            n, ok = executions.get(solver, (0, 0))
+            weighted[solver] = t * (ok / n if n else 0.0)
+        whole = sum(weighted.values())
+        if total:
+            world.consistency_mart[label] = {
+                s: (float(budget) * weighted[s] / whole if whole else 0.0, total[s])
+                for s in total
+            }
+        quote_budget = sum(world.quote_budget.get(a, 0.0) for a in ids)
+        share: dict[str, float] = {}
+        paying: set[str] = set()
+        for a in ids:
+            for uid, solver, value in world.shares.get(a, []):
+                share[solver] = share.get(solver, 0.0) + value
+                if value > 0:
+                    paying.add(uid)
+        if share:
+            n_orders = len(paying)
+            world.quote_mart[label] = {
+                s: (quote_budget * v / n_orders if n_orders else 0.0, quote_budget, n_orders)
+                for s, v in share.items()
+            }

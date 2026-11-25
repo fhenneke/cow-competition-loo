@@ -8,9 +8,11 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal, getcontext
+from decimal import ROUND_HALF_UP, Decimal, getcontext
 from statistics import median
 from typing import Any
+
+from .payouts import COMPONENTS, Component, RecordedRewards
 
 # Capped rewards are ~40-digit Decimals; 28 digits would round their sums and fail
 # `load_report`'s totals check.
@@ -21,7 +23,7 @@ WEI = Decimal(10) ** 18
 HEADLINE_RULE = "inherited"
 ALTERNATIVE_RULES = ("assume-settled",)
 
-REPORT_FORMAT = 15
+REPORT_FORMAT = 18
 """Bump whenever the `analyse --out` payload shape changes."""
 
 SIGN_CONVENTION_ID = "counterfactual-minus-actual"
@@ -37,6 +39,21 @@ CAVEATS = (
     "is claimed about how they would bid if the removed solver actually left. The "
     "competition's cap on solutions per solver is also applied before winners are "
     "picked, so a rival solution suppressed by that cap cannot step in either.",
+    "Runner-up: the margin rows measure how far the other winners' margin over their "
+    "reference score — their reward before caps — moves when the solver's bids are "
+    "taken away and every other bid stays as it was: room the solver's losing bids left "
+    "them. That a winner bidding against its reference could shade its bid by that much "
+    "is the theory behind the row, not something the counterfactual models, so the row "
+    "is neither a price change nor a bound on one. It counts only winners that win the "
+    "same solutions on both sides; a margin can also fall, when a solution the solver's "
+    "bids kept out (filtered, or blocked by its win) raises a reference. The part above "
+    "the reward cap counts only winners whose batch settled: above its cap a winner's "
+    "reward no longer depends on its bid, so that part is score it could withhold from "
+    "users at no cost in reward, while below the cap a worse bid costs it reward one for "
+    "one and the reward comes out of the same weekly pool as the consistency budget. "
+    "Δother winners' rewards (capped) needs no such theory: it is what the mechanism "
+    "would pay those winners more without the solver's bids, which the consistency "
+    "budget then lacks, their caps being the same on both sides.",
     "Settlement risk: winning an auction does not guarantee the batch lands on-chain, "
     "so the counterfactual must assume something about settlement. The headline rule "
     "(`inherited`) keeps each auction slot's recorded outcome — a batch that actually "
@@ -72,8 +89,23 @@ CAVEATS = (
     "table counts recharged orders whose execution would not have cleared the limit the "
     "replacement quote implies, and auctions where shifting every score by that limit "
     "change would move the winner set.",
-    "Quote rewards are excluded: the counterfactual quote's eligibility is "
-    "not evaluated, so no reward figure on either side includes them.",
+    "Quote rewards in the deltas: the counterfactual quote reward is not evaluated (the "
+    "replacement quote's eligibility and share are not computed), so no Δ figure "
+    "includes quote rewards. The quote rewards recorded as paid to the solver are "
+    "reported, under the rewards-paid rows.",
+    "Rewards paid to the solver are recorded amounts, not counterfactual deltas, over "
+    "every auction in the window — price-suspect and fast-path auctions included, which "
+    "Δsurplus excludes — and gross of the solver service fee. Performance rewards are the "
+    "per-auction payouts. Consistency and quote rewards are weekly; each is linear in a "
+    "per-auction metric (relative surplus, quote reward share), so the window's part of "
+    "a week's reward is that reward times the window's share of the solver's metric over "
+    "the week. A week not yet paid out has no figure and its auctions are counted as not "
+    "yet accounted, never as zero. Both weekly pools are budgets tied to protocol "
+    "revenue: without the solver its share would go to the remaining solvers, so these "
+    "rows say what the solver received, not what the protocol would save. The "
+    "consistency budget is the sum of upper cap minus capped reward and is paid out in "
+    "full, so Δconsistency budget (estimate) offsets the capped Δrewards, and their sum "
+    "is the change in summed upper caps.",
     "Conversion is out of scope: a worse quote means some users would not have placed "
     "the order at all, and there is no counterfactual for an order nobody created. The "
     "quote figures describe the price shown on orders that *were* created.",
@@ -134,6 +166,16 @@ class AuctionMove:
     quote_fee_recharges: tuple[int, ...] = ()
     """Price-improvement fee against replacement minus recorded quotes: gross, partner,
     DAO, per order."""
+    delta_reference_margin: int = 0
+    """The pressed winners' margin over their reference, counterfactual − actual."""
+    delta_margin_above_cap: Decimal | None = None
+    """Its part above the reward cap, settled winners only; None without caps."""
+    delta_pressed_rewards_capped: Decimal | None = None
+    """Those winners' capped rewards, counterfactual − actual; None without caps."""
+    delta_score: int = 0
+    """Δsurplus + Δprotocol and partner fees (fee leg where every fee is priced)."""
+    delta_consistency_budget: Decimal | None = None
+    """Σ (upper cap − capped reward), loo minus base; None where the capped delta is."""
 
 
 @dataclass(frozen=True)
@@ -179,6 +221,9 @@ class QuoteSide:
     window_bps: Decimal | None
     conditional_bps: Decimal | None
     """Over the window's executed volume, and over the moved orders' volume only."""
+    delta_volume_native: Decimal
+    """Σ Δ effective quote rate × executed volume over the moved orders: `window_bps` as
+    an amount, counterfactual − actual."""
     median_bps: Decimal | None
     largest_share: Decimal | None
     largest_bps: Decimal | None
@@ -268,6 +313,8 @@ class Report:
     `auctions_fees_incomplete`: auctions left out for unrecorded fee policies."""
     delta_rewards: int | None
     delta_rewards_capped: Decimal | None
+    delta_consistency_budget: Decimal | None
+    """Over the capped delta's auctions; the two sum to Δ Σ upper caps."""
     auctions_capped_skipped: int
     delta_rewards_cow: Decimal | None
     delta_rewards_capped_cow: Decimal | None
@@ -288,9 +335,29 @@ class Report:
     window_executions: int
     """Executed user orders of the recorded winners, partially fillable included, once
     per auction they execute in."""
+    auctions_runner_up: int
+    """Auctions the solver bid in where a losing bid of its set another winner's reference."""
+    delta_reference_margin: int
+    reference_margin_rises: int
+    reference_margin_falls: int
+    auctions_reference_margin_moved: int
+    reference_margin_volume: int
+    """The other winners' margin over their reference score, counterfactual − actual, in
+    the mode's currency: (auction, winner) pairs that rose / fell, the auctions holding
+    them, and the volume of those winners' winning solutions there."""
+    delta_margin_above_cap: Decimal | None
+    """Its part above the reward cap, over the winners that settled; None in surplus mode."""
+    delta_pressed_rewards_capped: Decimal | None
+    """Those winners' capped rewards, counterfactual − actual: what the solver's bids held
+    back from them, which the consistency budget gets instead. None in surplus mode."""
+    auctions_margin_cap_unknown: int
+    delta_score: int
+    """Δsurplus + Δprotocol and partner fees."""
     moves: tuple[AuctionMove, ...]
     quote: QuoteSide | None = None
     """`None` when the run had no quote pass, which is not the same as all zeroes."""
+    paid: RecordedRewards | None = None
+    """Rewards recorded as paid to the solver: amounts, not deltas; rule-independent."""
 
     @property
     def overall_bps(self) -> Decimal | None:
@@ -300,6 +367,16 @@ class Report:
         return (
             Decimal(self.price_impact.delta_surplus) * 10_000
             / Decimal(self.window_volume)
+        )
+
+    @property
+    def reference_margin_bps(self) -> Decimal | None:
+        """Δmargin over the volume it sits on: score (or surplus) bps, not a price change."""
+        if not self.reference_margin_volume:
+            return None
+        return (
+            Decimal(self.delta_reference_margin) * 10_000
+            / Decimal(self.reference_margin_volume)
         )
 
     @property
@@ -469,6 +546,7 @@ def _quote_side(payload: Mapping[str, Any]) -> QuoteSide | None:
         commit_dependent=quote["commit_dependent"],
         window_bps=_decimal_or_none(quote["window_bps"]),
         conditional_bps=_decimal_or_none(quote["conditional_bps"]),
+        delta_volume_native=Decimal(str(quote["delta_volume_native"])),
         median_bps=median,
         largest_share=largest_share,
         largest_bps=largest_bps,
@@ -523,17 +601,29 @@ def load_report(path: str) -> Report:
                 if row["delta_rewards_capped"] is not None
                 else None
             ),
-            delta_protocol_and_partner_fees=row["delta_protocol_and_partner_fees"],
-            delta_partner_fees=row["delta_partner_fees"],
-            delta_protocol_fees=row["delta_protocol_fees"],
+            # The window's fee totals leave out auctions with an unpriced fee, so the
+            # per-auction legs that the USD cells sum must too.
+            delta_protocol_and_partner_fees=(
+                row["delta_protocol_and_partner_fees"] if row["fees_complete"] else 0
+            ),
+            delta_partner_fees=row["delta_partner_fees"] if row["fees_complete"] else 0,
+            delta_protocol_fees=row["delta_protocol_fees"] if row["fees_complete"] else 0,
             quote_fee_recharge=row["quote_fee_recharge"],
             quote_fee_recharge_partner=row["quote_fee_recharge_partner"],
             quote_fee_recharge_protocol=row["quote_fee_recharge_protocol"],
             quote_fee_recharges=tuple(row["quote_fee_recharges"].values()),
+            delta_reference_margin=row["delta_reference_margin"],
+            delta_margin_above_cap=_decimal_or_none(row["delta_margin_above_cap"]),
+            delta_pressed_rewards_capped=_decimal_or_none(
+                row["delta_pressed_rewards_capped"]
+            ),
+            delta_score=row["delta_score"],
+            delta_consistency_budget=_decimal_or_none(row["delta_consistency_budget"]),
         )
         for row in payload["changed"]
     )
     cow = payload["cow"]
+    paid = payload["paid"]
 
     only_with = 0
     fok_uids: set[str] = set()
@@ -577,6 +667,9 @@ def load_report(path: str) -> Report:
         delta_rewards_capped=(
             Decimal(payload["delta_rewards_capped"]) if capped else None
         ),
+        delta_consistency_budget=(
+            Decimal(payload["delta_consistency_budget"]) if capped else None
+        ),
         auctions_capped_skipped=payload["auctions_capped_skipped"],
         delta_rewards_cow=(
             Decimal(cow["cow_wei"]) if uncapped and cow is not None else None
@@ -597,8 +690,21 @@ def load_report(path: str) -> Report:
         window_volume=payload["window_volume_base"],
         window_orders=payload["window_orders_base"],
         window_executions=payload["window_order_executions_base"],
+        auctions_runner_up=payload["auctions_runner_up"],
+        delta_reference_margin=payload["delta_reference_margin"],
+        reference_margin_rises=payload["reference_margin_rises"],
+        reference_margin_falls=payload["reference_margin_falls"],
+        auctions_reference_margin_moved=payload["auctions_reference_margin_moved"],
+        reference_margin_volume=payload["reference_margin_volume"],
+        delta_margin_above_cap=_decimal_or_none(payload["delta_margin_above_cap"]),
+        delta_pressed_rewards_capped=_decimal_or_none(
+            payload["delta_pressed_rewards_capped"]
+        ),
+        auctions_margin_cap_unknown=payload["auctions_margin_cap_unknown"],
+        delta_score=payload["delta_score"],
         moves=moves,
         quote=_quote_side(payload),
+        paid=RecordedRewards.from_payload(paid, path) if paid is not None else None,
     )
 
     # The derived only-with figures assume every such order lies in a `changed` auction.
@@ -610,7 +716,18 @@ def load_report(path: str) -> Report:
         )
 
     checks: list[tuple[str, int | Decimal, int | Decimal]] = [
-        ("delta_surplus", report.delta_surplus, sum(m.delta_surplus for m in moves))
+        ("delta_surplus", report.delta_surplus, sum(m.delta_surplus for m in moves)),
+        ("delta_score", report.delta_score, sum(m.delta_score for m in moves)),
+        (
+            "delta_protocol_and_partner_fees",
+            report.delta_protocol_and_partner_fees,
+            sum(m.delta_protocol_and_partner_fees for m in moves),
+        ),
+        (
+            "delta_reference_margin",
+            report.delta_reference_margin,
+            sum(m.delta_reference_margin for m in moves),
+        ),
     ]
     if report.delta_rewards is not None:
         checks.append(
@@ -626,6 +743,51 @@ def load_report(path: str) -> Report:
                         m.delta_rewards_capped
                         for m in moves
                         if m.delta_rewards_capped is not None
+                    ),
+                    Decimal(0),
+                ),
+            )
+        )
+    if report.delta_pressed_rewards_capped is not None:
+        checks.append(
+            (
+                "delta_pressed_rewards_capped",
+                report.delta_pressed_rewards_capped,
+                sum(
+                    (
+                        m.delta_pressed_rewards_capped
+                        for m in moves
+                        if m.delta_pressed_rewards_capped is not None
+                    ),
+                    Decimal(0),
+                ),
+            )
+        )
+    if report.delta_margin_above_cap is not None:
+        checks.append(
+            (
+                "delta_margin_above_cap",
+                report.delta_margin_above_cap,
+                sum(
+                    (
+                        m.delta_margin_above_cap
+                        for m in moves
+                        if m.delta_margin_above_cap is not None
+                    ),
+                    Decimal(0),
+                ),
+            )
+        )
+    if report.delta_consistency_budget is not None:
+        checks.append(
+            (
+                "delta_consistency_budget",
+                report.delta_consistency_budget,
+                sum(
+                    (
+                        m.delta_consistency_budget
+                        for m in moves
+                        if m.delta_consistency_budget is not None
                     ),
                     Decimal(0),
                 ),
@@ -792,6 +954,10 @@ class Table:
     columns: tuple[str, ...]
     rows: tuple[tuple[str, tuple[str, ...]], ...]
     warnings: tuple[str, ...]
+    notes: tuple[str, ...] = ()
+    """Legend lines, rendered under the sign convention."""
+    right_aligned: bool = False
+    """Cells are figures: right-align them."""
 
 
 def _column_title(window: SolverWindow, windows_differ: bool) -> str:
@@ -846,6 +1012,7 @@ def comparison(
     surplus = row("Δsurplus (inherited)")
     alternatives = {rule: row(f"  {rule}") for rule in ALTERNATIVE_RULES}
     protocol_and_partner_fees = row("Δprotocol and partner fees")
+    score = row("Δscore (Δsurplus + Δprotocol and partner fees)")
     saved_share = row("orders no longer executed")
 
     # --- second tier
@@ -877,10 +1044,26 @@ def comparison(
     protocol_fees_base_row = row("  DAO fee revenue with the solver")
     rewards_uncapped = row("Δrewards uncapped")
     rewards_capped = row("Δrewards capped (estimate)")
+    consistency_budget = row("  Δconsistency budget (estimate)")
+    upper_caps = row("  sum = Δ Σ upper reward caps (estimate)")
     net = row("net change (Δsurplus − capped Δrewards)")
+    # --- recorded amounts, not deltas: what the solver was paid in the window
+    paid_total = row("rewards paid to the solver (recorded)")
+    paid_parts: dict[Component, list[str]] = {
+        c: row(f"  {c} rewards (recorded)") for c in COMPONENTS
+    }
+    paid_ratio = row("  rewards paid ÷ −Δsurplus")
     affected = row("auctions where anything moved")
     relaxed = row("fairness filter relaxed")
     filter_exact = row("  filter verdicts resting on surplus, in those auctions")
+
+    # --- the solver as runner-up: room its losing bids left the other winners, bids fixed
+    runner_up = row("runner-up to another winner")
+    pressed_rewards = row("Δother winners' rewards (capped)")
+    margin = row("Δother winners' margin over their reference")
+    margin_above = row("  above the reward cap, winners that settled")
+    margin_bps = row("  over their winning solutions' volume")
+    margin_whale = row("  largest single auction of those")
 
     for window in windows:
         report = window.headline
@@ -941,6 +1124,7 @@ def comparison(
         if report.auctions_fees_incomplete:
             headline += f" ({report.auctions_fees_incomplete:,} auctions unpriced)"
         protocol_and_partner_fees.append(headline)
+        score.append(_score_cell(report, usd))
         partner_fees.append(
             _fee_cell(
                 report, usd, report.delta_partner_fees, lambda m: m.delta_partner_fees
@@ -955,7 +1139,34 @@ def comparison(
 
         rewards_uncapped.append(_rewards_cell(report, usd, capped=False))
         rewards_capped.append(_rewards_cell(report, usd, capped=True))
+        consistency_budget.append(_budget_cell(report, usd, with_capped=False))
+        upper_caps.append(_budget_cell(report, usd, with_capped=True))
         net.append(_net_cell(report, usd))
+        paid = report.paid
+        if paid is None:
+            for cells in (paid_total, *paid_parts.values(), paid_ratio):
+                cells.append("not recorded")
+        else:
+            paid_total.append(
+                _paid_cell(
+                    paid.total,
+                    paid.totals_by_auction(),
+                    paid.unaccounted_any,
+                    usd,
+                    none_accounted=min(paid.unaccounted.values()) >= paid.auctions,
+                )
+            )
+            for component, cells in paid_parts.items():
+                cells.append(
+                    _paid_cell(
+                        paid.amount(component),
+                        paid.amounts(component),
+                        paid.unaccounted[component],
+                        usd,
+                        none_accounted=paid.unaccounted[component] >= paid.auctions,
+                    )
+                )
+            paid_ratio.append(_paid_ratio_cell(report.delta_surplus, paid))
 
         saved.append(
             f"{pct(report.orders_only_with_solver, report.orders_compared)} "
@@ -1031,6 +1242,37 @@ def comparison(
             f"could have moved winners in "
             f"{report.auctions_filter_guess_could_matter:,}"
         )
+
+        runner_up.append(
+            f"{report.auctions_runner_up:,} auctions "
+            f"({pct(report.auctions_runner_up, report.auctions_with_solver)} of the "
+            f"{report.auctions_with_solver:,} the solver bid in)"
+        )
+        margin.append(_margin_cell(report, usd))
+        pressed_rewards.append(_pressed_rewards_cell(report, usd))
+        margin_above.append(_above_cap_cell(report, usd))
+        margin_bps.append(
+            f"{bps(report.reference_margin_bps)} of "
+            f"{eth(report.reference_margin_volume, 2)} ETH "
+            f"({report.mode}, not a price change)"
+            if report.reference_margin_bps is not None
+            else "n/a"
+        )
+        spread = distribution(
+            {m.auction_id: m.delta_reference_margin for m in report.moves}
+        )
+        if spread.largest is not None:
+            share = (
+                f" — {spread.largest_share:.0%} of the total"
+                if spread.largest_share is not None
+                else ""
+            )
+            margin_whale.append(
+                f"{signed_eth(spread.largest)} ETH{share} "
+                f"(auction {spread.largest_auction_id})"
+            )
+        else:
+            margin_whale.append("n/a")
 
         quote = report.quote
         if quote is None:
@@ -1154,6 +1396,7 @@ def comparison(
             quote_link.append(_link_cell(quote))
 
         warnings.extend(_report_warnings(window, usd))
+        warnings.extend(_paid_warnings(report, usd))
 
     return Table(
         columns=columns,
@@ -1184,6 +1427,65 @@ def _rewards_cell(report: Report, usd: UsdContext | None, *, capped: bool) -> st
     return f"{signed_eth(delta)} ETH{detail}"
 
 
+def _margin_cell(report: Report, usd: UsdContext | None) -> str:
+    moved = report.reference_margin_rises + report.reference_margin_falls
+    if not moved:
+        return "no other winner's margin moved"
+    cell = f"{signed_eth(report.delta_reference_margin)} ETH"
+    if usd:
+        deltas = {m.auction_id: m.delta_reference_margin for m in report.moves}
+        cell += f" ({usd_amount(usd_total(deltas, usd))})"
+    return (
+        f"{cell} over {moved:,} winners in "
+        f"{report.auctions_reference_margin_moved:,} auctions "
+        f"({report.reference_margin_rises:,} rose, {report.reference_margin_falls:,} fell)"
+    )
+
+
+def _score_cell(report: Report, usd: UsdContext | None) -> str:
+    cell = f"{signed_eth(report.delta_score)} ETH"
+    if usd:
+        deltas = {m.auction_id: m.delta_score for m in report.moves}
+        cell += f" ({usd_amount(usd_total(deltas, usd))})"
+    if report.auctions_fees_incomplete:
+        cell += f"; fees unpriced in {report.auctions_fees_incomplete:,} auctions"
+    return cell
+
+
+def _pressed_rewards_cell(report: Report, usd: UsdContext | None) -> str:
+    delta = report.delta_pressed_rewards_capped
+    if delta is None:
+        return "not computed (surplus mode)"
+    cell = f"{signed_eth(delta)} ETH"
+    if usd:
+        deltas: dict[int, int | Decimal] = {
+            m.auction_id: m.delta_pressed_rewards_capped
+            for m in report.moves
+            if m.delta_pressed_rewards_capped is not None
+        }
+        cell += f" ({usd_amount(usd_total(deltas, usd))})"
+    if report.auctions_margin_cap_unknown:
+        cell += f"; {report.auctions_margin_cap_unknown:,} auctions with an unknown cap left out"
+    return cell
+
+
+def _above_cap_cell(report: Report, usd: UsdContext | None) -> str:
+    above = report.delta_margin_above_cap
+    if above is None:
+        return "not computed (surplus mode)"
+    cell = f"{signed_eth(above)} ETH"
+    if usd:
+        deltas: dict[int, int | Decimal] = {
+            m.auction_id: m.delta_margin_above_cap
+            for m in report.moves
+            if m.delta_margin_above_cap is not None
+        }
+        cell += f" ({usd_amount(usd_total(deltas, usd))})"
+    if report.auctions_margin_cap_unknown:
+        cell += f"; {report.auctions_margin_cap_unknown:,} auctions with an unknown cap left out"
+    return cell
+
+
 def _net_cell(report: Report, usd: UsdContext | None) -> str:
     """Δsurplus − capped Δrewards: only the capped figure is at payout scale."""
     if report.delta_rewards_capped is None:
@@ -1199,6 +1501,80 @@ def _net_cell(report: Report, usd: UsdContext | None) -> str:
         }
         cell += f" ({usd_amount(usd_total(surplus, usd) - usd_total(capped, usd))})"
     return cell
+
+
+def _budget_cell(report: Report, usd: UsdContext | None, *, with_capped: bool) -> str:
+    """Δconsistency budget, or its sum with the capped Δrewards (= Δ Σ upper caps)."""
+    budget, capped = report.delta_consistency_budget, report.delta_rewards_capped
+    if budget is None or capped is None:
+        return "not computed"
+    total = budget + capped if with_capped else budget
+    cell = f"{signed_eth(total)} ETH"
+    if usd:
+        deltas: dict[int, int | Decimal] = {
+            m.auction_id: m.delta_consistency_budget
+            + (m.delta_rewards_capped if with_capped else 0)
+            for m in report.moves
+            if m.delta_consistency_budget is not None
+            and m.delta_rewards_capped is not None
+        }
+        cell += f" ({usd_amount(usd_total(deltas, usd))})"
+    return cell
+
+
+def _paid_cell(
+    amount: Decimal,
+    per_auction: Mapping[int, Decimal],
+    unaccounted: int,
+    usd: UsdContext | None,
+    *,
+    none_accounted: bool = False,
+) -> str:
+    """A recorded amount: unsigned, so it does not read as a counterfactual delta. With
+    nothing accounted yet there is no amount to show, not a zero."""
+    if unaccounted and none_accounted:
+        return f"not yet accounted ({unaccounted:,} auctions)"
+    cell = f"{eth(amount, 4)} ETH"
+    if usd:
+        cell += f" ({usd_amount(usd_total(per_auction, usd))})"
+    if unaccounted:
+        cell += f"; incomplete: {unaccounted:,} auctions not yet accounted"
+    return cell
+
+
+def _paid_ratio_cell(delta_surplus: int, paid: RecordedRewards) -> str:
+    if delta_surplus >= 0:
+        return "n/a — Δsurplus is not negative"
+    ratio = paid.total / Decimal(-delta_surplus)
+    return f"{ratio:.2f}" + ("; rewards paid incomplete" if paid.unaccounted_any else "")
+
+
+def _paid_warnings(report: Report, usd: UsdContext | None) -> list[str]:
+    paid = report.paid
+    if paid is None:
+        return []
+    warnings: list[str] = []
+    label = f"{report.solver} ({report.network})"
+    if paid.mismatches:
+        sample = "; ".join(
+            f"{m.component} {m.period} {m.solver[:8]}: int table {m.int_table:.6g}, "
+            f"mart {m.mart:.6g}"
+            for m in paid.mismatches[:3]
+        )
+        warnings.append(
+            f"{label}: for {len(paid.mismatches)} (week, solver) pairs the int table's "
+            f"full-week sum disagrees with the weekly mart's own total ({sample}) — one "
+            f"was rebuilt after the other; the recorded rewards row splits the paid "
+            f"reward over the week by the int table"
+        )
+    if usd:
+        missing = sum(1 for a in paid.per_auction if a not in usd.rates)
+        if missing:
+            warnings.append(
+                f"{label}: {missing} auctions with recorded rewards priced no reference "
+                f"stablecoin; converted at the window-median rate"
+            )
+    return warnings
 
 
 def _link_cell(quote: QuoteSide) -> str:
@@ -1220,16 +1596,31 @@ def _link_cell(quote: QuoteSide) -> str:
     return " | ".join(parts) if parts else "no orders"
 
 
+def _shared_warnings(report: Report, usd: UsdContext | None) -> list[str]:
+    """Warnings about figures both the comparison and the summary show."""
+    warnings: list[str] = []
+    label = f"{report.solver} ({report.network}, {report.outcome_rule})"
+    if not report.price_suspects_excluded and report.price_suspects:
+        warnings.append(
+            f"{label}: ran with --include-price-suspects, so "
+            f"{report.price_suspects} auctions with fabricated prices are IN these "
+            f"numbers"
+        )
+    if usd:
+        missing = sum(1 for m in report.moves if m.auction_id not in usd.rates)
+        if missing:
+            warnings.append(
+                f"{label}: {missing} changed auctions priced no reference "
+                f"stablecoin; converted at the window-median rate"
+            )
+    return warnings
+
+
 def _report_warnings(window: SolverWindow, usd: UsdContext | None) -> list[str]:
     warnings: list[str] = []
     for report in window.by_rule.values():
         label = f"{report.solver} ({report.network}, {report.outcome_rule})"
-        if not report.price_suspects_excluded and report.price_suspects:
-            warnings.append(
-                f"{label}: ran with --include-price-suspects, so "
-                f"{report.price_suspects} auctions with fabricated prices are IN these "
-                f"numbers"
-            )
+        warnings.extend(_shared_warnings(report, usd))
         if report.auctions_capped_skipped:
             warnings.append(
                 f"{label}: {report.auctions_capped_skipped} auctions have no capped "
@@ -1255,14 +1646,138 @@ def _report_warnings(window: SolverWindow, usd: UsdContext | None) -> list[str]:
                 f"({quote.matched / quote.linkable:.1%}, trivial unwraps aside); the "
                 f"unlinked ones contribute zero to every quote figure"
             )
-        if usd:
-            missing = sum(1 for m in report.moves if m.auction_id not in usd.rates)
-            if missing:
-                warnings.append(
-                    f"{label}: {missing} changed auctions priced no reference "
-                    f"stablecoin; converted at the window-median rate"
-                )
     return warnings
+
+
+# --- the summary: one row per solver-window ----------------------------------------
+
+
+def summary(
+    windows: Sequence[SolverWindow],
+    usd_by_network: Mapping[str, UsdContext] | None = None,
+) -> Table:
+    """One row per solver-window, most negative Δsurplus first: the figures for judging
+    solvers side by side. Amounts are in USD when every window's network has rates, else
+    native."""
+    usd_by_network = usd_by_network or {}
+    in_usd = bool(windows) and all(w.network in usd_by_network for w in windows)
+    windows_differ = len({w.headline.window for w in windows}) > 1
+
+    def amount(
+        report: Report, total: int | Decimal, per_auction: Mapping[int, int | Decimal]
+    ) -> Decimal:
+        """In the table's unit: dollars, or native wei."""
+        if in_usd:
+            return usd_total(per_auction, usd_by_network[report.network])
+        return Decimal(total)
+
+    def text(value: Decimal, *, signed: bool) -> str:
+        if not in_usd:
+            return signed_eth(value, 4) if signed else eth(value, 4)
+        whole = value.quantize(Decimal(1), rounding=ROUND_HALF_UP)
+        sign = "-" if whole < 0 else ("+" if signed and whole > 0 else "")
+        return f"{sign}${abs(whole):,}"
+
+    entries: list[tuple[Decimal, str, list[str]]] = []
+    warnings: list[str] = []
+    for window in windows:
+        report = window.headline
+        surplus_moves = {m.auction_id: m.delta_surplus for m in report.moves}
+        score_moves = {m.auction_id: m.delta_score for m in report.moves}
+        surplus = amount(report, report.delta_surplus, surplus_moves)
+        score = amount(report, report.delta_score, score_moves)
+        paid = report.paid
+        reward: dict[Component, str] = {}
+        for component in COMPONENTS:
+            missing = paid.unaccounted[component] if paid is not None else 0
+            if paid is None:
+                reward[component] = "n/a"
+            elif missing and missing >= paid.auctions:
+                reward[component] = "pending"
+            else:
+                value = amount(report, paid.amount(component), paid.amounts(component))
+                reward[component] = text(value, signed=False) + ("*" if missing else "")
+
+        pressed = report.delta_pressed_rewards_capped
+        if pressed is None:
+            pressed_cell = "n/a"
+        else:
+            pressed_moves: dict[int, int | Decimal] = {
+                m.auction_id: m.delta_pressed_rewards_capped
+                for m in report.moves
+                if m.delta_pressed_rewards_capped is not None
+            }
+            pressed_cell = text(amount(report, pressed, pressed_moves), signed=True)
+        quote = report.quote
+        if quote is None:
+            quote_cell = "not run"
+        elif in_usd:
+            # One amount for the window, not per auction: the window-median rate.
+            rate = usd_by_network[report.network].fallback
+            quote_cell = text(quote.delta_volume_native * rate / WEI, signed=True)
+        else:
+            quote_cell = text(quote.delta_volume_native, signed=True)
+        cells = [
+            pct(report.auctions_solver_won, report.analysed),
+            text(surplus, signed=True) + _largest_share(surplus_moves),
+            f"{report.orders_only_with_solver:,}",
+            # winning
+            text(score, signed=True),
+            reward["performance"],
+            # second-best bids
+            f"{report.auctions_runner_up:,}",
+            pressed_cell,
+            reward["consistency"],
+            # quotes
+            quote_cell,
+            reward["quote"],
+        ]
+        entries.append((surplus, _column_title(window, windows_differ), cells))
+        usd = usd_by_network.get(report.network) if in_usd else None
+        warnings.extend(_shared_warnings(report, usd))
+        warnings.extend(_paid_warnings(report, usd))
+    if usd_by_network and not in_usd:
+        lacking = sorted({w.network for w in windows} - set(usd_by_network))
+        warnings.append(
+            f"no USD rates for {', '.join(lacking)}: every amount is in the native token"
+        )
+    entries.sort(key=lambda entry: entry[0])
+
+    unit = "USD, each auction at its own rate" if in_usd else "ETH (the native token)"
+    notes = (
+        f"Sorted by Δsurplus, most negative first. Amounts in {unit}; (n%) is the "
+        "largest single auction's share of the total.",
+        "won: share of analysed auctions. orders lost: user orders executed only with "
+        "the solver.",
+        "Three groups, each a contribution with bids fixed, then the reward that pays for "
+        "it. Rewards are recorded as paid in the window, every auction included; amounts, "
+        "not deltas. * some auctions not yet accounted, pending: none yet.",
+        "Winning: Δscore is Δsurplus + Δprotocol and partner fees, what the winning bids "
+        "delivered; performance rewards pay for it.",
+        "Second-best bids: runner-up counts auctions where a losing bid of the solver sets "
+        "another winner's reference score. Δwinners' rewards is what the mechanism would "
+        "pay the winners that keep the same solutions more without the solver, capped; "
+        "the consistency budget, which pays consistency rewards, lacks exactly that much.",
+        "Quotes: Δquote is the change in the quoted amounts of executed orders without "
+        "the solver in the quote competition, at the window's median rate (needs analyse "
+        "--quotes). Quote rewards pay for accuracy, not for winning: the five quotes "
+        "closest to each executed order's price share it, verified or not.",
+    )
+    return Table(
+        columns=(
+            "won", "Δsurplus", "orders lost", "Δscore", "performance", "runner-up",
+            "Δwinners' rewards", "consistency", "Δquote", "quote",
+        ),
+        rows=tuple((label, tuple(cells)) for _, label, cells in entries),
+        warnings=tuple(warnings),
+        notes=notes,
+        right_aligned=True,
+    )
+
+
+def _largest_share(deltas: Mapping[int, int | Decimal]) -> str:
+    share = distribution(deltas).largest_share
+    return f" ({share:.0%})" if share is not None else ""
 
 
 def render_text(table: Table) -> str:
@@ -1271,18 +1786,19 @@ def render_text(table: Table) -> str:
         max(len(column), max(len(row[1][i]) for row in table.rows))
         for i, column in enumerate(table.columns)
     ]
-    lines = [
-        "".rjust(label_width)
-        + "  "
-        + "  ".join(c.ljust(w) for c, w in zip(table.columns, widths, strict=True))
-    ]
-    for label, cells in table.rows:
-        lines.append(
+
+    def line(label: str, cells: Sequence[str]) -> str:
+        pad = str.rjust if table.right_aligned else str.ljust
+        return (
             label.ljust(label_width)
             + "  "
-            + "  ".join(cell.ljust(w) for cell, w in zip(cells, widths, strict=True))
+            + "  ".join(pad(c, w) for c, w in zip(cells, widths, strict=True))
         )
+
+    lines = [line("", table.columns)]
+    lines.extend(line(label, cells) for label, cells in table.rows)
     lines.append(f"\nsigns: {SIGN_CONVENTION}")
+    lines.extend(f"\n{note}" for note in table.notes)
     for warning in table.warnings:
         lines.append(f"\nWARNING: {warning}")
     return "\n".join(lines)
@@ -1290,13 +1806,15 @@ def render_text(table: Table) -> str:
 
 def render_markdown(table: Table) -> str:
     header = "| | " + " | ".join(table.columns) + " |"
-    divider = "| --- |" + " --- |" * len(table.columns)
+    cell = " ---: |" if table.right_aligned else " --- |"
+    divider = "| --- |" + cell * len(table.columns)
     lines = [header, divider]
     for label, cells in table.rows:
         # Markdown drops leading spaces.
         shown = "&nbsp;&nbsp;" + label.strip() if label.startswith("  ") else label
         lines.append("| " + shown + " | " + " | ".join(cells) + " |")
     lines.append(f"\n*Signs: {SIGN_CONVENTION}.*")
+    lines.extend(f"\n{note}" for note in table.notes)
     for warning in table.warnings:
         lines.append(f"\n**Warning:** {warning}")
     return "\n".join(lines)

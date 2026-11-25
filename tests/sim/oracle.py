@@ -332,6 +332,19 @@ def references(ranked: Sequence[Bid], winners: set[int], max_winners: int
     return result
 
 
+def reference_picks(ranked: Sequence[Bid], winners: set[int], max_winners: int
+                    ) -> dict[str, frozenset[int]]:
+    """Step 6's re-picks themselves: per winning solver, the uids the pick without it
+    takes."""
+    result: dict[str, frozenset[int]] = {}
+    for bid in ranked:
+        if bid.uid not in winners or bid.solver in result:
+            continue
+        rest = [b for b in ranked if b.solver != bid.solver]
+        result[bid.solver] = frozenset(b.uid for b in _pick(rest, max_winners))
+    return result
+
+
 # --- rewards --------------------------------------------------------------------------
 
 

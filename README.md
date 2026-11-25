@@ -102,13 +102,22 @@ prevents idle sleep for the command's duration (closing the lid still sleeps)
 ### compare
 
 ```bash
-uv run loo compare out/*.json [--markdown] [--out FILE] [--skip-usd]
+uv run loo compare out/*.json [--summary] [--markdown] [--out FILE] [--skip-usd]
 ```
 
 One column per solver-window, the `assume-settled` scenario beside the `inherited`
-headline. Give every rule's run of a solver-window together; a group without `inherited`
-is refused. Reports carry a format marker and older ones are refused with "re-run
+headline. `--summary` turns it around for many solvers: one row each, sorted by
+Δsurplus, with win share, Δsurplus and orders lost, then three groups, each a
+contribution with bids fixed beside the reward paid for that kind of work: winning
+(Δscore, performance rewards), second-best bids (runner-up auctions, Δother winners'
+capped rewards, consistency rewards) and quotes (Δquote, quote rewards; needs
+`--quotes`). Quote rewards pay for accuracy, not for winning, so the quote pair sits
+side by side without one paying for the other. Its amounts are in USD when every window
+has rates, else native. Give every rule's run of a solver-window together; a group
+without `inherited` is refused. Reports carry a format marker and older ones are refused with "re-run
 analyse" — files are cheap to regenerate, a misread one is not. `--skip-usd` needs no DB.
+USD needs one rate per auction with a recorded reward, which over a week is most of its
+auctions: 11,083 mainnet auctions took 16 s cold and 3 s warm (2026-11-25).
 
 ### validate and validate-rewards
 
@@ -200,8 +209,64 @@ lack fee policies are dropped from both sides and counted
   the slot it displaced; a winner with nothing to inherit drops its auction from the
   capped sum and is counted
   ([details](docs/rewards.md#the-slot-inheritance-estimate-and-why-the-caps-cannot-be-skipped)).
+- **Δconsistency budget (estimate)** — each auction adds `upper cap − capped reward` to
+  the week's consistency budget, which is paid out in full, so it offsets the capped
+  delta over the same auctions; their sum is the change in summed upper caps
+  ([details](docs/rewards.md#the-consistency-budget-offsets-the-capped-delta)).
 
 Both convert native → COW per auction at the accounting-period rate, where snapshotted.
+
+### Runner-up
+
+`runner-up to another winner` counts the auctions where a losing bid of the solver's sets
+another winner's reference score. `Δother winners' margin over their reference` is how
+far those winners' margin over the reference (their reward before caps) moves without
+the solver, every bid held fixed. It is counterfactual − actual, over winners that win
+the same solutions on both sides, with rises and falls counted apart. Its bps are over
+those winners' winning volume and are score bps (surplus under `--mode surplus`), not a
+price change. That a winner could shade its bid by its margin is not modelled
+([definition and limits](docs/winner-selection.md#runner-up-the-margin-a-losing-bid-leaves-the-winners)).
+
+`Δother winners' rewards (capped)` is what the mechanism would pay those same winners
+more without the solver, bids fixed. Their caps are the same on both sides, so the
+consistency budget, which pays consistency rewards, lacks exactly that much: it is the
+part of the pool the solver's losing bids moved from winners to consistency rewards, and
+needs no assumption about how anyone would bid.
+
+`above the reward cap, winners that settled` is the part of each winner's margin beyond
+its upper cap, summed over the winners whose batch settled, counterfactual − actual.
+Above its cap a winner's reward no longer depends on its bid, so this is score it could
+withhold from users at no cost in reward; below the cap a worse bid costs it reward one
+for one, and that reward comes out of the same weekly pool as the consistency budget
+([why the cap splits it](docs/winner-selection.md#above-the-cap)).
+
+`Δscore (Δsurplus + Δprotocol and partner fees)` is the sum of the two rows: what the
+winning bids delivered to users, partners and the protocol, the fee leg over the
+auctions whose fees are all priced. With bids fixed it is the solver's own marginal
+contribution, the quantity the performance reward pays before caps.
+
+### Rewards paid to the solver (recorded)
+
+Below the net row, `compare` shows what the solver was paid in the window: performance
+rewards per auction, and its consistency and quote rewards, each weekly reward split over
+the window by the solver's own per-auction metric (relative surplus, quote reward share)
+([decomposition](docs/rewards.md#rewards-paid-to-a-solver-recorded)). These are amounts of
+record, unsigned, not counterfactual − actual:
+
+- They cover **every auction in the window**, price-suspect and fast-path ones included,
+  which Δsurplus excludes; `rewards paid ÷ −Δsurplus` divides one by the other as they
+  are.
+- They are **gross** of the solver service fee.
+- A week not paid out yet has no consistency or quote figure, and an auction without a
+  reward row no performance figure: the row says `incomplete: N auctions not yet
+  accounted` rather than counting them as zero. On 2026-11-25 the latest paid week was
+  2026-11-10..17.
+- The consistency and quote pools are budgets tied to protocol revenue. Without the
+  solver its share would go to the remaining solvers, so the rows say what the solver
+  received, not what the protocol would save. The counterfactual quote reward is not
+  evaluated.
+- A warning names any week whose int table no longer sums to its mart's own total (one
+  was rebuilt after the other); the split then follows the int table.
 
 ### Price sanity
 
@@ -262,5 +327,6 @@ type-check; dev tooling installs with `uv sync --extra dev`.
   prices, fees, settlement, solver names, query cost.
 - [docs/winner-selection.md](docs/winner-selection.md) — the algorithm, Rust source map,
   the score-split filter, the fee port, counterfactual rules.
-- [docs/rewards.md](docs/rewards.md) — reward and cap formulas, the capped estimate.
+- [docs/rewards.md](docs/rewards.md) — reward and cap formulas, the capped estimate, the
+  rewards paid.
 - [docs/quotes.md](docs/quotes.md) — the quote competition and the quote side.

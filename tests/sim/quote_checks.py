@@ -19,7 +19,7 @@ from loo.fees import Quote
 from loo.quotes import MatchedQuote, QuoteAnalysis, QuoteWindow
 from loo.valuation import build_solutions
 
-from . import expect, oracle
+from . import expect, oracle, summary_checks
 from .harness import Sim
 from .oracle import Answer
 from .world import NATIVE, World
@@ -498,6 +498,11 @@ def check_cli(sim: Sim, world: World, tmp_path: Path, label: str,
             if window.trivial_orders else "no orders")
     link = report.quote.link
     assert link.rate == (Decimal(link.linked) / link.orders if link.orders else None)
+    # The window's Δquote as an amount (checked against the oracle's numerator above),
+    # and the summary's quote group, native without a USD rate.
+    assert report.quote.delta_volume_native == Decimal(str(analysis.delta_volume_native))
+    windows = aggregate.group_reports([report])
+    summary_checks.check_table(aggregate.summary(windows), windows, {})
     v = window.validation
     if v.rate is not None:
         pick = cell["  quote pick reproduced the recorded winner"]

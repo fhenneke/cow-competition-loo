@@ -18,6 +18,7 @@ from .rewards import SolverReward, Win, uncapped_rewards
 from .valuation import Mode, Order, ValuedBid, build_solutions
 from .winner_selection import (
     Ranking,
+    ReferenceScore,
     Solution,
     arbitrate,
     compute_reference_outcomes,
@@ -84,6 +85,51 @@ def un_filtered(baseline: Ranking, loo: Ranking, removed: frozenset[str]) -> fro
         )
 
     return frozenset(loo_kept - baseline_kept)
+
+
+def reference_margin(winning_score: int, reference_score: int) -> int:
+    """A winner's margin over its reference score, `winning_score − min(winning_score,
+    reference_score)`: what it earns before caps if it settles (docs/rewards.md)."""
+    return winning_score - min(winning_score, reference_score)
+
+
+def _winning_uids_by_solver(ranking: Ranking) -> dict[str, frozenset[int]]:
+    by_solver: dict[str, set[int]] = {}
+    for solution in ranking.winners:
+        by_solver.setdefault(solution.solver, set()).add(solution.solution_uid)
+    return {solver: frozenset(uids) for solver, uids in by_solver.items()}
+
+
+def pressed_winners(
+    baseline: Ranking, loo: Ranking, removed: frozenset[str]
+) -> dict[str, frozenset[int]]:
+    """Solvers outside `removed` winning the same solutions on both sides, with those
+    solutions. One that wins other solutions without `removed` took part of a vacated
+    slot, which belongs to Δrewards, not to the margin a runner-up left it."""
+    base, counterfactual = _winning_uids_by_solver(baseline), _winning_uids_by_solver(loo)
+    return {
+        solver: uids
+        for solver, uids in base.items()
+        if solver not in removed and counterfactual.get(solver) == uids
+    }
+
+
+def runner_up_uids(
+    baseline: Ranking, references: Mapping[str, ReferenceScore], removed: frozenset[str]
+) -> frozenset[int]:
+    """Removed solvers' non-winning solutions in the reference pick of a winner outside
+    `removed`. By uid: a removed solver can win one pair and be runner-up on another."""
+    losing = {
+        s.solution_uid
+        for s in baseline.ranked
+        if s.solver in removed and s.solution_uid not in baseline.winner_uids
+    }
+    return frozenset(
+        uid
+        for solver, reference in references.items()
+        if solver not in removed
+        for uid in reference.setter_uids & losing
+    )
 
 
 @dataclass(frozen=True)
@@ -525,8 +571,14 @@ class AuctionCounterfactual:
     loo_winner_uids: frozenset[int] = frozenset()
     baseline_reference_scores: dict[str, int] = field(default_factory=dict[str, int])
     loo_reference_scores: dict[str, int] = field(default_factory=dict[str, int])
-    solver_set_reference_for: frozenset[str] = frozenset()
-    """Solvers whose baseline reference score a removed solver helped set."""
+    reference_margins_base: dict[str, int] = field(default_factory=dict[str, int])
+    reference_margins_loo: dict[str, int] = field(default_factory=dict[str, int])
+    """`reference_margin` per pressed winner (`pressed_winners`), from each side's own
+    winning and reference scores; settlement plays no part."""
+    pressed_volume_base: int = 0
+    """Received-leg volume of the winning solutions of pressed winners whose margin moved."""
+    runner_up_uids: frozenset[int] = frozenset()
+    """Removed solvers' losing solutions that set another winner's reference score."""
     baseline_rewards: dict[str, SolverReward] = field(default_factory=dict[str, SolverReward])
     loo_rewards: dict[str, SolverReward] = field(default_factory=dict[str, SolverReward])
     """Score mode only; empty in surplus mode."""
@@ -588,6 +640,43 @@ class AuctionCounterfactual:
         """Can move without the winner set: a removed non-winning solution can win a
         without-`s` pick in `compute_reference_scores`."""
         return self.baseline_reference_scores != self.loo_reference_scores
+
+    @property
+    def runner_up(self) -> bool:
+        return bool(self.runner_up_uids)
+
+    @property
+    def reference_margin_base(self) -> int:
+        return sum(self.reference_margins_base.values())
+
+    @property
+    def reference_margin_loo(self) -> int:
+        return sum(self.reference_margins_loo.values())
+
+    @property
+    def delta_reference_margin(self) -> int:
+        """Counterfactual minus actual. A margin moves only with the winning score or a
+        reference score, so `anything_moved` retains every auction where this is nonzero."""
+        return self.reference_margin_loo - self.reference_margin_base
+
+    @property
+    def reference_margin_rises(self) -> int:
+        return sum(
+            1
+            for solver, margin in self.reference_margins_base.items()
+            if self.reference_margins_loo[solver] > margin
+        )
+
+    @property
+    def reference_margin_falls(self) -> int:
+        """Removal lowers a margin where the reference pick does better without it: an
+        un-filtered solution, a batch a removed winner's claim kept out, or smaller bids a
+        removed losing batch crowded out of the greedy pick."""
+        return sum(
+            1
+            for solver, margin in self.reference_margins_base.items()
+            if self.reference_margins_loo[solver] < margin
+        )
 
     @property
     def anything_moved(self) -> bool:
@@ -703,6 +792,102 @@ class AuctionCounterfactual:
         if base is None or loo is None:
             return None
         return loo - base
+
+    @staticmethod
+    def _consistency_budget(rewards: dict[str, SolverReward]) -> Decimal | None:
+        """Σ (upper cap − capped reward), as `consistency_budget_contribution`."""
+        total = Decimal(0)
+        for reward in rewards.values():
+            if reward.capped_reward is None or reward.upper_cap is None:
+                return None
+            total += reward.upper_cap - reward.capped_reward
+        return total
+
+    @property
+    def consistency_budget_base(self) -> Decimal | None:
+        return self._consistency_budget(self.baseline_rewards)
+
+    @property
+    def consistency_budget_loo(self) -> Decimal | None:
+        return self._consistency_budget(self.loo_rewards)
+
+    @property
+    def delta_consistency_budget(self) -> Decimal | None:
+        """Defined exactly where `delta_rewards_capped` is; the two sum to Δ Σ upper caps."""
+        base, loo = self.consistency_budget_base, self.consistency_budget_loo
+        if base is None or loo is None:
+            return None
+        return loo - base
+
+    @staticmethod
+    def _margin_above_cap(
+        margins: Mapping[str, int], rewards: Mapping[str, SolverReward]
+    ) -> Decimal | None:
+        """Σ max(0, margin − upper cap) over the pressed winners whose wins all settled:
+        score a winner could have withheld from users at no cost in reward, since above its
+        cap the reward no longer depends on its bid. A batch that did not land delivered
+        nothing to withhold. None without rewards (surplus mode) or with an unknown cap."""
+        total = Decimal(0)
+        for solver, margin in margins.items():
+            reward = rewards.get(solver)
+            if reward is None or reward.upper_cap is None:
+                return None
+            if reward.observed_score == reward.competition_score:
+                total += max(Decimal(0), margin - reward.upper_cap)
+        return total
+
+    @property
+    def margin_above_cap_base(self) -> Decimal | None:
+        return self._margin_above_cap(self.reference_margins_base, self.baseline_rewards)
+
+    @property
+    def margin_above_cap_loo(self) -> Decimal | None:
+        return self._margin_above_cap(self.reference_margins_loo, self.loo_rewards)
+
+    @property
+    def delta_margin_above_cap(self) -> Decimal | None:
+        base, loo = self.margin_above_cap_base, self.margin_above_cap_loo
+        if base is None or loo is None:
+            return None
+        return loo - base
+
+    @staticmethod
+    def _pressed_capped(
+        margins: Mapping[str, int], rewards: Mapping[str, SolverReward]
+    ) -> Decimal | None:
+        """Σ capped reward of the pressed winners (the keys of `margins`)."""
+        total = Decimal(0)
+        for solver in margins:
+            reward = rewards.get(solver)
+            if reward is None or reward.capped_reward is None:
+                return None
+            total += reward.capped_reward
+        return total
+
+    @property
+    def pressed_rewards_capped_base(self) -> Decimal | None:
+        return self._pressed_capped(self.reference_margins_base, self.baseline_rewards)
+
+    @property
+    def pressed_rewards_capped_loo(self) -> Decimal | None:
+        return self._pressed_capped(self.reference_margins_loo, self.loo_rewards)
+
+    @property
+    def delta_pressed_rewards_capped(self) -> Decimal | None:
+        """What the pressed winners would be paid more without the removed solvers, bids
+        fixed. Their caps are the same on both sides, so the consistency budget moves by
+        exactly the opposite: mechanism accounting, no assumption about behaviour."""
+        base, loo = self.pressed_rewards_capped_base, self.pressed_rewards_capped_loo
+        if base is None or loo is None:
+            return None
+        return loo - base
+
+    @property
+    def delta_score(self) -> int:
+        """Δsurplus + Δprotocol and partner fees, the fee leg only where every fee is
+        priced: the window total is then the sum of the two rows."""
+        fees = self.delta_protocol_and_partner_fees if self.fees_complete else 0
+        return self.delta_surplus + fees
 
     @property
     def price_suspect(self) -> bool:
@@ -986,6 +1171,23 @@ def analyse_auction(
     }
     loo_reference_scores = compute_reference_scores(loo, max_winners)
 
+    pressed = pressed_winners(baseline, loo, removed)
+    margins_base = {
+        solver: reference_margin(baseline.winning_score, baseline_reference_scores[solver])
+        for solver in pressed
+    }
+    margins_loo = {
+        solver: reference_margin(loo.winning_score, loo_reference_scores[solver])
+        for solver in pressed
+    }
+    pressed_volume = sum(
+        by_uid[uid].valuation.order_volume_native[order.uid]
+        for solver, uids in pressed.items()
+        if margins_base[solver] != margins_loo[solver]
+        for uid in uids
+        for order in by_uid[uid].bid.orders
+    )
+
     baseline_rewards: dict[str, SolverReward] = {}
     loo_rewards: dict[str, SolverReward] = {}
     cap_double_inherited = 0
@@ -1051,9 +1253,10 @@ def analyse_auction(
         loo_winner_uids=loo.winner_uids,
         baseline_reference_scores=baseline_reference_scores,
         loo_reference_scores=loo_reference_scores,
-        solver_set_reference_for=frozenset(
-            solver for solver, ref in baseline_references.items() if ref.setters & removed
-        ),
+        reference_margins_base=margins_base,
+        reference_margins_loo=margins_loo,
+        pressed_volume_base=pressed_volume,
+        runner_up_uids=runner_up_uids(baseline, baseline_references, removed),
         baseline_rewards=baseline_rewards,
         loo_rewards=loo_rewards,
         cap_double_inherited=cap_double_inherited,
@@ -1148,6 +1351,10 @@ class Analysis:
     """Recorded caps were supplied; capped fields aggregate only then."""
     rewards_base_capped: Decimal = Decimal(0)
     rewards_loo_capped: Decimal = Decimal(0)
+    consistency_budget_base: Decimal = Decimal(0)
+    consistency_budget_loo: Decimal = Decimal(0)
+    """Σ (upper cap − capped reward), the weekly consistency budget's contributions; over
+    `auctions_capped` like the capped rewards."""
     auctions_capped: int = 0
     auctions_capped_skipped: int = 0
     """Dropped from both sides: some winner's cap could not be estimated."""
@@ -1198,8 +1405,26 @@ class Analysis:
     orphans_loo: int = 0
     """Replacements whose settlement was assumed: no recorded winner held their pairs."""
 
-    reference_influence: int = 0
-    """(auction, solver) pairs whose baseline reference score a removed solver helped set."""
+    auctions_runner_up: int = 0
+    """A removed solver's losing solution set another winner's reference score."""
+    reference_margin_base: int = 0
+    reference_margin_loo: int = 0
+    """Σ margin over the reference score of the pressed winners (outside the removal,
+    same winning solutions on both sides); in the mode's currency, bids held fixed."""
+    reference_margin_rises: int = 0
+    reference_margin_falls: int = 0
+    """(auction, pressed winner) pairs whose margin rose / fell without the removed solvers."""
+    auctions_reference_margin_moved: int = 0
+    reference_margin_volume: int = 0
+    """Received-leg volume of those winners' winning solutions, where their margin moved."""
+    margin_above_cap_base: Decimal = Decimal(0)
+    margin_above_cap_loo: Decimal = Decimal(0)
+    """Σ max(0, margin − upper cap) over the pressed winners that settled (score mode)."""
+    pressed_rewards_capped_base: Decimal = Decimal(0)
+    pressed_rewards_capped_loo: Decimal = Decimal(0)
+    """Σ capped reward of the pressed winners (score mode)."""
+    auctions_margin_cap_unknown: int = 0
+    """Auctions with a pressed winner whose cap is unknown, left out of both of the above."""
 
     valuation_failures: list[tuple[int, int, str]] = field(
         default_factory=list[tuple[int, int, str]]
@@ -1240,9 +1465,37 @@ class Analysis:
         return self.rewards_loo - self.rewards_base
 
     @property
+    def delta_reference_margin(self) -> int:
+        return self.reference_margin_loo - self.reference_margin_base
+
+    @property
+    def delta_margin_above_cap(self) -> Decimal | None:
+        """None in surplus mode, which has no caps."""
+        if self.mode != "score":
+            return None
+        return self.margin_above_cap_loo - self.margin_above_cap_base
+
+    @property
+    def delta_pressed_rewards_capped(self) -> Decimal | None:
+        """None in surplus mode, which has no caps."""
+        if self.mode != "score":
+            return None
+        return self.pressed_rewards_capped_loo - self.pressed_rewards_capped_base
+
+    @property
+    def delta_score(self) -> int:
+        """Δsurplus + Δprotocol and partner fees, as the two rows report them."""
+        return self.delta_surplus + self.delta_protocol_and_partner_fees
+
+    @property
     def delta_rewards_capped(self) -> Decimal:
         """Over `auctions_capped`."""
         return self.rewards_loo_capped - self.rewards_base_capped
+
+    @property
+    def delta_consistency_budget(self) -> Decimal:
+        """Over `auctions_capped`; with `delta_rewards_capped` it sums to Δ Σ upper caps."""
+        return self.consistency_budget_loo - self.consistency_budget_base
 
     def add(self, result: AuctionCounterfactual) -> None:
         self.auctions += 1
@@ -1311,12 +1564,21 @@ class Analysis:
         if self.capped_estimate:
             base_capped = result.rewards_base_capped
             loo_capped = result.rewards_loo_capped
-            if base_capped is None or loo_capped is None:
+            base_budget = result.consistency_budget_base
+            loo_budget = result.consistency_budget_loo
+            if (
+                base_capped is None
+                or loo_capped is None
+                or base_budget is None
+                or loo_budget is None
+            ):
                 self.auctions_capped_skipped += 1
             else:
                 self.auctions_capped += 1
                 self.rewards_base_capped += base_capped
                 self.rewards_loo_capped += loo_capped
+                self.consistency_budget_base += base_budget
+                self.consistency_budget_loo += loo_budget
         self.cap_double_inherited += result.cap_double_inherited
         self.cap_orphans += len(result.cap_orphans_loo)
 
@@ -1325,7 +1587,26 @@ class Analysis:
         self.inherited_reverts_loo += len(result.inherited_reverts_loo)
         self.orphans_base += len(result.orphans_base)
         self.orphans_loo += len(result.orphans_loo)
-        self.reference_influence += len(result.solver_set_reference_for)
+        self.auctions_runner_up += result.runner_up
+        self.reference_margin_base += result.reference_margin_base
+        self.reference_margin_loo += result.reference_margin_loo
+        self.reference_margin_rises += result.reference_margin_rises
+        self.reference_margin_falls += result.reference_margin_falls
+        self.auctions_reference_margin_moved += bool(
+            result.reference_margin_rises or result.reference_margin_falls
+        )
+        self.reference_margin_volume += result.pressed_volume_base
+        if self.mode == "score":
+            above_base, above_loo = result.margin_above_cap_base, result.margin_above_cap_loo
+            paid_base = result.pressed_rewards_capped_base
+            paid_loo = result.pressed_rewards_capped_loo
+            if above_base is None or above_loo is None or paid_base is None or paid_loo is None:
+                self.auctions_margin_cap_unknown += 1
+            else:
+                self.margin_above_cap_base += above_base
+                self.margin_above_cap_loo += above_loo
+                self.pressed_rewards_capped_base += paid_base
+                self.pressed_rewards_capped_loo += paid_loo
 
         for diff in result.order_diffs:
             self.orders_compared += 1

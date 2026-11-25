@@ -13,6 +13,20 @@ const fmtNat = (v, sym) => {
   if (Number(shown.replace(/,/g, "")) === 0) return `0 ${sym}`;
   return `${v < 0 ? M : "+"}${shown} ${sym}`;
 };
+/* Recorded amounts, not deltas: no plus sign. Declared up here because `render()` runs
+   at load, before anything declared below it with `const` exists. */
+const fmtUsdAmt = v => {
+  const m = Math.abs(v || 0);
+  const shown = m >= 100 ? Math.round(m).toLocaleString("en-US") : m.toFixed(2);
+  if (Number(shown.replace(/,/g, "")) === 0) return "$0";
+  return `${v < 0 ? M : ""}$${shown}`;
+};
+const fmtNatAmt = (v, sym) => {
+  const shown = Math.abs(v || 0).toLocaleString("en-US",
+    {minimumFractionDigits: 4, maximumFractionDigits: 4});
+  if (Number(shown.replace(/,/g, "")) === 0) return `0 ${sym}`;
+  return `${v < 0 ? M : ""}${shown} ${sym}`;
+};
 const fmtBps = (v, p = 3) => {
   if (v === null || v === undefined) return "n/a";
   const shown = Math.abs(v).toFixed(p);
@@ -142,6 +156,7 @@ function render() {
     ? `${entries.length} solvers that bid on ${chain}`
     : `${entries.length} solvers, ${DATA.chains.length} chains`;
   renderQuotes();
+  renderPaid();
 }
 
 document.getElementById("rows").addEventListener("click", e => {
@@ -209,6 +224,67 @@ function renderQuotes() {
         q.quote_only_auctions.toLocaleString("en-US")} without its bid<br>largest order ${
         q.fee_recharge_largest_share === null || q.fee_recharge_largest_share === undefined
           ? "n/a" : pct(q.fee_recharge_largest_share, 0)}</td></tr>`);
+  }
+  body.innerHTML = out.join("\n");
+}
+
+/* ---- contribution and reward, side by side ------------------------------
+   Its own table, not columns in the focus band: three groups (winning, second-best bids,
+   quotes), each a contribution with bids fixed, then the reward that pays for it. Reward
+   columns are recorded amounts, not deltas, so they are unsigned and uncoloured. One row
+   per solver-chain in scope, never summed across chains, in the solver table's order. */
+function paidCell(p, component, sym) {
+  const missing = p.unaccounted[component];
+  if (missing && missing >= p.auctions) {
+    return { main: "<td>pending</td>",
+      detail: `<td>${missing.toLocaleString("en-US")} auctions not yet accounted</td>` };
+  }
+  return { main: `<td>${fmtUsdAmt(p[component + "_usd"])}</td>`,
+    detail: `<td>${fmtNatAmt(p[component], sym)}${missing
+      ? `<br>${missing.toLocaleString("en-US")} auctions not yet accounted` : ""}</td>` };
+}
+
+function renderPaid() {
+  const body = document.getElementById("prows");
+  if (!body) return;
+  const inScope = DATA.chains.filter(c => !state.chain || c.id === state.chain);
+  const rows = [];
+  for (const s of DATA.solvers) {
+    for (const c of inScope) {
+      const chain = s.chains[c.id];
+      if (chain && chain.paid && chain.runner_up) {
+        rows.push({ name: s.name, chain: c.id, d: chain });
+      }
+    }
+  }
+  rows.sort((a, b) => Math.abs(b.d.usd_s) - Math.abs(a.d.usd_s));
+  const out = [];
+  const none = why => `<td class="group-start"><span class="na" title="${why}">—</span></td>`;
+  for (const { name, chain, d } of rows) {
+    const p = d.paid, r = d.runner_up, q = d.quote;
+    const shown = inScope.length > 1
+      ? `${label(name)} <span class="chip">${chain}</span>` : label(name);
+    const [perf, cons, quote] =
+      ["performance", "consistency", "quote"].map(c => paidCell(p, c, d.sym));
+    // Three groups, each the contribution with bids fixed, then the reward paying for it.
+    const pressed = r.rewards_usd === null ? none("no reward caps in surplus mode")
+      : `<td class="group-start ${neg(r.rewards_usd)}">${fmtUsd(r.rewards_usd)}</td>`;
+    const quoted = !q ? none("the run had no quote pass")
+      : `<td class="group-start ${neg(q.delta_usd)}">${fmtUsd(q.delta_usd)}</td>`;
+    out.push(`<tr class="main"><td class="chain" rowspan="2">${shown}</td>` +
+      `<td class="group-start ${neg(d.usd_score)}">${fmtUsd(d.usd_score)}</td>` + perf.main +
+      pressed + cons.main + quoted + quote.main + `</tr>`);
+    out.push(`<tr class="detail">` +
+      `<td class="group-start">${fmtNat(d.native_score, d.sym)}<br>Δsurplus ${fmtUsd(d.usd_s)}<br>Δfees ${
+        fmtUsd(d.usd_f)}</td>` + perf.detail +
+      `<td class="group-start">${r.rewards === null ? "" : fmtNat(r.rewards, d.sym) + "<br>"}runner-up in ${
+        r.auctions.toLocaleString("en-US")}<br>${
+        d.bid ? pct(r.auctions / d.bid, 1) : "n/a"} of its bids${
+        r.cap_unknown ? `<br>${r.cap_unknown} auctions cap unknown` : ""}</td>` + cons.detail +
+      (q ? `<td class="group-start">${fmtBps(q.window_bps, 2)} of executed volume<br>${
+        q.no_quote.toLocaleString("en-US")} orders not quoted<br>${
+        q.wins.toLocaleString("en-US")} quote wins</td>` : '<td class="group-start"></td>') +
+      quote.detail + `</tr>`);
   }
   body.innerHTML = out.join("\n");
 }

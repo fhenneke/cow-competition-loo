@@ -24,10 +24,10 @@ from typing import Any, cast
 import psycopg2
 import psycopg2.errors
 
-from loo import extract, quotes
+from loo import extract, payouts, quotes
 from loo.db import Connection
 
-from .world import NATIVE, World
+from .world import NATIVE, World, auction_times, reward_rows
 
 Row = dict[str, Any]
 
@@ -95,6 +95,15 @@ class SimServer:
             q(quotes.TOKEN_PRICES_SQL): self._token_medians,
             quotes.ORDER_TRADES_SQL: self._order_trades,
             q(quotes.TRADE_PRICES_SQL): self._trade_prices,
+            payouts.PERFORMANCE_SQL: self._performance,
+            payouts.RELATIVE_SURPLUS_SQL: lambda p: self._metric(p, self._relative_rows()),
+            payouts.RELATIVE_SURPLUS_TOTALS_SQL: lambda p: self._metric_totals(
+                p, self._relative_rows()),
+            payouts.QUOTE_SHARES_SQL: lambda p: self._metric(p, self._share_rows()),
+            payouts.QUOTE_SHARE_TOTALS_SQL: lambda p: self._metric_totals(
+                p, self._share_rows()),
+            payouts.CONSISTENCY_MART_SQL: self._consistency_mart,
+            payouts.QUOTE_MART_SQL: self._quote_mart,
         }
 
     def query(self, conn: SimConnection, sql: str, params: Any) -> list[Row]:
@@ -121,12 +130,10 @@ class SimServer:
     # --- the window and its auctions --------------------------------------------------
 
     def _in_window(self, params: dict[str, Any]) -> list[int]:
+        """By deadline time; shadows and bidless ids included (`world.auction_times`)."""
         start = datetime.fromisoformat(params["start"])
         end = datetime.fromisoformat(params["end"])
-        ids = [a.auction_id for a in self.world.auctions if start <= a.time < end]
-        if self.world.auctions and start <= self.world.auctions[0].time < end:
-            ids += self.world.extra_window_ids
-        return sorted(ids)
+        return sorted(a for a, when in auction_times(self.world).items() if start <= when < end)
 
     def _window(self, params: dict[str, Any]) -> list[Row]:
         return [{"auction_id": a} for a in self._in_window(params)]
@@ -321,9 +328,15 @@ class SimServer:
                 })
         return self._unordered(rows)
 
+    def _unaccounted(self, auction_id: int) -> bool:
+        cut = self.world.fct_cut
+        return cut is not None and auction_id > cut
+
     def _mart(self, params: dict[str, Any]) -> list[Row]:
         rows: list[Row] = []
         for a in self._auctions_by_id(params):
+            if self._unaccounted(a.auction_id):
+                continue
             for solver, r in a.mart.items():
                 off = (a.auction_id, solver) in self.world.mart_off
                 rows.append({
@@ -355,6 +368,68 @@ class SimServer:
             {"auction_id": a, "token": token, "price": Decimal(price)}
             for a, token, price in self._price_rows(set(params["ids"]))
             if token in tokens
+        ])
+
+    # --- the accounting tables: rewards paid -----------------------------------------
+
+    def _performance(self, params: dict[str, Any]) -> list[Row]:
+        first, last = params["first"], params["last"]
+        return self._unordered([
+            {"auction_id": a, "solver": solver, "batch_reward_native": capped}
+            for a, rows in reward_rows(self.world).items()
+            if first <= a <= last and not self._unaccounted(a)
+            for solver, (_, capped) in rows.items()
+        ])
+
+    def _relative_rows(self) -> Iterator[tuple[int, str, float]]:
+        for a, rows in self.world.relative.items():
+            for solver, _, value in rows:
+                yield a, solver, value
+
+    def _share_rows(self) -> Iterator[tuple[int, str, float]]:
+        for a, rows in self.world.shares.items():
+            for _, solver, value in rows:
+                yield a, solver, value
+
+    def _metric(self, params: dict[str, Any], rows: Iterator[tuple[int, str, float]]
+                ) -> list[Row]:
+        """`sum(metric)` grouped by (auction, solver) over the id range and the solvers,
+        non-zero groups only."""
+        first, last = params["first"], params["last"]
+        solvers = {bytes(s).hex() for s in params["solvers"]}
+        sums: dict[tuple[int, str], float] = {}
+        for a, solver, value in rows:
+            if first <= a <= last and solver in solvers:
+                sums[(a, solver)] = sums.get((a, solver), 0.0) + value
+        return self._unordered([
+            {"auction_id": a, "solver": solver, "metric": value}
+            for (a, solver), value in sums.items()
+            if value != 0
+        ])
+
+    def _metric_totals(self, params: dict[str, Any], rows: Iterator[tuple[int, str, float]]
+                       ) -> list[Row]:
+        first, last = params["first"], params["last"]
+        sums: dict[str, float] = {}
+        for a, solver, value in rows:
+            if first <= a <= last:
+                sums[solver] = sums.get(solver, 0.0) + value
+        return self._unordered([{"solver": s, "metric": v} for s, v in sums.items()])
+
+    def _consistency_mart(self, params: dict[str, Any]) -> list[Row]:
+        return self._unordered([
+            {"accounting_period": period, "solver": solver, "reward": reward,
+             "total_relative_surplus": total}
+            for period in params["periods"]
+            for solver, (reward, total) in self.world.consistency_mart.get(period, {}).items()
+        ])
+
+    def _quote_mart(self, params: dict[str, Any]) -> list[Row]:
+        return self._unordered([
+            {"accounting_period": period, "solver": solver, "reward": reward,
+             "total_quote_budget": budget, "num_quote_reward_orders": orders}
+            for period in params["periods"]
+            for solver, (reward, budget, orders) in self.world.quote_mart.get(period, {}).items()
         ])
 
     # --- solvers ----------------------------------------------------------------------

@@ -114,6 +114,27 @@ replacement. The caps follow the same slot rule:
 - A winner with nothing to inherit drops its auction from the capped aggregate and is
   counted (`auctions_capped_skipped`), never guessed.
 
+### The consistency budget offsets the capped delta
+
+Each (auction, solver) row adds `consistency_budget_contribution = upper_reward_cap −
+batch_reward_native` to its week's `total_consistency_budget`, and the week's consistency
+rewards are that budget times shares summing to one, so it is paid out in full. Per week,
+performance plus consistency payouts are Σ `upper_reward_cap`, and whatever the capped
+estimate moves, the budget moves back:
+
+```
+Δconsistency budget = Σ_loo (upper cap − capped) − Σ_base (upper cap − capped)
+Δcapped rewards + Δconsistency budget = Δ Σ upper caps
+```
+
+`loo` reports Δconsistency budget (estimate) per auction from the same inherited caps and
+over the same `auctions_capped` as the capped delta, and their sum beside it. Checked
+2026-11-25: the row identity holds on all 70,827 rows of mainnet 2026-11-10..17 and on
+1,426,263 recent rows of mainnet, xdai, base, arbitrum-one, bnb, polygon, avalanche and
+linea; none of those is excluded, and for an excluded auction it holds by the model's own
+SQL (capped 0). The week's contributions sum to its `total_consistency_budget` to the
+last digit (59.62 ETH), and its rewards add up to the same 59.62 ETH.
+
 ## Native → COW
 
 `dbt.int_accounting_period_data__conversion_rates` carries `conversion_rate_cow_to_native`
@@ -127,6 +148,78 @@ by [period, not per block](analytics-db.md#int_accounting_period_data__conversio
 - It is snapshotted from Dune **after** the period is paid out, so recent blocks carry
   NULL. An unconverted auction is reported, never treated as rate 0.
 
+## Rewards paid to a solver (recorded)
+
+`analyse` also reports what each scenario's addresses were paid over the window, and
+`compare` shows it below the net row (`loo/payouts.py`, loaded once per window for every
+scenario):
+
+| component | mart | window part |
+| --- | --- | --- |
+| performance | `fct_solver_rewards_per_auction.batch_reward_native` | Σ over the window's auctions |
+| consistency | `fct_consistency_rewards_per_solver_and_accounting_period.consistency_reward_native` | pro rata, below |
+| quote (CIP-88) | `fct_quote_rewards_per_solver_and_accounting_period.quote_reward_native` | pro rata, below |
+
+Both weekly rewards are linear in a per-auction metric, with every other factor fixed per
+period (cow-dagster `02cb3ec`, 2026-11-24):
+
+```
+consistency(p, s) = budget(p) × T(p, s)·success(p, s) / Σ_s' T(p, s')·success(p, s')
+                    T(p, s) = Σ_{a ∈ p} relative_surplus(a, s)
+quote(p, s)       = quote_budget(p) × Σ_{a ∈ p} share(a, s) / N(p)
+```
+
+with `relative_surplus` from `int_backend_data__solver_relative_surplus_on_executed_orders`,
+`share` the `quote_reward_share` of `int_quote_data__quote_reward_shares`, and `N(p)` the
+period's orders with a positive share. The window's part is therefore exact:
+
+```
+reward(p, s) × Σ_{a ∈ window ∩ p} metric(a, s) / Σ_{a ∈ p} metric(a, s)
+```
+
+Each auction carries its term of that sum, rounded to the wei, so `compare` converts it
+at the auction's own USD rate.
+
+- Periods run Tuesday 00:00 UTC to Tuesday, and an auction belongs to the period of its
+  `block_deadline` — the criterion of `extract.WINDOW_SQL`, which for 2026-11-10..17
+  returned the marts' auction set exactly (39,110 auctions). Auction ids rise with the
+  deadline, so a period's id range holds exactly its auctions: none of the week's 70,827
+  reward rows or 382,748 (auction, solver) relative-surplus groups in its id range
+  belonged to another week.
+- Both sums come from the int table, so the split stays defined when an int table is
+  rebuilt after its mart (cow-dagster#1364 excluded a wallet from quote rewards for the
+  2026-11-17..24 payout). The int table's full-period sum is still reconciled with the
+  mart's own total — Σ relative surplus against `total_relative_surplus`, budget × Σ share
+  / N against `quote_reward_native` — at a relative 1e-9, and a disagreement is listed in
+  the report and warned about in `compare`.
+- A period missing from a weekly mart is not paid out yet; an auction with bids and no
+  `fct_solver_rewards_per_auction` row is not accounted yet (none in 2026-11-10..17).
+  Their auctions are counted per component and the row says `incomplete`; they are never
+  counted as zero. On 2026-11-25 both weekly marts ended at 2026-11-10..17, and
+  `int_backend_data__solver_relative_surplus_on_executed_orders` at that week's last
+  auction (14,262,308): it is built per paid week.
+- Every auction of the window counts, fast-path and price-suspect ones included: payouts
+  of record do not depend on `loo`'s valuation.
+- Gross of the solver service fee (`fct_data_per_solver_and_accounting_period`), which is
+  not modelled.
+- Not a counterfactual: the consistency and quote pools are budgets tied to protocol
+  revenue, and without the solver its share would go to the remaining solvers. The rows
+  say what the solver received, not what the protocol would save.
+
+Checked on mainnet, 2026-11-25:
+
+| check | result |
+| --- | --- |
+| Σ relative surplus over 2026-11-10..17 vs `total_relative_surplus` | 28 of 28 solvers, worst relative difference 1.0e-14 |
+| budget × Σ share / N vs `quote_reward_native`, same week | 21 of 21 solvers, worst 5.0e-15; N = 35,921 in both |
+| the week as a window, three largest consistency earners (Kipseli, Dfusion, BRRRolver) | consistency and quote equal the mart rows (ratio 1.000000000000) |
+| the week as a window, all 29 solvers with a row in any of the three marts | performance equal to Σ `batch_reward_native` exactly; consistency within 2.1e-15 and quote within 2.8e-15 relative; nothing unaccounted, no mismatch (66.95, 59.62 and 29.50 ETH in all) |
+| 2026-11-10..13 and 2026-11-13..17 as two windows | each solver's two parts sum to its week within 4,859 wei (per-auction rounding) |
+| 2026-11-12..14 as a window (2 of 7 days), same solvers | consistency 26.0–30.5% and quote 29.3–30.6% of the week's rows |
+| loading a week for three solvers / all 29 | 3.6 s / 4.7 s |
+
 ## Out of scope
 
-Quote rewards ([quotes](quotes.md#out-of-scope-and-named-as-such)).
+The counterfactual quote reward — what the replacement quoters would earn
+([quotes](quotes.md#out-of-scope-and-named-as-such)); the quote rewards recorded as paid
+are reported ([above](#rewards-paid-to-a-solver-recorded)). The solver service fee.

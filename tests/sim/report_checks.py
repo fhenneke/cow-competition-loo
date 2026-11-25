@@ -110,7 +110,24 @@ def check_tampering(payload: dict[str, Any], tmp_path: Path) -> None:
         refused({"delta_rewards": payload["delta_rewards"] - 1}, "rewards")
         refused({"delta_rewards_capped": str(Decimal(payload["delta_rewards_capped"]) + 1)},
                 "capped")
+        refused({"delta_consistency_budget":
+                 str(Decimal(payload["delta_consistency_budget"]) + 1)}, "budget")
         refused({"orders_only_with_solver": payload["orders_only_with_solver"] + 1}, "lost")
+        margin = payload["delta_reference_margin"]
+        refused(dict(delta_reference_margin=margin + 1), "margin")
+        refused({"delta_score": payload["delta_score"] + 1}, "score")
+        refused({"delta_protocol_and_partner_fees":
+                 payload["delta_protocol_and_partner_fees"] + 1}, "fees")
+        if payload["delta_pressed_rewards_capped"] is not None:
+            refused({"delta_pressed_rewards_capped":
+                     str(Decimal(payload["delta_pressed_rewards_capped"]) + 1)}, "pressed")
+        if payload["delta_margin_above_cap"] is not None:
+            refused({"delta_margin_above_cap":
+                     str(Decimal(payload["delta_margin_above_cap"]) + 1)}, "above cap")
+    for name in ("performance", "consistency", "quote", "total"):
+        paid = copy.deepcopy(payload["paid"])
+        paid[name] = str(Decimal(paid[name]) + 1)
+        refused({"paid": paid}, f"paid {name}")
 
 
 def check_more_rows(table: aggregate.Table, windows: list[aggregate.SolverWindow]) -> None:
@@ -125,6 +142,10 @@ def check_more_rows(table: aggregate.Table, windows: list[aggregate.SolverWindow
         assert cell["solver won"] == (
             f"{head.auctions_solver_won:,} ({pct_text(head.auctions_solver_won, analysed)})")
         assert cell["Δpartner fee"] == oracle.signed_eth_text(head.delta_partner_fees) + " ETH"
+        unpriced = head.auctions_fees_incomplete
+        assert cell["Δscore (Δsurplus + Δprotocol and partner fees)"] == (
+            oracle.signed_eth_text(head.delta_surplus + head.delta_protocol_and_partner_fees)
+            + " ETH" + (f"; fees unpriced in {unpriced:,} auctions" if unpriced else ""))
         assert head.delta_rewards_capped is not None
         capped = cell["Δrewards capped (estimate)"]
         assert capped.startswith(oracle.signed_eth_text(head.delta_rewards_capped) + " ETH")
@@ -180,6 +201,8 @@ def check_more_rows(table: aggregate.Table, windows: list[aggregate.SolverWindow
     expected_warnings = sum(
         bool(r.auctions_capped_skipped) + bool(r.cow_auctions_without_rate)
         for w in windows for r in w.by_rule.values())
+    expected_warnings += sum(bool(w.headline.paid and w.headline.paid.mismatches)
+                             for w in windows)
     assert len(table.warnings) == expected_warnings
     markdown = aggregate.render_markdown(table)
     for label, cells in table.rows:

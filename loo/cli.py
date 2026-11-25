@@ -7,9 +7,10 @@ import json
 import re
 import sys
 from dataclasses import asdict
+from decimal import Decimal
 from typing import cast
 
-from . import aggregate, ch, counterfactual, db, extract, quotes, rewards, run, validate
+from . import aggregate, ch, counterfactual, db, extract, payouts, quotes, rewards, run, validate
 from .aggregate import cow_amount, eth, pct
 from .primitives import MAX_WINNERS, wrapped_native_token
 
@@ -172,6 +173,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     compare.add_argument(
         "--markdown", action="store_true", help="render the table as GitHub markdown"
+    )
+    compare.add_argument(
+        "--summary",
+        action="store_true",
+        help="one row per solver instead of one column: Δsurplus, rewards paid and "
+        "runner-up, sorted by Δsurplus",
     )
     compare.add_argument("--out", help="also write the rendered comparison to a file")
     compare.set_defaults(func=run_compare)
@@ -479,7 +486,9 @@ def run_analyse(args: argparse.Namespace) -> int:
     reduced: dict[str, list[str]] = {}
     skipped = False
     for solver_run in window.runs:
-        report_analysis(solver_run.analysis, args, solver_run.cow, solver_run.quote)
+        report_analysis(
+            solver_run.analysis, args, solver_run.cow, solver_run.quote, solver_run.paid
+        )
         if args.out:
             path = report_path(
                 args.out, solver_run.solver, solver_run.analysis.outcome_rule
@@ -536,12 +545,15 @@ def run_compare(args: argparse.Namespace) -> int:
 
     usd_by_network: dict[str, aggregate.UsdContext] = {}
     if not args.skip_usd:
-        # Only changed auctions carry a non-zero delta.
+        # Only changed auctions carry a non-zero delta; recorded rewards convert per
+        # auction too, which can be most of the window.
         by_network: dict[str, set[int]] = {}
         for report in reports:
             by_network.setdefault(report.network, set()).update(
                 move.auction_id for move in report.moves
             )
+            if report.paid is not None:
+                by_network[report.network].update(report.paid.per_auction)
         for network, auction_ids in sorted(by_network.items()):
             conn = db.connect(network)
             try:
@@ -561,7 +573,8 @@ def run_compare(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
 
-    table = aggregate.comparison(windows, usd_by_network)
+    build = aggregate.summary if args.summary else aggregate.comparison
+    table = build(windows, usd_by_network)
     render = aggregate.render_markdown if args.markdown else aggregate.render_text
     rendered = render(table)
 
@@ -633,11 +646,68 @@ def report_quote_side(analysis: quotes.QuoteAnalysis) -> None:
             print(f"  excluded         {count:,} wins — {why}")
 
 
+def report_paid(paid: payouts.RecordedRewards, delta_surplus: int) -> None:
+    """Recorded amounts, not deltas: what the solver was paid in the window."""
+    print(
+        "\nrewards paid to the solver (recorded, every auction in the window incl. price "
+        "suspects and fast path)"
+    )
+    for component in payouts.COMPONENTS:
+        missing = paid.unaccounted[component]
+        if missing and missing >= paid.auctions:
+            print(f"  {component:<12}{'not yet accounted':>26}   <- all {missing} auctions")
+            continue
+        print(
+            f"  {component:<12}{eth(paid.amount(component)):>22} ETH"
+            + (f"   <- incomplete: {missing} auctions not yet accounted" if missing else "")
+        )
+    print(
+        f"  {'total':<12}{eth(paid.total):>22} ETH"
+        + (
+            f"   <- incomplete: {paid.unaccounted_any} auctions not yet accounted"
+            if paid.unaccounted_any
+            else ""
+        )
+    )
+    if delta_surplus < 0:
+        print(
+            f"  rewards paid ÷ −Δsurplus  {paid.total / Decimal(-delta_surplus):.2f}"
+            + ("   <- payouts incomplete" if paid.unaccounted_any else "")
+        )
+    for part in paid.periods:
+        print(
+            f"  week {part.period[:10]}: {part.auctions} auctions; consistency "
+            + (
+                f"{eth(part.consistency_window)} of {eth(part.consistency_period)} ETH"
+                if part.consistency_accounted
+                else "not paid out yet"
+            )
+            + "; quote "
+            + (
+                f"{eth(part.quote_window)} of {eth(part.quote_period)} ETH"
+                if part.quote_accounted
+                else "not paid out yet"
+            )
+        )
+    if paid.mismatches:
+        print(
+            f"  WARNING: {len(paid.mismatches)} (week, solver) pairs whose int-table "
+            f"full-week sum disagrees with the mart's own total — one was rebuilt after "
+            f"the other; the window share uses the int table"
+        )
+    print(
+        "  NOTE: consistency and quote rewards are weekly budgets; without the solver\n"
+        "  its share would go to the remaining solvers, so these are amounts received,\n"
+        "  not a protocol saving."
+    )
+
+
 def report_analysis(
     analysis: counterfactual.Analysis,
     args: argparse.Namespace,
     cow: run.CowConversion | None = None,
     quote: quotes.QuoteAnalysis | None = None,
+    paid: payouts.RecordedRewards | None = None,
 ) -> None:
     total = analysis.auctions
     print(f"\n=== leave one out: {analysis.solver} ===")
@@ -719,6 +789,10 @@ def report_analysis(
             f"auctions left out: a filtered-out solution wins the counterfactual and "
             f"its fee policies are unrecorded"
         )
+    print(
+        f"delta score                   {eth(analysis.delta_score)} ETH"
+        "   <- delta surplus + delta protocol fee: what the winning bids delivered"
+    )
 
     if analysis.mode == "score":
         print(f"\nuncapped rewards with solver  {eth(analysis.rewards_base)} ETH")
@@ -758,6 +832,14 @@ def report_analysis(
             capped_line += f"  = {cow_amount(cow.cow_wei_capped)} COW"
         print(capped_line)
         print(
+            f"delta consistency budget      {eth(analysis.delta_consistency_budget)} ETH"
+            "   <- Σ (upper cap − capped reward), paid out in full each week"
+        )
+        print(
+            f"  sum = delta Σ upper caps    "
+            f"{eth(analysis.delta_rewards_capped + analysis.delta_consistency_budget)} ETH"
+        )
+        print(
             f"  over {analysis.auctions_capped} auctions"
             + (
                 f"; {analysis.auctions_capped_skipped} skipped, no cap estimate"
@@ -788,6 +870,9 @@ def report_analysis(
             "\nrewards not computed: the reward formula's quantities are scores, and "
             "this run ranked on user surplus"
         )
+
+    if paid is not None:
+        report_paid(paid, analysis.delta_surplus)
 
     print(f"\nuser orders compared          {analysis.orders_compared}")
     print(
@@ -826,10 +911,50 @@ def report_analysis(
         "   <- nothing held that pair; the mapping failures"
     )
     print(
-        f"\nsolver helped set another solver's reference score in "
-        f"{analysis.reference_influence} auction-solver pairs"
-        "  <- where its removal moves a reward"
+        f"\nrunner-up to another winner   {analysis.auctions_runner_up} auctions "
+        f"({pct(analysis.auctions_runner_up, analysis.auctions_with_solver)} of those "
+        f"the solver bid in)"
+        "   <- a losing bid of the solver's sets another winner's reference score"
     )
+    print(
+        f"others' margin over reference "
+        f"{eth(analysis.reference_margin_base)} ETH with, "
+        f"{eth(analysis.reference_margin_loo)} ETH without ({analysis.mode})"
+        "   <- winners winning the same solutions on both sides"
+    )
+    moved = analysis.reference_margin_rises + analysis.reference_margin_falls
+    print(
+        f"delta margin over reference   {eth(analysis.delta_reference_margin)} ETH over "
+        f"{moved} winners in {analysis.auctions_reference_margin_moved} auctions "
+        f"({analysis.reference_margin_rises} rose, {analysis.reference_margin_falls} fell)"
+    )
+    if analysis.reference_margin_volume:
+        margin_bps = (
+            analysis.delta_reference_margin * 10_000 / analysis.reference_margin_volume
+        )
+        print(
+            f"  over their winning volume   {margin_bps:+.2f} bps of "
+            f"{eth(analysis.reference_margin_volume)} ETH"
+            f"   <- {analysis.mode} room the solver's bids left, every bid held fixed; "
+            f"not a price change"
+        )
+    above = analysis.delta_margin_above_cap
+    pressed = analysis.delta_pressed_rewards_capped
+    if pressed is not None:
+        print(
+            f"delta their capped rewards    {eth(pressed)} ETH"
+            "   <- paid to those winners instead of the consistency budget; bids fixed"
+        )
+    if above is not None:
+        print(
+            f"  above the reward cap        {eth(above)} ETH"
+            "   <- winners that settled: room to bid worse at no cost in reward"
+        )
+        if analysis.auctions_margin_cap_unknown:
+            print(
+                f"    {analysis.auctions_margin_cap_unknown} auctions left out: a pressed "
+                f"winner's cap is unknown"
+            )
 
     if quote is not None:
         report_quote_side(quote)

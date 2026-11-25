@@ -8,7 +8,7 @@ import random
 from decimal import Decimal
 from pathlib import Path
 
-from sim import aggregation, autopilot_checks, cli_checks, expect, oracle, quote_checks
+from sim import aggregation, autopilot_checks, cli_checks, expect, oracle, quote_checks, runner_up
 from sim.harness import Sim, simulate
 from sim.oracle import Bid
 from sim.world import World, generate
@@ -54,7 +54,9 @@ def check_against_oracle(ranking: Ranking, solutions: list[Solution], max_winner
     assert ranking.baselines == truth.baselines
     ours = compute_reference_outcomes(ranking, max_winners)
     theirs = oracle.references(truth.ranked, truth.winners, max_winners)
-    assert {k: (v.score, v.setters) for k, v in ours.items()} == theirs
+    picks = oracle.reference_picks(truth.ranked, truth.winners, max_winners)
+    assert {k: (v.score, v.setter_uids) for k, v in ours.items()} == {
+        k: (score, picks[k]) for k, (score, _) in theirs.items()}
     # Proxied: a multi-pair solution with a pair that has no score and whose surplus
     # does not clear its baseline.
     proxied = {
@@ -213,6 +215,7 @@ def check_counterfactual(
     valued, _ = build_solutions(bundle.bids, bundle.native_prices, world.weth,
                                 fee_context=bundle.fee_context)
     solutions = [v.solution for v in valued]
+    runner_up.check(result, auction, as_bids(solutions), removed, world.max_winners)
     ours_base = arbitrate(solutions, world.max_winners)
     ours_loo = arbitrate([s for s in solutions if s.solver not in removed], world.max_winners)
     # Monotone: nobody kept with the removed solvers present is filtered without them.
@@ -313,6 +316,26 @@ def check_counterfactual(
                     row.competition, row.observed, row.reference)
         assert result.rewards_base_capped == truth.capped(truth.base)
         assert result.rewards_loo_capped == truth.capped(truth.loo)
+        budgets: list[Decimal | None] = []
+        for side in (truth.base, truth.loo):
+            rows = list(side.rewards.values())
+            budgets.append(
+                None if any(r.upper is None or r.capped is None for r in rows)
+                else sum((r.upper - r.capped for r in rows
+                          if r.upper is not None and r.capped is not None), Decimal(0)))
+        assert (result.consistency_budget_base, result.consistency_budget_loo) == tuple(budgets)
+        runner_up.check_above_cap(result, truth.base.rewards, truth.loo.rewards)
+    # The consistency budget is what the caps leave: with the capped rewards it sums to the
+    # upper caps, auction by auction, and exists exactly where the capped delta does.
+    if result.delta_rewards_capped is None:
+        assert result.delta_consistency_budget is None
+    else:
+        budget = result.delta_consistency_budget
+        assert budget is not None
+        uppers = [sum((r.upper_cap for r in side.values() if r.upper_cap is not None),
+                      Decimal(0))
+                  for side in (result.baseline_rewards, result.loo_rewards)]
+        assert result.delta_rewards_capped + budget == uppers[1] - uppers[0]
     # Rewards stay inside their caps.
     for reward in [*result.baseline_rewards.values(), *result.loo_rewards.values()]:
         if reward.capped_reward is None:

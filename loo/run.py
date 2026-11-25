@@ -12,8 +12,8 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, NamedTuple, cast
 
-from . import ch, extract, quotes
-from .aggregate import REPORT_FORMAT, SIGN_CONVENTION_ID
+from . import ch, extract, payouts, quotes
+from .aggregate import REPORT_FORMAT, SIGN_CONVENTION_ID, eth
 from .counterfactual import (
     OUTCOME_RULE,
     Analysis,
@@ -101,6 +101,17 @@ class SolverRun:
     quote_substitutions: Mapping[str, Quote] = MappingProxyType({})
     quote: QuoteAnalysis | None = None
     """Rule-independent (quotes have no settlement): shared across a scenario's rules."""
+    recorded: payouts.RecordedWindow | None = None
+    """Every scenario's recorded rewards over the window, shared by all runs."""
+
+    @property
+    def paid(self) -> payouts.RecordedRewards | None:
+        """This scenario's recorded rewards: not counterfactual, so the same under every
+        rule. Sliced on use, since holding every scenario's per-auction amounts at once
+        costs ~200 MiB per mainnet week under `--all-solvers`."""
+        if self.recorded is None:
+            return None
+        return self.recorded.for_addresses(self.addresses)
 
 
 def absent_members(solver_run: SolverRun) -> list[str]:
@@ -272,7 +283,9 @@ def analyse_window(
             f"recorded winning solutions"
         )
 
+    with_bids: list[int] = []
     for bundle in extract.load_auctions(conn, auction_ids, fast_path=window.fast_path):
+        with_bids.append(bundle.auction_id)
         for run in runs:
             run.analysis.add(
                 analyse_auction(
@@ -290,6 +303,31 @@ def analyse_window(
 
     for run in runs:
         run.analysis.fast_path_auctions = list(window.fast_path)
+
+    # Payouts of record over every window auction, fast path included; one pass for all.
+    recorded = payouts.load_recorded(
+        conn,
+        auction_ids,
+        [*with_bids, *window.fast_path],
+        start,
+        end,
+        frozenset[str]().union(*(addresses for _, _, addresses, _ in resolved)),
+    )
+    for run in runs:
+        run.recorded = recorded
+    for label, _, addresses, _ in resolved:
+        rewards = recorded.for_addresses(addresses)
+        unaccounted = rewards.unaccounted_any
+        emit(
+            f"recorded rewards {label!r}: {eth(rewards.total)} ETH over "
+            f"{rewards.auctions} auctions"
+            + (f", {unaccounted} not yet accounted" if unaccounted else "")
+            + (
+                f", {len(rewards.mismatches)} int-table/mart mismatches"
+                if rewards.mismatches
+                else ""
+            )
+        )
 
     if mode == "score":
         # One rate query for all runs; the table must be touched sparingly.
@@ -320,15 +358,25 @@ _FEE_PROPERTIES = (
 )
 _ANALYSIS_PROPERTIES = (
     "delta_surplus",
+    "delta_score",
     "delta_rewards",
     "delta_rewards_capped",
+    "delta_reference_margin",
+    "delta_margin_above_cap",
+    "delta_pressed_rewards_capped",
+    "delta_consistency_budget",
     "quote_fee_recharge_protocol",
     *_FEE_PROPERTIES,
 )
 _AUCTION_PROPERTIES = (
     "delta_surplus",
+    "delta_score",
     "delta_rewards",
     "delta_rewards_capped",
+    "delta_reference_margin",
+    "delta_margin_above_cap",
+    "delta_pressed_rewards_capped",
+    "delta_consistency_budget",
     "fees_complete",
     "protocol_and_partner_fees_base",
     "protocol_and_partner_fees_loo",
@@ -440,6 +488,7 @@ def _quote_window_payload(quote_window: QuoteWindow) -> dict[str, Any]:
 
 def report_payload(window: WindowAnalysis, run: SolverRun) -> dict[str, Any]:
     analysis = run.analysis
+    paid = run.paid
     payload: dict[str, Any] = {
         "format": REPORT_FORMAT,
         "sign_convention": SIGN_CONVENTION_ID,
@@ -449,6 +498,7 @@ def report_payload(window: WindowAnalysis, run: SolverRun) -> dict[str, Any]:
         "outcome_rule_description": OUTCOME_RULE[analysis.outcome_rule],
         "cow": run.cow._asdict() if run.cow is not None else None,
         "quote": _quote_payload(run.quote) if run.quote is not None else None,
+        "paid": paid.to_payload() if paid is not None else None,
         "quote_window": (
             _quote_window_payload(window.quote_window)
             if window.quote_window is not None

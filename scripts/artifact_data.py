@@ -22,6 +22,7 @@ from decimal import Decimal
 from typing import Any
 
 from loo import aggregate, db, extract
+from loo.payouts import COMPONENTS
 from loo.primitives import ONE_ETH
 
 # The unit every native amount on the page is printed in. Same networks as
@@ -72,6 +73,9 @@ def usd_contexts(
         by_network.setdefault(report.network, set()).update(
             move.auction_id for move in report.moves
         )
+        # Recorded rewards convert per auction too, which can be most of the window.
+        if report.paid is not None:
+            by_network[report.network].update(report.paid.per_auction)
     contexts: dict[str, aggregate.UsdContext] = {}
     for network, auction_ids in sorted(by_network.items()):
         conn = db.connect(network)
@@ -163,6 +167,30 @@ def row(
         {m.auction_id: m.delta_protocol_and_partner_fees for m in report.moves}, context
     )
     quote = report.quote
+    paid = report.paid
+    margins = {m.auction_id: m.delta_reference_margin for m in report.moves}
+    largest_margin = max(report.moves, key=lambda m: abs(m.delta_reference_margin),
+                         default=None)
+    margin_usd = _usd_per_auction(margins, context)
+    above = {
+        m.auction_id: m.delta_margin_above_cap
+        for m in report.moves
+        if m.delta_margin_above_cap is not None
+    }
+    largest_above = max(above.items(), key=lambda item: abs(item[1]), default=None)
+    above_usd = _usd_per_auction(above, context)
+    largest_above_usd = (
+        _usd_per_auction({largest_above[0]: largest_above[1]}, context)
+        if largest_above
+        else 0.0
+    )
+    largest_margin_usd = (
+        _usd_per_auction(
+            {largest_margin.auction_id: largest_margin.delta_reference_margin}, context
+        )
+        if largest_margin
+        else 0.0
+    )
     return {
         "chain": report.network,
         "sym": native_symbol(report.network),
@@ -183,6 +211,10 @@ def row(
             context,
         ),
         "native_f": _native(report.delta_protocol_and_partner_fees),
+        "usd_score": _usd_per_auction(
+            {m.auction_id: m.delta_score for m in report.moves}, context
+        ),
+        "native_score": _native(report.delta_score),
         "usd_pr": _usd_per_auction(
             {m.auction_id: m.delta_protocol_fees for m in report.moves}, context
         ),
@@ -219,6 +251,61 @@ def row(
         "largest_usd": largest_usd,
         "largest_fee_usd": largest_fee_usd,
         "fee_share": abs(largest_fee_usd) / abs(total_fee_usd) if total_fee_usd else None,
+        # --- rewards recorded as paid: amounts, not deltas, over every window auction
+        "paid": None
+        if paid is None
+        else {
+            **{
+                f"{c}_usd": _usd_per_auction(paid.amounts(c), context)
+                for c in COMPONENTS
+            },
+            **{c: _native(paid.amount(c)) for c in COMPONENTS},
+            "total_usd": _usd_per_auction(paid.totals_by_auction(), context),
+            "total": _native(paid.total),
+            "auctions": paid.auctions,
+            "unaccounted": {c: paid.unaccounted[c] for c in COMPONENTS},
+            "unaccounted_any": paid.unaccounted_any,
+            # Native over native: exact, and what `compare` prints.
+            "ratio": float(paid.total / Decimal(-report.delta_surplus))
+            if report.delta_surplus < 0
+            else None,
+        },
+        # --- the solver as runner-up: room its losing bids left the other winners
+        "runner_up": {
+            "auctions": report.auctions_runner_up,
+            "margin_usd": margin_usd,
+            "margin": _native(report.delta_reference_margin),
+            "largest_usd": largest_margin_usd,
+            "share": abs(largest_margin_usd) / abs(margin_usd) if margin_usd else None,
+            "rises": report.reference_margin_rises,
+            "falls": report.reference_margin_falls,
+            "moved_auctions": report.auctions_reference_margin_moved,
+            "bps": float(report.reference_margin_bps)
+            if report.reference_margin_bps is not None
+            else None,
+            # The part beyond the winners' reward caps, settled winners only.
+            "above_usd": above_usd if report.delta_margin_above_cap is not None else None,
+            "above": _native(report.delta_margin_above_cap)
+            if report.delta_margin_above_cap is not None
+            else None,
+            "above_share": abs(largest_above_usd) / abs(above_usd) if above_usd else None,
+            "cap_unknown": report.auctions_margin_cap_unknown,
+            # What the mechanism would pay those winners more without the solver, capped:
+            # the consistency budget lacks exactly that much. Bids fixed, no behaviour.
+            "rewards_usd": _usd_per_auction(
+                {
+                    m.auction_id: m.delta_pressed_rewards_capped
+                    for m in report.moves
+                    if m.delta_pressed_rewards_capped is not None
+                },
+                context,
+            )
+            if report.delta_pressed_rewards_capped is not None
+            else None,
+            "rewards": _native(report.delta_pressed_rewards_capped)
+            if report.delta_pressed_rewards_capped is not None
+            else None,
+        },
         # --- the quote side
         "quote": None
         if quote is None
@@ -240,6 +327,9 @@ def row(
             "window_bps": float(quote.window_bps)
             if quote.window_bps is not None
             else None,
+            # `window_bps` as an amount: one window figure, so the window-median rate.
+            "delta_native": _native(quote.delta_volume_native),
+            "delta_usd": _usd(quote.delta_volume_native, context),
             "conditional_bps": float(quote.conditional_bps)
             if quote.conditional_bps is not None
             else None,

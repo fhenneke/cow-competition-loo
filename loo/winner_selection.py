@@ -217,14 +217,15 @@ def arbitrate(
 
 class ReferenceScore(NamedTuple):
     score: int
-    setters: frozenset[str]
-    """Solvers whose solutions make up the score."""
+    setter_uids: frozenset[int]
+    """The solutions the without-solver pick takes; their totals make up the score."""
 
 
 def compute_reference_outcomes(
     ranking: Ranking, max_winners: int = MAX_WINNERS
 ) -> dict[str, ReferenceScore]:
-    """Reference score per winning solver (`arbitrator.rs:607`), plus its setters."""
+    """Reference score per winning solver (`arbitrator.rs:607`), plus the solutions
+    setting it."""
     outcomes: dict[str, ReferenceScore] = {}
 
     for solution in ranking.ranked:
@@ -240,7 +241,7 @@ def compute_reference_outcomes(
         winner_indices = pick_winners(without_solver, max_winners)
         outcomes[solver] = ReferenceScore(
             score=sum(without_solver[i].total for i in winner_indices),
-            setters=frozenset(without_solver[i].solver for i in winner_indices),
+            setter_uids=frozenset(without_solver[i].solution_uid for i in winner_indices),
         )
 
     return outcomes

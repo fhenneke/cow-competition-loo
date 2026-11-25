@@ -6,12 +6,13 @@ are priced, and an auction retained only if something moved."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import fields
 from decimal import Decimal
 from typing import Any
 
 from loo.counterfactual import Analysis, AuctionCounterfactual
+from loo.rewards import SolverReward
 
 
 def expected(
@@ -40,9 +41,19 @@ def expected(
         "quote_partner_fee_recharge", "orders_compared", "orders_only_with_solver",
         "orders_only_without_solver", "orders_unsettled_base", "orders_lost_to_lateness",
         "replacements_base", "replacements_loo", "inherited_reverts_loo", "orphans_base",
-        "orphans_loo", "reference_influence")}
+        "orphans_loo",
+        "auctions_runner_up", "reference_margin_base", "reference_margin_loo",
+        "reference_margin_rises", "reference_margin_falls",
+        "auctions_reference_margin_moved", "reference_margin_volume")}
     out["rewards_base_capped"] = Decimal(0)
     out["rewards_loo_capped"] = Decimal(0)
+    out["consistency_budget_base"] = Decimal(0)
+    out["consistency_budget_loo"] = Decimal(0)
+    out["margin_above_cap_base"] = Decimal(0)
+    out["margin_above_cap_loo"] = Decimal(0)
+    out["pressed_rewards_capped_base"] = Decimal(0)
+    out["pressed_rewards_capped_loo"] = Decimal(0)
+    out["auctions_margin_cap_unknown"] = 0
     out["auctions"] = len(results)
     out["price_suspect_auctions"] = [r.auction_id for r in results if r.price_suspect]
     clean = [r for r in results if not (exclude_suspects and r.price_suspect)]
@@ -104,6 +115,12 @@ def expected(
                                                   Decimal(0))
                 out["rewards_loo_capped"] += sum((x for x in sides[1] if x is not None),
                                                  Decimal(0))
+                # What the caps leave over: the weekly consistency budget's contributions.
+                for key, rewards in (("consistency_budget_base", r.baseline_rewards),
+                                     ("consistency_budget_loo", r.loo_rewards)):
+                    for w in rewards.values():
+                        assert w.upper_cap is not None and w.capped_reward is not None
+                        out[key] += w.upper_cap - w.capped_reward
         out["cap_double_inherited"] += r.cap_double_inherited
         out["cap_orphans"] += len(r.cap_orphans_loo)
         out["replacements_base"] += len(r.replacements_base)
@@ -111,7 +128,27 @@ def expected(
         out["inherited_reverts_loo"] += len(r.inherited_reverts_loo)
         out["orphans_base"] += len(r.orphans_base)
         out["orphans_loo"] += len(r.orphans_loo)
-        out["reference_influence"] += len(r.solver_set_reference_for)
+        out["auctions_runner_up"] += bool(r.runner_up_uids)
+        margins = [(m, r.reference_margins_loo[s]) for s, m in r.reference_margins_base.items()]
+        out["reference_margin_base"] += sum(m for m, _ in margins)
+        out["reference_margin_loo"] += sum(m for _, m in margins)
+        out["reference_margin_rises"] += sum(1 for b, lo in margins if lo > b)
+        out["reference_margin_falls"] += sum(1 for b, lo in margins if lo < b)
+        out["auctions_reference_margin_moved"] += any(b != lo for b, lo in margins)
+        out["reference_margin_volume"] += r.pressed_volume_base
+        if r.baseline_rewards or not r.reference_margins_base:
+            # Score mode: each settled pressed winner's margin beyond its upper cap.
+            above_base = _above_cap(r.reference_margins_base, r.baseline_rewards)
+            above_loo = _above_cap(r.reference_margins_loo, r.loo_rewards)
+            paid_base = _capped(r.reference_margins_base, r.baseline_rewards)
+            paid_loo = _capped(r.reference_margins_loo, r.loo_rewards)
+            if above_base is None or above_loo is None or paid_base is None or paid_loo is None:
+                out["auctions_margin_cap_unknown"] += 1
+            else:
+                out["margin_above_cap_base"] += above_base
+                out["margin_above_cap_loo"] += above_loo
+                out["pressed_rewards_capped_base"] += paid_base
+                out["pressed_rewards_capped_loo"] += paid_loo
         for d in r.order_diffs:
             out["orders_compared"] += 1
             out["orders_only_with_solver"] += d.executed_base and not d.executed_loo
@@ -148,6 +185,25 @@ def expected(
     return out
 
 
+def _above_cap(margins: Mapping[str, int], rewards: Mapping[str, SolverReward]) -> Decimal | None:
+    total = Decimal(0)
+    for solver, margin in margins.items():
+        reward = rewards.get(solver)
+        if reward is None or reward.upper_cap is None:
+            return None
+        if reward.observed_score == reward.competition_score:
+            total += max(Decimal(0), margin - reward.upper_cap)
+    return total
+
+
+def _capped(margins: Mapping[str, int], rewards: Mapping[str, SolverReward]) -> Decimal | None:
+    rows = [rewards.get(solver) for solver in margins]
+    if any(r is None or r.capped_reward is None for r in rows):
+        return None
+    return sum((r.capped_reward for r in rows if r is not None and r.capped_reward is not None),
+               Decimal(0))
+
+
 def compare(analysis: Analysis, want: dict[str, Any]) -> None:
     for f in fields(analysis):
         if f.name not in want:
@@ -158,6 +214,19 @@ def compare(analysis: Analysis, want: dict[str, Any]) -> None:
         assert got == want[f.name], f.name
     assert analysis.delta_surplus == want["surplus_loo"] - want["surplus_base"]
     assert analysis.delta_rewards == want["rewards_loo"] - want["rewards_base"]
+    assert analysis.delta_reference_margin == (
+        want["reference_margin_loo"] - want["reference_margin_base"])
+    assert analysis.delta_score == (
+        want["surplus_loo"] - want["surplus_base"]
+        + want["protocol_and_partner_fees_loo"] - want["protocol_and_partner_fees_base"])
+    if analysis.mode == "score":
+        assert analysis.delta_margin_above_cap == (
+            want["margin_above_cap_loo"] - want["margin_above_cap_base"])
+        assert analysis.delta_pressed_rewards_capped == (
+            want["pressed_rewards_capped_loo"] - want["pressed_rewards_capped_base"])
+    else:
+        assert analysis.delta_margin_above_cap is None
+        assert analysis.delta_pressed_rewards_capped is None
     assert analysis.delta_protocol_fees == (
         want["protocol_and_partner_fees_loo"] - want["partner_fees_loo"]
         - want["protocol_and_partner_fees_base"] + want["partner_fees_base"])
@@ -167,5 +236,7 @@ def compare(analysis: Analysis, want: dict[str, Any]) -> None:
     assert analysis.protocol_fees_base == (
         want["protocol_and_partner_fees_base"] - want["partner_fees_base"])
     assert analysis.delta_rewards_capped == want["rewards_loo_capped"] - want["rewards_base_capped"]
+    assert analysis.delta_consistency_budget == (
+        want["consistency_budget_loo"] - want["consistency_budget_base"])
     assert analysis.quote_fee_recharge_protocol == (
         want["quote_fee_recharge"] - want["quote_partner_fee_recharge"])

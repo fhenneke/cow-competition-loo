@@ -11,8 +11,9 @@ from statistics import median
 from loo import aggregate, validate
 from loo.counterfactual import Analysis
 from loo.extract import AuctionBundle
+from loo.payouts import COMPONENTS
 
-from . import expect, oracle, report_checks
+from . import expect, oracle, payout_checks, report_checks, runner_up, summary_checks
 from .harness import Sim
 from .world import STABLES, World
 
@@ -44,15 +45,51 @@ def cow_rate(world: World, block: int) -> Decimal | None:
     return None
 
 
+def paid_text(amount: Decimal, unaccounted: int, none_accounted: bool) -> str:
+    """Nothing accounted yet shows no amount; a partial amount says how much is missing."""
+    if unaccounted and none_accounted:
+        return f"not yet accounted ({unaccounted:,} auctions)"
+    return oracle.eth_text(amount, 4) + " ETH" + (
+        f"; incomplete: {unaccounted:,} auctions not yet accounted" if unaccounted else "")
+
+
+def check_paid_rows(rows: dict[str, tuple[str, ...]], column: int,
+                    head: aggregate.Report) -> None:
+    """Recorded amounts unsigned, the budget rows signed like every delta."""
+    paid = head.paid
+    assert paid is not None
+    assert rows["rewards paid to the solver (recorded)"][column] == paid_text(
+        paid.total, paid.unaccounted_any,
+        all(paid.unaccounted[c] >= paid.auctions for c in COMPONENTS))
+    for component in COMPONENTS:
+        missing = paid.unaccounted[component]
+        assert rows[f"  {component} rewards (recorded)"][column] == paid_text(
+            paid.amount(component), missing, missing >= paid.auctions)
+    ratio = rows["  rewards paid ÷ −Δsurplus"][column]
+    if head.delta_surplus < 0:
+        assert ratio == f"{paid.total / Decimal(-head.delta_surplus):.2f}" + (
+            "; rewards paid incomplete" if paid.unaccounted_any else "")
+    else:
+        assert ratio == "n/a — Δsurplus is not negative"
+    budget, capped = head.delta_consistency_budget, head.delta_rewards_capped
+    assert budget is not None and capped is not None
+    assert rows["  Δconsistency budget (estimate)"][column] == (
+        oracle.signed_eth_text(budget) + " ETH")
+    assert rows["  sum = Δ Σ upper reward caps (estimate)"][column] == (
+        oracle.signed_eth_text(budget + capped) + " ETH")
+
+
 def check_reports_and_compare(
     sim: Sim, world: World, tmp_path: Path, entries: list[str],
     direct: dict[tuple[str, str], Analysis], code: int,
 ) -> None:
     """The report files round-trip, their totals are the sums of their auctions, the
-    COW conversion uses each auction's own period, and the comparison table says what
-    the reports say."""
+    COW conversion uses each auction's own period, the recorded rewards are the world's,
+    and the comparison table says what the reports say."""
     paths = sorted(str(p) for p in tmp_path.glob("*.*.json"))
     blocks = {a.auction_id: a.block for a in world.auctions}
+    window_ids = {a.auction_id for a in world.auctions} | set(world.extra_window_ids)
+    with_bids = {a.auction_id for a in world.auctions}
     absent = False
     for path in paths:
         payload = json.loads(Path(path).read_text())
@@ -60,6 +97,14 @@ def check_reports_and_compare(
         analysis = direct[(report.solver, report.outcome_rule)]
         report_checks.check_report_properties(report, payload, analysis)
         report_checks.check_tampering(payload, tmp_path)
+        runner_up.check_report(report, payload, analysis)
+        assert report.delta_consistency_budget == analysis.delta_consistency_budget
+        assert report.paid is not None
+        payout_checks.check_paid(
+            report.paid,
+            payout_checks.expected_paid(world, window_ids, with_bids, analysis.addresses),
+            auctions=len(with_bids),
+        )
         moves = {m.auction_id: m for m in report.moves}
         assert set(moves) == {r.auction_id for r in analysis.changed}
         assert sum(m.delta_surplus for m in report.moves) == report.delta_surplus
@@ -132,7 +177,11 @@ def check_reports_and_compare(
             assert rows["orders no longer executed"][column] == (
                 f"{head.orders_only_with_solver:,} ({share:.3%} of the window's "
                 f"{head.window_executions:,} executions)")
+        # Recorded, so the same whatever the outcome rule.
+        assert all(r.paid == head.paid for r in window.by_rule.values())
+        check_paid_rows(rows, column, head)
     report_checks.check_more_rows(table, windows)
+    runner_up.check_rows(table, windows)
     rendered = sim.cli("compare", *paths, "--skip-usd")
     assert rendered.code == 0, rendered.err
     lines = rendered.out.splitlines()
@@ -154,6 +203,21 @@ def check_reports_and_compare(
                    for m in head.moves), Decimal(0)) / Decimal(oracle.ONE)
         cell = oracle.signed_eth_text(head.delta_surplus) + " ETH (" + usd_text(usd) + ")"
         assert cell in usd_run.out
+    # Recorded rewards convert per auction too, every auction `compare` loaded a rate for.
+    loaded = {m.auction_id for w in windows for r in w.by_rule.values() for m in r.moves}
+    loaded |= {a for w in windows if w.headline.paid for a in w.headline.paid.per_auction}
+    rates = usd_rates(world, loaded)
+    for window in windows:
+        paid = window.headline.paid
+        if not rates or paid is None or not paid.per_auction or (
+                min(paid.unaccounted.values()) >= paid.auctions):
+            continue
+        fallback = median(rates.values())
+        usd = sum((total * rates.get(a, fallback) for a, total in
+                   paid.totals_by_auction().items()), Decimal(0)) / Decimal(oracle.ONE)
+        cell = oracle.eth_text(paid.total, 4) + " ETH (" + usd_text(usd) + ")"
+        assert cell in usd_run.out
+    summary_checks.check_cli(sim, paths, windows, rates)
 
 
 def check_validate(sim: Sim, world: World, tmp_path: Path, bundles: list[AuctionBundle]) -> None:

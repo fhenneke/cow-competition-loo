@@ -266,6 +266,123 @@ it alone in 40811270. Without Gnosis_0x, Wraxyn wins the first auction and inher
 revert, and nobody bids in the second — 66% of Gnosis_0x's polygon Δsurplus. Check a
 removed solver's largest coverage auction for a failed win of the same order just before.
 
+### Runner-up: the margin a losing bid leaves the winners
+
+A winner `s` that settles earns `winning_score − min(winning_score, reference(s))` before
+caps ([rewards](rewards.md)): its **margin** over the reference score of step 6. A solver
+whose losing bid sits in another winner's without-`s` pick sets that reference; it is
+that winner's **runner-up**. Over the auctions the removed solver bid in, `analyse`
+reports:
+
+- `auctions_runner_up`: auctions where a removed solver's **non-winning** solution is in
+  the reference pick of a winner outside the removal. It is decided by solution uid
+  (`ReferenceScore.setter_uids`), because a solver can win one pair and be runner-up on
+  another.
+- `delta_reference_margin`: Σ margin without minus Σ margin with, over the **pressed
+  winners**. A pressed winner is a solver outside the removal that wins the **same
+  solutions** on both sides, and each side uses its own winning and reference scores.
+  Settlement plays no part, so the figure is the same under both outcome rules. A
+  replacement, or a winner that takes other solutions once the removed solver is gone,
+  holds part of a vacated slot. That belongs to Δrewards, not to room left.
+- `reference_margin_rises` / `_falls` (auction-winner pairs),
+  `auctions_reference_margin_moved`, and `reference_margin_volume`, the received-leg
+  volume of the moved winners' winning solutions. `compare` divides the delta by that
+  volume; in score mode these are **score** bps, never a price change.
+
+A margin moves only when the winning score or a reference score moves, so every such
+auction is in `changed`, and `load_report` checks the total against those rows.
+
+**Margin, not reference.** Sector wins X at 100 and Quasi wins Y at 80, so Quasi's
+reference holds Sector's 100. Without Sector, Horadrim takes X at 60. The winning score
+and Quasi's reference both fall by 40, so Quasi's margin stays 50
+(`tests/sim/pinned.py` `runner_up_elsewhere`). A Δreference sum would credit Sector
+with pressing Quasi; the margin does not. If Sector also bids Y at 70, it loses Y to
+Quasi but fills Quasi's reference pick. It is then runner-up on Y while it wins X, and
+Quasi's margin rises from 10 to 50. Kipseli's removal on mainnet 2026-11-18 moved a
+pressed winner's reference without moving its margin in 537 auction-winner pairs.
+
+**A margin can fall.** Without the removed solver, the reference pick can do better than
+it did with it:
+
+- **un-filtering**: the removed solver's single-pair bid set a baseline that filtered a
+  rival batch, and once kept the batch raises the reference (`margin_falls`, 40 → 25);
+- **a vacated claim**: the removed solver's winning batch held a pair that kept another
+  batch out of the reference pick, and its replacement claims less (35 → 10);
+- **the greedy pick is not monotone**: removing a losing batch can let two smaller bids
+  fill more. The fairness filter makes this rare.
+
+Falls are counted apart from rises and summed into the delta, not dropped.
+
+**What it does not claim.** Every bid is held fixed. In theory, a winner bidding against
+its reference could shade its bid by its margin and still win, so a strong runner-up
+keeps the winners' bids up. `loo` does not model that. The row measures room left with
+bids fixed, and is neither a price change nor a bound on one.
+
+Measured 2026-11-25 on mainnet 2026-11-18, first 3,000 auctions (2,951 analysed):
+
+| Removed | Bid in | Runner-up in | Δmargin | Winners moved (rose / fell) | In auctions | Over volume |
+| --- | --- | --- | --- | --- | --- | --- |
+| Kipseli | 2,301 | 743 | +0.3853 ETH | 786 (786 / 0) | 726 | +0.53 bps of 7,307.55 ETH |
+| Baseline | 1,620 | 17 | +0.0022 ETH | 17 (17 / 0) | 17 | +1.51 bps of 14.35 ETH |
+
+In both runs, every auction where a margin moved was a runner-up auction. In 158 of
+Kipseli's 726, Kipseli also won another pair. Requiring the same winning solutions on
+both sides excluded 62 of the 1,687 Kipseli auction-winner pairs that won on both sides.
+
+Auction 14271972: Rizzolver wins at 0.034049 ETH. Its reference pick holds Cicada's
+winning 0.000036 ETH and Kipseli's losing solution (uid 2) at 0.029870 ETH, for a reference
+of 0.029907 ETH, equal to the recorded one. No other bid fills Rizzolver's pairs, so
+without Kipseli the reference is Cicada's 0.000036 ETH. Rizzolver's margin rises from
+0.004179 to 0.034049 ETH: +0.029870 ETH, all of Kipseli's bid.
+
+### Above the cap
+
+The cap decides who a margin matters to. A settled winner is paid
+`clamp(margin, lower cap, upper cap)`:
+
+- **Below its upper cap**, a bid lower by `x` lowers the reward by `x`. A worse bid buys
+  the winner nothing, so the reference only sets what it is paid, and performance plus
+  consistency payouts sum to the upper caps whoever wins ([rewards](rewards.md)): a
+  runner-up's absence moves reward between solvers out of a fixed pool.
+- **Above its upper cap**, the reward is the cap whatever the winner bids above
+  `reference + cap`. That much score it could withhold from users at no cost in reward.
+
+`delta_margin_above_cap` is Σ max(0, margin − upper cap) without minus with, over the
+pressed winners whose wins all settled (`observed_score == competition_score`). A batch
+that did not land delivered nothing to withhold; its recorded upper cap is 0, so counting
+it would put its whole margin above the cap. The cap is the pressed winner's own recorded
+one, the same on both sides because it wins the same solutions. Score mode only; an
+auction with a pressed winner whose cap is unknown is counted in
+`auctions_margin_cap_unknown` and left out.
+
+`delta_pressed_rewards_capped` is the behaviour-free counterpart: Σ capped reward of the
+pressed winners without minus with. Their caps do not move, so the consistency budget
+moves by exactly the opposite, and the figure is the part of the weekly pool the removed
+solver's bids shifted from winners' performance rewards to the consistency budget. It
+sits beside consistency rewards for that reason.
+
+The above-cap figure is room with bids fixed, not a scenario. Most pressed winners are
+above their cap already with the runner-up present and still bid there: they bid
+against what rivals might offer, not against a reference they cannot see. What a strong,
+frequent runner-up's absence would do to those bids is the equilibrium effect this row
+points at and `loo` does not model.
+
+Measured 2026-11-25 on mainnet 2026-11-17..24 (38,642 auctions analysed, every cap
+known):
+
+| Removed | Δmargin | of it on winners that did not settle | above the cap, settled |
+| --- | --- | --- | --- |
+| Sector | +93.203 ETH | +6.431 ETH | +82.198 ETH |
+| Rizzolver | +49.208 ETH | +34.433 ETH | +9.991 ETH |
+| Kipseli | +33.130 ETH | +9.863 ETH | +18.236 ETH |
+
+51.554 ETH of Sector's is auction 14289933, where its losing bid set Rizzolver's
+reference on a 6,291 ETH order and the whole rise lies above Rizzolver's cap.
+
+`Δscore` beside it is Δsurplus + Δprotocol and partner fees, the fee leg over the
+auctions whose fees are all priced. With bids fixed it is the solver's own marginal
+contribution, the quantity the performance reward pays before caps.
+
 ## Score vs. surplus
 
 The autopilot ranks on the CIP-38 score, `user surplus + protocol fees` in the surplus

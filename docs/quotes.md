@@ -359,6 +359,8 @@ for 78.3% and 1.0000 at every quantile p10–p99 (2026-07-25).
 - **Quote rewards.** The counterfactual quote's eligibility is not evaluated. Since
   2026-10-12 (CIP-88, cow-dagster#1110) they are a budget share of protocol revenue split
   by `int_quote_data__quote_reward_shares`; nothing here is checked against those models.
+  The quote rewards recorded as paid to the removed solver are reported by `analyse`
+  ([rewards](rewards.md#rewards-paid-to-a-solver-recorded)).
 - **Conversion.** No counterfactual exists for an order nobody created, and at a 0.13%
   conversion rate an elasticity proxy would be indefensible.
 - **The limit price and fillability.** A better quote makes an order harder to fill;

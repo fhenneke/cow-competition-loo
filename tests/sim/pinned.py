@@ -248,6 +248,103 @@ def cancelled_price() -> World:
     return world
 
 
+def runner_up_only() -> World:
+    """Sector bids twice and never wins; both times its bid sets a winner's reference.
+    Auction 14000011: Quasi wins X at 100 over Sector's 90 and Baseline's 50. Auction
+    14000012: Quasi wins X at 100, Baseline wins Y at 80 over Sector's 70 and Horadrim's
+    20. Without Sector the winners stay, Quasi's margin in the first rises from 10 to 50
+    and Baseline's in the second from 10 to 60."""
+    world = blank()
+    weth = WRAPPED["sepolia"]
+    x = order(world, "71" * 56, weth, USDC, 10**9, 10**9)
+    y = order(world, "72" * 56, DAI, TOKEN_X, 10**9, 10**9)
+    r = solver(world, "Sector", "a7" * 20)
+    b = solver(world, "Quasi", "b7" * 20)
+    c = solver(world, "Baseline", "c7" * 20)
+    d = solver(world, "Horadrim", "d7" * 20)
+    auction(world, 14000011, [
+        (b, [fill(x, 10**9, 10**9 + 100)]),
+        (r, [fill(x, 10**9, 10**9 + 90)]),
+        (c, [fill(x, 10**9, 10**9 + 50)]),
+    ])
+    auction(world, 14000012, [
+        (b, [fill(x, 10**9, 10**9 + 100)]),
+        (c, [fill(y, 10**9, 10**9 + 80)]),
+        (r, [fill(y, 10**9, 10**9 + 70)]),
+        (d, [fill(y, 10**9, 10**9 + 20)]),
+    ])
+    return world
+
+
+def runner_up_elsewhere() -> World:
+    """Sector wins X; Quasi wins Y, and its reference holds Sector's winning 100.
+    Auction 14000021: without Sector, Horadrim takes X at 60, and the winning score and
+    Quasi's reference both fall by 40, so Quasi's margin stays 50: Sector sets a
+    reference but presses nobody. Auction 14000022: Sector also bids Y at 70, losing to
+    Quasi's 80 but filling Quasi's reference pick: runner-up on Y while it wins X, so
+    Quasi's margin rises from 10 to 50."""
+    world = blank()
+    weth = WRAPPED["sepolia"]
+    x = order(world, "81" * 56, weth, USDC, 10**9, 10**9)
+    y = order(world, "82" * 56, DAI, TOKEN_X, 10**9, 10**9)
+    r = solver(world, "Sector", "a8" * 20)
+    b = solver(world, "Quasi", "b8" * 20)
+    c = solver(world, "Baseline", "c8" * 20)
+    d = solver(world, "Horadrim", "d8" * 20)
+    for auction_id, sector_on_y in ((14000021, False), (14000022, True)):
+        bids = [
+            (r, [fill(x, 10**9, 10**9 + 100)]),
+            (b, [fill(y, 10**9, 10**9 + 80)]),
+            (d, [fill(x, 10**9, 10**9 + 60)]),
+            (c, [fill(y, 10**9, 10**9 + 30)]),
+        ]
+        if sector_on_y:
+            bids.append((r, [fill(y, 10**9, 10**9 + 70)]))
+        auction(world, auction_id, bids)
+    return world
+
+
+def margin_falls() -> World:
+    """Two ways removing a solver lowers another winner's margin, every bid fixed.
+
+    Auction 14000031, un-filtering: Quasi's batch wins X and Y at 100 (50 + 50).
+    Sector's single X bid at 40 sets the X baseline, which filters Arc's batch (X 30,
+    Y 45). Quasi's reference is Sector's 40 plus Baseline's 20 on Y: margin 40. Without
+    Sector, Arc's batch is kept and alone makes the reference, 75: margin 25.
+
+    Auction 14000032, a winner's claim: Sector's batch wins X and Z at 50, Quasi's wins
+    Y and W at 40. Arctic's batch on Z and Y (30) is kept out of Quasi's reference pick
+    by Sector's claim on Z, so the reference is Sector's 50 plus Baseline's 5: margin 35.
+    Without Sector, Horadrim takes X alone at 20, Arctic's batch joins Quasi's reference
+    pick (20 + 30), and the margin falls to 10."""
+    world = blank()
+    weth = WRAPPED["sepolia"]
+    x = order(world, "91" * 56, weth, USDC, 10**9, 10**9)
+    y = order(world, "92" * 56, DAI, TOKEN_X, 10**9, 10**9)
+    z = order(world, "93" * 56, TOKEN_X, USDC, 10**9, 10**9)
+    w = order(world, "94" * 56, USDC, DAI, 10**9, 10**9)
+    r = solver(world, "Sector", "a9" * 20)
+    b = solver(world, "Quasi", "b9" * 20)
+    c = solver(world, "Baseline", "c9" * 20)
+    d = solver(world, "Horadrim", "d9" * 20)
+    u = solver(world, "Arc", "e9" * 20)
+    n = solver(world, "Arctic", "f9" * 20)
+    auction(world, 14000031, [
+        (b, [fill(x, 10**9, 10**9 + 50), fill(y, 10**9, 10**9 + 50)]),
+        (r, [fill(x, 10**9, 10**9 + 40)]),
+        (u, [fill(x, 10**9, 10**9 + 30), fill(y, 10**9, 10**9 + 45)]),
+        (c, [fill(y, 10**9, 10**9 + 20)]),
+    ])
+    auction(world, 14000032, [
+        (r, [fill(x, 10**9, 10**9 + 25), fill(z, 10**9, 10**9 + 25)]),
+        (b, [fill(y, 10**9, 10**9 + 20), fill(w, 10**9, 10**9 + 20)]),
+        (n, [fill(z, 10**9, 10**9 + 15), fill(y, 10**9, 10**9 + 15)]),
+        (d, [fill(x, 10**9, 10**9 + 20)]),
+        (c, [fill(y, 10**9, 10**9 + 5)]),
+    ])
+    return world
+
+
 PINNED_WORLDS = {
     "live-fee-fixture": live_fee_fixture,
     "dark-pair": dark_pair,
@@ -255,4 +352,7 @@ PINNED_WORLDS = {
     "blocked-batch": blocked_batch,
     "penalty-caps": penalty_caps,
     "cancelled-price": cancelled_price,
+    "runner-up-only": runner_up_only,
+    "runner-up-elsewhere": runner_up_elsewhere,
+    "margin-falls": margin_falls,
 }
