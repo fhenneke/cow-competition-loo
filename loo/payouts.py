@@ -539,6 +539,7 @@ def plan_recorded(
     end: str,
     addresses: Collection[str],
     *,
+    network: str,
     chunk_size: int = CHUNK_SIZE,
 ) -> RecordedPlan:
     """Read the marts and each period's auctions, and queue the queries they decide: the
@@ -563,6 +564,13 @@ def plan_recorded(
     period_ids: list[tuple[int, ...]] = []
     queries: list[tuple[str, dict[str, Any]]] = []
     for (begin, finish), label in zip(spans, labels, strict=True):
+        if any(marts[component].get(label) for component in WEEKLY):
+            # A paid week is shared out by its full-week totals, which a period cut short
+            # would shrink; checked before its auctions are taken, so none is kept cut.
+            extract.require_coverage(
+                conn, network, _sql_time(finish),
+                what=f"the end of the paid accounting period {label}",
+            )
         ids = tuple(extract.auctions_in_window(conn, _sql_time(begin), _sql_time(finish)))
         period_ids.append(ids)
         piece = [a for a in ids if a in in_window]
@@ -589,6 +597,7 @@ def load_recorded(
     end: str,
     addresses: Collection[str],
     *,
+    network: str,
     chunk_size: int = CHUNK_SIZE,
     plan: RecordedPlan | None = None,
 ) -> RecordedWindow:
@@ -598,7 +607,9 @@ def load_recorded(
     `with_bids` are the window auctions with a recorded solution: those, and only those,
     need a reward row to count as accounted."""
     if plan is None:
-        plan = plan_recorded(conn, auction_ids, start, end, addresses, chunk_size=chunk_size)
+        plan = plan_recorded(
+            conn, auction_ids, start, end, addresses, network=network, chunk_size=chunk_size
+        )
     window = sorted(set(auction_ids))
     in_window = frozenset(window)
     expected = in_window & frozenset(with_bids)

@@ -19,6 +19,7 @@ from loo import db, extract, payouts
 
 SETTLING = {
     extract.WINDOW_SQL,
+    extract.COVERAGE_SQL,  # asked up to the end of a paid week, which may not have settled
     extract.CONVERSION_RATES_SQL,
     payouts.PERFORMANCE_SQL,
     payouts.CONSISTENCY_MART_SQL,

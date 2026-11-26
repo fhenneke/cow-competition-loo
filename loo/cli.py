@@ -189,6 +189,10 @@ def main(argv: list[str] | None = None) -> int:
     except extract.UnsupportedWindowError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 4
+    except extract.WindowNotCoveredError as error:
+        # The data, not the arguments: the same window passes once the DB catches up.
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 5
     except (db.ConnectionLostError, db.StatementTimeoutError) as error:
         # The network, never the data: print the cause, not a psycopg2 traceback.
         print(f"ERROR: {error}", file=sys.stderr)
@@ -201,6 +205,7 @@ def run_validate(args: argparse.Namespace) -> int:
     conn = db.connect(args.network)
 
     try:
+        extract.require_coverage(conn, args.network, args.end)
         auction_ids = extract.auctions_in_window(conn, args.start, args.end)
         if args.limit:
             auction_ids = auction_ids[: args.limit]
@@ -268,6 +273,7 @@ def run_validate_rewards(args: argparse.Namespace) -> int:
     """Recompute uncapped rewards from the mart's own inputs; must match it exactly."""
     conn = db.connect(args.network)
     try:
+        extract.require_coverage(conn, args.network, args.end)
         auction_ids = extract.auctions_in_window(conn, args.start, args.end)
         if args.limit:
             auction_ids = auction_ids[: args.limit]
@@ -428,6 +434,8 @@ def resolve_scenarios(args: argparse.Namespace, conn: db.Connection) -> list[str
         ),
         first=True,
     )
+    # Before any of them is taken, so a cut window keeps nothing; a cut one lists fewer.
+    extract.require_coverage(conn, args.network, args.end)
     solvers = extract.all_solvers(conn, args.start, args.end)
     if not solvers:
         print(

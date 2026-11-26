@@ -69,8 +69,12 @@ skipped.
 
 Exit codes: 0 ok; 1 no auctions in the window; 2 an auction could not be valued; 4 a
 solver did not resolve, inconsistent flags, a named solver absent, or a window before the
-replayed mechanism; 5 the settlement source does not cover the window; 6 the DB
-connection was lost or a statement passed the 30-minute timeout.
+replayed mechanism; 5 the DB does not cover the window: the settlement source, or the
+block times or auction model, which must reach the window's end and the end of every paid
+accounting period it touches
+([why](docs/analytics-db.md#the-window-needs-block-times-and-the-auction-model-up-to-its-end));
+6 the DB connection was lost or a statement passed the 30-minute timeout. Exit 5 is the
+data, not the arguments: rerun the same window once the DB has caught up.
 
 From Python the pipeline is one call, which the CLI renders:
 
@@ -164,7 +168,8 @@ uv run loo validate-rewards --start 2026-11-18 --end 2026-11-19
 
 `validate` reproduces the recorded competition — winners, fairness filter, reference
 scores — and names a cause for every difference. Exit 0 when every difference has a
-named cause, 1 no auctions, 2 something unexplained, 3 a bad cross-check window, 6 DB.
+named cause, 1 no auctions, 2 something unexplained, 3 a bad cross-check window, 5 the
+block times or auction model stop before the window's end, 6 DB.
 `--cross-check-surplus` also diffs per-order surplus against
 `int_backend_data__proposed_solution_data`; that model lags the raw tables by days, so it
 fails loudly on an uncovered window rather than checking nothing. Solana has no such
@@ -173,7 +178,8 @@ model, so the flag exits 3 there.
 `validate-rewards` recomputes every winner's uncapped and capped reward from the mart's
 own inputs and diffs `fct_solver_rewards_per_auction` row by row. Nothing on that path is
 approximated, so anything but an exact match exits 2 (1 empty window, 3 mart does not
-cover the window, 6 DB). It has no mechanism cut-off.
+cover the window, 5 block times or auction model stop before its end, 6 DB). It has no
+mechanism cut-off.
 
 ## Reading a run
 

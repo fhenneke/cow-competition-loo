@@ -71,8 +71,8 @@ Outcomes and ground truth:
 | `stg_backend_data__reference_scores` | `(auction_id, solver) → reference_score`, winners only |
 | `int_backend_data__solution_data` | winning solutions only: `score, reference_score, is_settled_in_time, upper_reward_cap, lower_reward_cap` (the *flat* floor, see [rewards](rewards.md#since-2026-09-08-the-lower-cap-is-per-order-cip-87)), `penalty_cap_native, is_excluded, block_deadline` |
 | `fct_solver_rewards_per_auction` | `competition_score, observed_score, reference_score, uncapped_reward, batch_reward_native, upper_reward_cap, lower_reward_cap` (NULL on rows built before the column existed) |
-| `pre_stg__orders_per_auction_with_at_least_one_bid` | `(auction_id, block_deadline, order_uid)` — the auction universe the reward models use |
-| `stg_rpc_data__block_timestamp` | `block_number → time` |
+| `pre_stg__orders_per_auction_with_at_least_one_bid` | `(auction_id, block_deadline, order_uid)` — the auction universe the reward models use; **lags staging** at times ([below](#the-window-needs-block-times-and-the-auction-model-up-to-its-end)) |
+| `stg_rpc_data__block_timestamp` | `block_number → time`, every block; **lags** by up to days ([below](#the-window-needs-block-times-and-the-auction-model-up-to-its-end)) |
 | `dune_data__cow_protocol__solvers` | `address ↔ name, active, environment` ([traps](#resolving-a-solver-name)) |
 | `reward_config` | per-network caps, `service_fee_factor`, reward token |
 
@@ -221,7 +221,8 @@ It also lacks `filtered_out`, so the fairness-filter ground truth comes only fro
 The lag is specific to that model: on the same day `stg_backend_data__settlements`,
 `int_backend_data__winning_solutions_with_onchain_status`, `int_backend_data__solution_data`
 and `int_backend_data__trade_with_tx_hash` were level with staging. Check the model, do not
-avoid `int_` as a class.
+avoid `int_` as a class. The two tables a window is mapped through lag apart from staging
+too ([below](#the-window-needs-block-times-and-the-auction-model-up-to-its-end)).
 
 ## Mapping a date window to auctions
 
@@ -240,6 +241,41 @@ and 6–11 s on bnb, three times per run. The answers are equal (24 windows on m
 base, arbitrum-one and bnb, past the table's ends included) because a block's time never
 falls below its predecessor's: no inversion since 2026-09-01 on those chains (622k, 11M,
 27M and 16M blocks), as consensus requires.
+
+### The window needs block times and the auction model up to its end
+
+Past the last row of either table the query above finds nothing, and says nothing. Both
+sync apart from staging. On 2026-11-26 `stg_rpc_data__block_timestamp` ended at 11-24
+12:00 UTC on base and bnb and at 11-25 04:20 on arbitrum-one, while `competition_auctions`,
+`proposed_solutions` and `orders` were current: a run over 10-29..11-26 exited 0 with base
+and bnb cut 1.5 days short, and its quote side, which reads `orders`, covered the whole
+window. Measured at 21:00 UTC that day, block times ended 2.2 days back on base, 1.3 on
+arbitrum-one, 1.2 on bnb, ink and plasma, and 15 hours on polygon; mainnet, xdai and linea
+were within three hours.
+
+So `loo` checks both (`extract.COVERAGE_SQL`, 0.04 s on every chain) before it maps a
+window to auctions, and exits 5 naming the table and where it stops:
+
+- **Block times** must hold a block at or after the window's end. The table holds every
+  block (cow-dagster's sync fetches each block number in turn; base's last rows are five a
+  second), so the test is exact: no tolerance is needed, and none would be safe.
+- **The model** cannot be held to the same test, because it holds only auctions with a
+  bid and quiet chains go hours without one. In the week to 2026-11-26 linea had 13 such
+  auctions with a gap of 2 days 6 hours, and ink and plasma had gaps of 1 h 45 m. Instead
+  its last auction is compared with staging, which the model is built from: if
+  `stg_backend_data__proposed_trade_executions` holds a later auction whose deadline falls
+  before the end, the model is behind. dbt takes the model's block range from the RPC,
+  not from block times (cow-dagster `shared/dune.py`, `time_to_block`), so the two lag
+  independently. On 2026-11-26 the model was ahead of the block times on seven chains.
+
+`analyse` also needs both up to the end of every paid accounting period the window
+touches. A week's consistency and quote rewards are shared out by that week's totals, and a
+cut week shrinks them, so the window's share comes out too large without a warning.
+
+Staging itself is not checked: within a day of a moment it may still be filling
+(`db.SETTLED_AFTER`), and a window read that soon is read live and not kept. A covered
+answer is kept in a snapshot, since the tables only grow, and a refused run keeps nothing,
+so the window reruns whole once the tables catch up.
 
 ## `order_surplus_atoms_in_surplus_token` rounds
 
@@ -504,6 +540,8 @@ instantiates `winner-selection` for Solana; production `max-winners = 20`). What
 - **The window.** `stg_solana_backend_data__competition_auctions` holds only auctions
   with a winner, and its `auction_timestamp` is the time of the deadline slot, so the
   window is read from it directly; on 2026-11-26 every raw auction with a bid was in it.
+  Nothing lags it, so the coverage check
+  ([above](#the-window-needs-block-times-and-the-auction-model-up-to-its-end)) passes.
   There are no blocks: `deadline_slot` stands where `block_deadline` does.
 - **Native prices** are lamports per atom × 1e9 (`NATIVE_PRICE_DENOMINATOR` in services
   `crates/chain-types`), not wei × 1e18. `extract.fetch_prices` multiplies them by 1e9 onto

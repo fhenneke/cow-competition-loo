@@ -55,6 +55,12 @@ class Faults:
     """(auction, uid) -> what the recorded score is off by."""
     flip_filtered: frozenset[tuple[int, int]] = frozenset()
     """(auction, uid) whose recorded `filtered_out` contradicts the mechanism."""
+    blocks_end: datetime | None = None
+    """The last row of `stg_rpc_data__block_timestamp`, when it stops short: no window
+    bound reaches past it. `None`: it reaches every moment asked about."""
+    model_end: int | None = None
+    """`pre_stg__orders_per_auction_with_at_least_one_bid` holds no auction above this
+    id, though staging does."""
 
 
 @dataclass
@@ -75,6 +81,7 @@ class SimServer:
         q = extract.price_query
         routes: dict[str, Callable[[dict[str, Any]], list[Row]]] = {
             extract.WINDOW_SQL: self._window,
+            extract.COVERAGE_SQL: self._coverage,
             extract.AUCTIONS_SQL: self._auctions,
             extract.SOLUTIONS_SQL: self._solutions,
             extract.EXECUTIONS_SQL: self._executions,
@@ -149,13 +156,46 @@ class SimServer:
     # --- the window and its auctions --------------------------------------------------
 
     def _in_window(self, params: dict[str, Any]) -> list[int]:
-        """By deadline time; shadows and bidless ids included (`world.auction_times`)."""
+        """By deadline time; shadows and bidless ids included (`world.auction_times`).
+        Bounded by the block times' last row and the model's last auction, as the SQL is:
+        past either it finds nothing, and says nothing."""
         start = datetime.fromisoformat(params["start"])
         end = datetime.fromisoformat(params["end"])
-        return sorted(a for a, when in auction_times(self.world).items() if start <= when < end)
+        blocks, model = self.faults.blocks_end, self.faults.model_end
+        return sorted(
+            a for a, when in auction_times(self.world).items()
+            if start <= when < end
+            and (blocks is None or when <= blocks)
+            and (model is None or a <= model)
+        )
 
     def _window(self, params: dict[str, Any]) -> list[Row]:
         return [{"auction_id": a} for a in self._in_window(params)]
+
+    def _coverage(self, params: dict[str, Any]) -> list[Row]:
+        """Staging's auctions with a bid are every id the window query can name; the model
+        holds those up to `model_end`. A deadline past the block times' last row reads
+        that row's time, as the SQL's last-block-at-or-before lookup does."""
+        end = datetime.fromisoformat(params["end"])
+        times = auction_times(self.world)
+        blocks = self.faults.blocks_end or max([end, *times.values()])
+
+        def at(when: datetime | None) -> datetime | None:
+            return None if when is None else min(when, blocks)
+
+        cut = self.faults.model_end
+        modelled = max((a for a in times if cut is None or a <= cut), default=None)
+        unmodelled = min((a for a in times if cut is not None and a > cut), default=None)
+        deadline = at(times[unmodelled]) if unmodelled is not None else None
+        return [{
+            "blocks_end": blocks,
+            "blocks_cover": blocks >= end,
+            "model_auction": modelled,
+            "model_end": at(times[modelled]) if modelled is not None else None,
+            "unmodelled_auction": unmodelled,
+            "unmodelled_deadline": deadline,
+            "model_covers": deadline is None or deadline >= end,
+        }]
 
     def _auctions_by_id(self, params: dict[str, Any]) -> Iterator[Any]:
         ids = set(params["ids"])

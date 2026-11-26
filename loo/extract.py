@@ -15,6 +15,7 @@ import json
 import os
 from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from statistics import median
@@ -90,6 +91,13 @@ class MissingPricesError(Exception):
 
 class SolverResolutionError(Exception):
     """`--solver` did not name exactly one solver that bid in the window."""
+
+
+class WindowNotCoveredError(Exception):
+    """The block times or the model of auctions with a bid stop before the end of the
+    window, or of a paid accounting period it touches, so `WINDOW_SQL` would silently
+    return it shorter
+    ([docs](../docs/analytics-db.md#the-window-needs-block-times-and-the-auction-model-up-to-its-end))."""
 
 
 @dataclass(frozen=True)
@@ -195,6 +203,53 @@ select distinct auction_id
 from dbt.pre_stg__orders_per_auction_with_at_least_one_bid
 where block_deadline {WINDOW_BLOCKS}
 order by auction_id
+"""
+
+# The two tables `WINDOW_SQL` maps the window through sync apart from staging, and past
+# their last row it finds nothing. Block times hold every block, so the last block at or
+# before a deadline is the deadline's own. The model holds only auctions with a bid,
+# which a quiet chain sees hours apart, so it is checked against staging instead.
+COVERAGE_SQL = """
+with last_block as (
+    select time
+    from dbt.stg_rpc_data__block_timestamp
+    order by block_number desc
+    limit 1
+),
+last_modelled as (
+    select auction_id, block_deadline
+    from dbt.pre_stg__orders_per_auction_with_at_least_one_bid
+    order by auction_id desc
+    limit 1
+),
+first_unmodelled as (
+    -- The first auction with a bid in staging that the model does not hold yet.
+    select ca.auction_id, ca.block_deadline
+    from dbt.stg_backend_data__competition_auctions ca
+    where ca.auction_id = (
+        select min(pte.auction_id)
+        from dbt.stg_backend_data__proposed_trade_executions pte
+        where pte.auction_id > coalesce((select auction_id from last_modelled), -1)
+    )
+),
+deadlines as (
+    select
+        (select b.time from dbt.stg_rpc_data__block_timestamp b
+         where b.block_number <= (select block_deadline from last_modelled)
+         order by b.block_number desc limit 1) as modelled,
+        (select b.time from dbt.stg_rpc_data__block_timestamp b
+         where b.block_number <= (select block_deadline from first_unmodelled)
+         order by b.block_number desc limit 1) as unmodelled
+)
+select
+    (select time from last_block)                             as blocks_end,
+    coalesce((select time from last_block) >= %(end)s, false) as blocks_cover,
+    (select auction_id from last_modelled)                    as model_auction,
+    d.modelled                                                as model_end,
+    (select auction_id from first_unmodelled)                 as unmodelled_auction,
+    d.unmodelled                                              as unmodelled_deadline,
+    coalesce(d.unmodelled >= %(end)s, true)                   as model_covers
+from deadlines d
 """
 
 SOLUTIONS_SQL = """
@@ -589,6 +644,43 @@ def window_queries(
         ]
     bidders = [(ALL_SOLVERS_SQL, params)] if all_solvers else []
     return [*bidders, (SOLVERS_SQL, params), (WINDOW_SQL, params)]
+
+
+def require_coverage(
+    conn: Connection, network: str, end: str, *, what: str | None = None
+) -> None:
+    """Raise `WindowNotCoveredError` unless the block times and the auction model reach
+    `end`, the window's end unless `what` names it. Call it before anything maps a span
+    ending at `end` to auctions, so no shortened result is kept in a snapshot. Solana
+    reads its window from staging itself, which nothing lags, so it always passes."""
+    if network == SOLANA:
+        return
+
+    def covers(rows: list[Row]) -> bool:
+        # Tables only grow, so a span once covered stays covered.
+        return settled(end) and rows[0]["blocks_cover"] and rows[0]["model_covers"]
+
+    (row,) = fetch(conn, COVERAGE_SQL, {"end": end}, final=covers)
+    reach = what or f"the window's end {end}"
+    if not row["blocks_cover"]:
+        raise WindowNotCoveredError(
+            f"on {network}, dbt.stg_rpc_data__block_timestamp ends at "
+            f"{_moment(row['blocks_end'])}, before {reach}: every auction after it would "
+            f"be left out without a word. Rerun once the block times have caught up."
+        )
+    if not row["model_covers"]:
+        raise WindowNotCoveredError(
+            f"on {network}, dbt.pre_stg__orders_per_auction_with_at_least_one_bid ends "
+            f"at auction {row['model_auction']} (deadline {_moment(row['model_end'])}), "
+            f"but staging already holds auction {row['unmodelled_auction']} with bids "
+            f"(deadline {_moment(row['unmodelled_deadline'])}), before {reach}: every "
+            f"auction after the model's would be left out without a word. Rerun once the "
+            f"model has caught up."
+        )
+
+
+def _moment(value: datetime | None) -> str:
+    return "no row at all" if value is None else f"{value:%Y-%m-%d %H:%M:%S} UTC"
 
 
 def auctions_in_window(conn: Connection, start: str, end: str) -> list[int]:

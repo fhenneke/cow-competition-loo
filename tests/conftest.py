@@ -21,10 +21,13 @@ DEFAULT_SEEDS = 120
 
 PINNED: dict[int, str] = {
     1: "an auction with an unpriced fee carried a partial fee delta into the USD fee cells",
+    6: "block times ending inside the window cut it short, and the run exited 0",
+    13: "block times ending inside a paid week after the window overstated its reward share",
     80: "a replaced quote's limit shift would move the counterfactual winners",
     100: "a token both feeds overprice, sold for a sub-wei side the floor read as unpriced",
     107: "a replaced quote's limit shift would move the counterfactual winners",
     138: "a streamed order whose replacement depends on when its user committed",
+    181: "a model whose last bid falls before the window's end, none after it: not refused",
     271: "our baseline differs from the recorded winners: a guessed filter verdict",
     291: "our baseline differs from the recorded winners: a guessed filter verdict",
     372: "a dropped stream's replacement answer was never recorded",

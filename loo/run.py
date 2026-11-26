@@ -191,6 +191,7 @@ def analyse_window(
 
     Each `solvers` entry is one scenario; comma-separated names are removed jointly.
     Overlapping scenarios are fine; identical address sets are rejected as duplicates.
+    Raises `extract.WindowNotCoveredError` when the DB does not reach `end`.
     """
     if not outcome_rules:
         raise ValueError("outcome_rules must name at least one rule")
@@ -203,6 +204,9 @@ def analyse_window(
     db.prefetch(
         conn, window_queries(network, start, end, with_quotes=with_quotes), first=True
     )
+    # Before any of them is taken, so a cut window keeps nothing: resolving a solver counts
+    # its bids in the window, which a cut window shrinks.
+    extract.require_coverage(conn, network, end)
 
     resolved: list[
         tuple[str, tuple[GroupMember, ...], frozenset[str], list[extract.SolverMatch]]
@@ -353,7 +357,11 @@ def analyse_window(
     # Every scenario's solvers: the payouts of record are read in one pass for all.
     every_address = frozenset[str]().union(*(addresses for _, _, addresses, _ in resolved))
     plan = (
-        payouts.plan_recorded(conn, auction_ids, start, end, every_address) if paid else None
+        payouts.plan_recorded(
+            conn, auction_ids, start, end, every_address, network=network
+        )
+        if paid
+        else None
     )
 
     with_bids: list[int] = []
@@ -397,6 +405,7 @@ def analyse_window(
         end,
         every_address,
         plan=plan,
+        network=network,
     )
     for run in runs:
         run.recorded = recorded

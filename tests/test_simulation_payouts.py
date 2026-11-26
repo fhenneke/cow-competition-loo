@@ -54,7 +54,7 @@ def load(sim: Sim, world: World, begin: datetime, end: datetime, addresses: Coll
     conn = sim.conn()
     window = extract.auctions_in_window(conn, text(begin), text(end)) if ids is None else ids
     recorded = payouts.load_recorded(conn, window, with_bids(world), text(begin), text(end),
-                                     addresses, chunk_size=3)
+                                     addresses, network=world.network, chunk_size=3)
     return recorded, window
 
 

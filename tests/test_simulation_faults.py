@@ -7,17 +7,18 @@ from __future__ import annotations
 import json
 import random
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 import psycopg2
 import pytest
 from sim import expect
-from sim.harness import simulate
+from sim.harness import Run, Sim, simulate
 from sim.simch import SimClickHouse
 from sim.simdb import Faults
-from sim.world import Knobs, World, generate, sample_knobs
+from sim.world import Knobs, World, auction_times, generate, sample_knobs
 
-from loo import aggregate, ch, extract
+from loo import aggregate, ch, extract, payouts
 
 
 def analyse_args(world: World, *solvers: str) -> list[str]:
@@ -99,6 +100,81 @@ def test_missing_data_is_loud(seed: int) -> None:
                           "--end", world.end, "--max-winners", str(world.max_winners))
         assert checked.code == 2
         assert "valuation-failure" in checked.out
+
+
+def test_uncovered_window(seed: int, tmp_path: Path) -> None:
+    """Block times or the model of auctions with a bid that stop before the window's end
+    are exit 5 from every command, naming the table and where it stops: past them the
+    window query finds nothing, so the run would silently come out shorter. `analyse`
+    needs the same up to the end of each paid accounting period the window touches, whose
+    full-week totals share out its rewards. A model whose last auction falls before an
+    end, with staging holding no later bid before it (a quiet chain), is complete and runs
+    as if nothing were cut. A refused run keeps nothing, so the same window reruns whole
+    once the tables catch up."""
+    world = generate(seed)
+    rng = random.Random(seed * 7_907 + 41)  # its own stream: the world stays the seed's
+    label = some_label(world, random.Random(seed))
+    start, end = datetime.fromisoformat(world.start), datetime.fromisoformat(world.end)
+    periods = payouts.accounting_periods(world.start, world.end)
+    paid = [finish for begin, finish in periods
+            if world.consistency_mart.get(payouts.period_label(begin, finish))
+            or world.quote_mart.get(payouts.period_label(begin, finish))]
+    times = auction_times(world)
+    blocks_end = rng.choice((None, start + (end - start) * rng.random(),
+                             end + (periods[-1][1] - end) * rng.random()))
+    model_end = rng.choice((None, rng.choice(sorted(times))))
+    later = sorted(a for a in times if model_end is not None and a > model_end)
+
+    def short(ends: list[datetime]) -> tuple[str, datetime] | None:
+        """The table that stops before the first of `ends` it does not reach, and where."""
+        for at in ends:
+            if blocks_end is not None and blocks_end < at:
+                return "stg_rpc_data__block_timestamp", blocks_end
+            if model_end is not None and later and times[later[0]] < at:
+                return "pre_stg__orders_per_auction_with_at_least_one_bid", times[model_end]
+        return None
+
+    window = ("--network", world.network, "--start", world.start, "--end", world.end)
+    commands = {
+        "analyse": [*analyse_args(world, label), "--out", str(tmp_path / "{rule}.json")],
+        "all-solvers": ["analyse", *window, "--all-solvers", "--limit", "2",
+                        "--max-winners", str(world.max_winners)],
+        "validate": ["validate", *window, "--max-winners", str(world.max_winners)],
+        "validate-rewards": ["validate-rewards", *window],
+    }
+    expected = {name: short([end, *paid] if name in ("analyse", "all-solvers") else [end])
+                for name in commands}
+
+    def outcomes(sim: Sim) -> dict[str, tuple[Run, str]]:
+        """Each command's run, and the report it wrote."""
+        seen: dict[str, tuple[Run, str]] = {}
+        for name, argv in commands.items():
+            run = sim.cli(*argv)
+            report = tmp_path / "inherited.json"
+            seen[name] = (run, report.read_text() if report.exists() else "")
+            report.unlink(missing_ok=True)
+        return seen
+
+    def same(a: tuple[Run, str], b: tuple[Run, str]) -> bool:
+        return (a[0].code, a[0].out, a[1]) == (b[0].code, b[0].out, b[1])
+
+    with simulate(world) as sim:
+        clean = outcomes(sim)
+    with simulate(world, Faults(blocks_end=blocks_end, model_end=model_end)) as sim:
+        cut = outcomes(sim)
+        for name, refusal in expected.items():
+            run, report = cut[name]
+            if refusal is None:
+                assert same(cut[name], clean[name]), (name, run.err)
+                continue
+            table, stop = refusal
+            assert run.code == 5, (name, run.err)
+            assert table in run.err and world.network in run.err, run.err
+            assert f"{stop:%Y-%m-%d %H:%M:%S} UTC" in run.err, run.err
+            assert not run.out and not report, name
+        sim.server.faults = Faults()  # the tables catch up
+        caught_up = outcomes(sim)
+        assert all(same(caught_up[name], clean[name]) for name in commands)
 
 
 def test_reward_gate_faults(seed: int, tmp_path: Path) -> None:

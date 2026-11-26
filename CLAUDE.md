@@ -18,7 +18,8 @@ Results pages: the [solver-value-artifact skill](.claude/skills/solver-value-art
 4. Auction membership comes from `competition_auctions.order_uids`. Fee policies are
    not membership.
 5. `int_backend_data__proposed_solution_data` lags staging by days, so query its
-   `max(auction_id)`. It has no `filtered_out` column. Other models are level with staging.
+   `max(auction_id)`. It has no `filtered_out` column. The window's block times and
+   auction model lag too, which `loo` refuses with exit 5; ad-hoc window queries do not.
 6. `order_surplus_atoms_in_surplus_token` can be one atom high. Use exact integer ceiling
    division.
 7. Executed (`tx_hash is not null`) is not settled in time (`is_settled_in_time`). `loo`
