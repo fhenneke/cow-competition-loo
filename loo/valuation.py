@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 from .fees import EMPTY_FEE_CONTEXT, FeeContext, FeeError, order_fees
@@ -41,8 +42,7 @@ class Order:
     partially_fillable: bool = False
 
 
-@dataclass(frozen=True)
-class ClearingPrices:
+class ClearingPrices(NamedTuple):
     sell: int
     buy: int
 
@@ -120,6 +120,23 @@ def order_volume_native(order: Order, native_prices: dict[str, int]) -> int:
     return price_in_eth(price, order.executed_buy)
 
 
+class OrderFees(NamedTuple):
+    """`SolutionValuation`'s fee half."""
+
+    order_fee_native: dict[str, int]
+    order_partner_fee_native: dict[str, int]
+    pair_fee_native: dict[Pair, int]
+    pairs_fees_unknown: frozenset[Pair]
+    fees_unknown: frozenset[str]
+
+
+class FeeInputs(NamedTuple):
+    valued: tuple[tuple[Order, int, int], ...]
+    """Per order in bid order: the order, its surplus in atoms and in native wei."""
+    native_prices: dict[str, int]
+    fee_context: FeeContext
+
+
 @dataclass(frozen=True)
 class SolutionValuation:
     pair_surplus: dict[Pair, int]
@@ -129,14 +146,69 @@ class SolutionValuation:
     """`as_erc20`-normalised: what `pick_winners` claims."""
     order_uids: frozenset[str]
     order_volume_native: dict[str, int] = field(default_factory=dict[str, int])
-    order_fee_native: dict[str, int] = field(default_factory=dict[str, int])
-    """Protocol fee including partner fees; orders in `fees_unknown` are absent."""
-    order_partner_fee_native: dict[str, int] = field(default_factory=dict[str, int])
-    pair_fee_native: dict[Pair, int] = field(default_factory=dict[Pair, int])
-    """Short by an unknown amount on `pairs_fees_unknown`."""
-    pairs_fees_unknown: frozenset[Pair] = frozenset()
-    fees_unknown: frozenset[str] = frozenset()
-    """Orders with no recorded policies; empty for every solution the arbitrator kept."""
+    fee_inputs: FeeInputs | None = field(default=None, compare=False, repr=False)
+    """What the fees are computed from, on first use: only winners and multi-pair score
+    splits read them, a small share of the bids. None: nothing to price."""
+
+    @cached_property
+    def fees(self) -> OrderFees:
+        """Can neither fail nor raise where the surplus did not: an uncomputable fee is
+        `fees_unknown`, and `to_native` checks nothing the surplus did not."""
+        fee_native: dict[str, int] = {}
+        partner_fee_native: dict[str, int] = {}
+        pair_fee_native: dict[Pair, int] = {}
+        pairs_fees_unknown: set[Pair] = set()
+        fees_unknown: set[str] = set()
+        valued, prices, context = self.fee_inputs or ((), {}, EMPTY_FEE_CONTEXT)
+        for order, surplus_atoms, surplus_native in valued:
+            pair = (order.sell_token, order.buy_token)
+            try:
+                split = order_fees(order, context)
+            except FeeError:
+                split = None
+            if split is None:
+                fees_unknown.add(order.uid)
+                pairs_fees_unknown.add(pair)
+                continue
+            # Convert as differences of conversions, so surplus + fee equals the score to
+            # the wei and 0 <= dao <= fee (to_native is monotone but floors).
+            score_native = to_native(order, surplus_atoms + split.total, prices)
+            protocol_native = (
+                to_native(order, surplus_atoms + split.protocol, prices) - surplus_native
+            )
+            fee_native[order.uid] = score_native - surplus_native
+            partner_fee_native[order.uid] = score_native - surplus_native - protocol_native
+            pair_fee_native[pair] = pair_fee_native.get(pair, 0) + fee_native[order.uid]
+        return OrderFees(
+            fee_native,
+            partner_fee_native,
+            pair_fee_native,
+            frozenset(pairs_fees_unknown),
+            frozenset(fees_unknown),
+        )
+
+    @property
+    def order_fee_native(self) -> dict[str, int]:
+        """Protocol fee including partner fees; orders in `fees_unknown` are absent."""
+        return self.fees.order_fee_native
+
+    @property
+    def order_partner_fee_native(self) -> dict[str, int]:
+        return self.fees.order_partner_fee_native
+
+    @property
+    def pair_fee_native(self) -> dict[Pair, int]:
+        """Short by an unknown amount on `pairs_fees_unknown`."""
+        return self.fees.pair_fee_native
+
+    @property
+    def pairs_fees_unknown(self) -> frozenset[Pair]:
+        return self.fees.pairs_fees_unknown
+
+    @property
+    def fees_unknown(self) -> frozenset[str]:
+        """Orders with no recorded policies; empty for every solution the arbitrator kept."""
+        return self.fees.fees_unknown
 
     @property
     def total(self) -> int:
@@ -164,18 +236,15 @@ def value_solution(
     """`score_by_token_pair`, `arbitrator.rs:176`.
 
     Raises `ValuationError`; the caller must discard the whole solution. An
-    uncomputable fee is not an error: the order goes to `fees_unknown`.
+    uncomputable fee is not an error: the order goes to `fees_unknown`. Fees are
+    computed when first read (`SolutionValuation.fees`).
     """
     pair_surplus: dict[Pair, int] = {}
     native: dict[str, int] = {}
     volumes: dict[str, int] = {}
-    fee_native: dict[str, int] = {}
-    partner_fee_native: dict[str, int] = {}
-    pair_fee_native: dict[Pair, int] = {}
-    pairs_fees_unknown: set[Pair] = set()
-    fees_unknown: set[str] = set()
     winner_pairs: set[Pair] = set()
     uids: set[str] = set()
+    valued: list[tuple[Order, int, int]] = []
 
     for order in orders:
         uids.add(order.uid)
@@ -190,24 +259,7 @@ def value_solution(
         volumes[order.uid] = order_volume_native(order, native_prices)
         pair = (order.sell_token, order.buy_token)
         pair_surplus[pair] = pair_surplus.get(pair, 0) + surplus_native
-
-        try:
-            split = order_fees(order, fee_context)
-        except FeeError:
-            split = None
-        if split is None:
-            fees_unknown.add(order.uid)
-            pairs_fees_unknown.add(pair)
-        else:
-            # Convert as differences of conversions, so surplus + fee equals the score to
-            # the wei and 0 <= dao <= fee (to_native is monotone but floors).
-            score_native = to_native(order, surplus_atoms + split.total, native_prices)
-            protocol_native = (
-                to_native(order, surplus_atoms + split.protocol, native_prices) - surplus_native
-            )
-            fee_native[order.uid] = score_native - surplus_native
-            partner_fee_native[order.uid] = score_native - surplus_native - protocol_native
-            pair_fee_native[pair] = pair_fee_native.get(pair, 0) + fee_native[order.uid]
+        valued.append((order, surplus_atoms, surplus_native))
 
     return SolutionValuation(
         pair_surplus=pair_surplus,
@@ -215,11 +267,7 @@ def value_solution(
         winner_pairs=frozenset(winner_pairs),
         order_uids=frozenset(uids),
         order_volume_native=volumes,
-        order_fee_native=fee_native,
-        order_partner_fee_native=partner_fee_native,
-        pair_fee_native=pair_fee_native,
-        pairs_fees_unknown=frozenset(pairs_fees_unknown),
-        fees_unknown=frozenset(fees_unknown),
+        fee_inputs=FeeInputs(tuple(valued), native_prices, fee_context),
     )
 
 
@@ -238,11 +286,14 @@ def pair_score_split(valuation: SolutionValuation, db_score: int) -> PairScores:
     residual. Any contradiction with `db_score` returns no pairs and `anchor_failed`.
     """
     pairs = valuation.pair_surplus
-    if len(pairs) <= 1:
+    if len(pairs) == 1:
+        ((pair, surplus),) = pairs.items()
         # Surplus above the recorded score: our order set disagrees with the autopilot's.
-        if any(surplus > db_score for surplus in pairs.values()):
+        if surplus > db_score:
             return PairScores({}, anchor_failed=True)
-        return PairScores({pair: db_score for pair in pairs}, anchor_failed=False)
+        return PairScores({pair: db_score}, anchor_failed=False)
+    if not pairs:
+        return PairScores({}, anchor_failed=False)
 
     unknown = valuation.pairs_fees_unknown
     priced = {

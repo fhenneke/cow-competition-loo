@@ -8,7 +8,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from typing import Literal
+from functools import cached_property
+from typing import Any, Literal, NamedTuple
 
 from .extract import AuctionBundle, Bid, Settlement, SolutionCap
 from .fees import FeeContext, Quote
@@ -17,12 +18,11 @@ from .quotes import shifted_limit
 from .rewards import SolverReward, Win, uncapped_rewards
 from .valuation import Mode, Order, ValuedBid, build_solutions
 from .winner_selection import (
+    Arbitration,
     Ranking,
     ReferenceScore,
     Solution,
     arbitrate,
-    compute_reference_outcomes,
-    compute_reference_scores,
     filter_guess_could_matter,
 )
 
@@ -156,6 +156,18 @@ class OrderOutcome:
 UNEXECUTED = OrderOutcome(executed=False, surplus_native=None)
 
 
+def _imbalance(sold: int, bought: int, threshold: int) -> Literal["sell", "buy", "ok"] | None:
+    """Which of two native values is worth more than `threshold` times the other; None
+    when either is worth nothing."""
+    if not sold or not bought:
+        return None
+    if sold > threshold * bought:
+        return "sell"
+    if bought > threshold * sold:
+        return "buy"
+    return "ok"
+
+
 def price_imbalanced(
     bid: Bid, prices: Mapping[str, int], threshold: int = PRICE_IMBALANCE_THRESHOLD
 ) -> bool:
@@ -168,9 +180,7 @@ def price_imbalanced(
             continue
         sell_value += price_in_eth(sell_price, order.executed_sell)
         buy_value += price_in_eth(buy_price, order.executed_buy)
-    if not sell_value or not buy_value:
-        return False
-    return sell_value > threshold * buy_value or buy_value > threshold * sell_value
+    return _imbalance(sell_value, buy_value, threshold) in ("sell", "buy")
 
 
 def _order_imbalance(
@@ -184,13 +194,7 @@ def _order_imbalance(
         return None
     sold = price_in_eth(sell_price, order.sell_amount if limit else order.executed_sell)
     bought = price_in_eth(buy_price, order.buy_amount if limit else order.executed_buy)
-    if not sold or not bought:
-        return None
-    if sold > threshold * bought:
-        return "sell"
-    if bought > threshold * sold:
-        return "buy"
-    return "ok"
+    return _imbalance(sold, bought, threshold)
 
 
 def price_suspects(
@@ -207,20 +211,36 @@ def price_suspects(
     no user would sign is what says the price, not the bid, is wrong."""
     sides: dict[str, set[str]] = {}
     limits: dict[str, str | None] = {}
+    imbalanced: set[int] = set()
     for bid in bids:
+        # One pass per fill for both tests: its own imbalance, and the sums that
+        # `price_imbalanced` compares.
+        sell_value = buy_value = 0
         for order in bid.orders:
-            side = _order_imbalance(order, prices, threshold)
+            if order.uid not in limits:  # the order's own, the same in every bid
+                limits[order.uid] = _order_imbalance(order, prices, threshold, limit=True)
+            sell_price = prices.get(order.sell_token)
+            buy_price = prices.get(order.buy_token)
+            if sell_price is None or buy_price is None:
+                continue
+            sold = price_in_eth(sell_price, order.executed_sell)
+            bought = price_in_eth(buy_price, order.executed_buy)
+            sell_value += sold
+            buy_value += bought
+            side = _imbalance(sold, bought, threshold)
             if side is not None:
                 sides.setdefault(order.uid, set()).add(side)
-            limits[order.uid] = _order_imbalance(order, prices, threshold, limit=True)
+        if _imbalance(sell_value, buy_value, threshold) in ("sell", "buy"):
+            imbalanced.add(bid.uid)
     mispriced = {
         uid for uid, seen in sides.items() if seen in ({"sell"}, {"buy"}) and {limits[uid]} == seen
     }
+    if not mispriced:
+        return frozenset(imbalanced)
     return frozenset(
         bid.uid
         for bid in bids
-        if price_imbalanced(bid, prices, threshold)
-        or any(order.uid in mispriced for order in bid.orders)
+        if bid.uid in imbalanced or any(order.uid in mispriced for order in bid.orders)
     )
 
 
@@ -557,6 +577,66 @@ def diff_outcomes(
     return tuple(diffs)
 
 
+class DiffTotals(NamedTuple):
+    """Sums and counts over one auction's `OrderDiff`s, in one pass."""
+
+    surplus_base: int
+    surplus_loo: int
+    fees_base: int
+    fees_loo: int
+    partner_fees_base: int
+    partner_fees_loo: int
+    fees_complete: bool
+    only_with_solver: int
+    only_without_solver: int
+    unsettled_base: int
+    late_base: int
+
+
+class SideTotals(NamedTuple):
+    """One side's margin and reward sums, computed together."""
+
+    reference_margin: int
+    rewards: int
+    rewards_capped: Decimal | None
+    consistency_budget: Decimal | None
+    margin_above_cap: Decimal | None
+    pressed_rewards_capped: Decimal | None
+    settled_margin: int | None
+    """None where a pressed winner has no reward row, which the property raises on."""
+
+
+def diff_totals(diffs: Iterable[OrderDiff]) -> DiffTotals:
+    surplus_base = surplus_loo = fees_base = fees_loo = partner_base = partner_loo = 0
+    only_with = only_without = unsettled = late = 0
+    complete = True
+    for d in diffs:
+        surplus_base += d.surplus_base or 0
+        surplus_loo += d.surplus_loo or 0
+        fees_base += d.fee_base or 0
+        fees_loo += d.fee_loo or 0
+        partner_base += d.partner_fee_base or 0
+        partner_loo += d.partner_fee_loo or 0
+        complete = complete and d.fees_known_base and d.fees_known_loo
+        only_with += d.executed_base and not d.executed_loo
+        only_without += d.executed_loo and not d.executed_base
+        unsettled += d.observed_base and not d.executed_base
+        late += d.late_base
+    return DiffTotals(
+        surplus_base,
+        surplus_loo,
+        fees_base,
+        fees_loo,
+        partner_base,
+        partner_loo,
+        complete,
+        only_with,
+        only_without,
+        unsettled,
+        late,
+    )
+
+
 @dataclass(frozen=True)
 class AuctionCounterfactual:
     auction_id: int
@@ -645,13 +725,43 @@ class AuctionCounterfactual:
     def runner_up(self) -> bool:
         return bool(self.runner_up_uids)
 
+    def _side_totals(
+        self, margins: Mapping[str, int], rewards: dict[str, SolverReward]
+    ) -> SideTotals:
+        return SideTotals(
+            reference_margin=sum(margins.values()),
+            rewards=sum(r.uncapped_reward for r in rewards.values()),
+            rewards_capped=self._capped_total(rewards),
+            consistency_budget=self._consistency_budget(rewards),
+            margin_above_cap=self._margin_above_cap(margins, rewards),
+            pressed_rewards_capped=self._pressed_capped(margins, rewards),
+            settled_margin=(
+                self._settled_margin(margins, rewards)
+                if margins.keys() <= rewards.keys()
+                else None
+            ),
+        )
+
+    @cached_property
+    def base_totals(self) -> SideTotals:
+        return self._side_totals(self.reference_margins_base, self.baseline_rewards)
+
+    @cached_property
+    def loo_totals(self) -> SideTotals:
+        if (
+            self.reference_margins_loo is self.reference_margins_base
+            and self.loo_rewards is self.baseline_rewards
+        ):
+            return self.base_totals
+        return self._side_totals(self.reference_margins_loo, self.loo_rewards)
+
     @property
     def reference_margin_base(self) -> int:
-        return sum(self.reference_margins_base.values())
+        return self.base_totals.reference_margin
 
     @property
     def reference_margin_loo(self) -> int:
-        return sum(self.reference_margins_loo.values())
+        return self.loo_totals.reference_margin
 
     @property
     def delta_reference_margin(self) -> int:
@@ -659,7 +769,7 @@ class AuctionCounterfactual:
         reference score, so `anything_moved` retains every auction where this is nonzero."""
         return self.reference_margin_loo - self.reference_margin_base
 
-    @property
+    @cached_property
     def reference_margin_rises(self) -> int:
         return sum(
             1
@@ -667,7 +777,7 @@ class AuctionCounterfactual:
             if self.reference_margins_loo[solver] > margin
         )
 
-    @property
+    @cached_property
     def reference_margin_falls(self) -> int:
         """Removal lowers a margin where the reference pick does better without it: an
         un-filtered solution, a batch a removed winner's claim kept out, or smaller bids a
@@ -688,39 +798,43 @@ class AuctionCounterfactual:
             or bool(self.quote_substituted_uids)
         )
 
+    @cached_property
+    def diff_totals(self) -> DiffTotals:
+        return diff_totals(self.order_diffs)
+
     @property
     def delta_surplus(self) -> int:
-        return sum(d.delta_surplus for d in self.order_diffs)
+        return self.diff_totals.surplus_loo - self.diff_totals.surplus_base
 
     @property
     def surplus_base(self) -> int:
-        return sum(d.surplus_base or 0 for d in self.order_diffs)
+        return self.diff_totals.surplus_base
 
     @property
     def surplus_loo(self) -> int:
-        return sum(d.surplus_loo or 0 for d in self.order_diffs)
+        return self.diff_totals.surplus_loo
 
     @property
     def fees_complete(self) -> bool:
         """Every executed order's fee known on both sides; fails only when a solution the record
         filtered out wins the loo side."""
-        return all(d.fees_known for d in self.order_diffs)
+        return self.diff_totals.fees_complete
 
     @property
     def protocol_and_partner_fees_base(self) -> int:
-        return sum(d.fee_base or 0 for d in self.order_diffs)
+        return self.diff_totals.fees_base
 
     @property
     def protocol_and_partner_fees_loo(self) -> int:
-        return sum(d.fee_loo or 0 for d in self.order_diffs)
+        return self.diff_totals.fees_loo
 
     @property
     def partner_fees_base(self) -> int:
-        return sum(d.partner_fee_base or 0 for d in self.order_diffs)
+        return self.diff_totals.partner_fees_base
 
     @property
     def partner_fees_loo(self) -> int:
-        return sum(d.partner_fee_loo or 0 for d in self.order_diffs)
+        return self.diff_totals.partner_fees_loo
 
     @property
     def protocol_fees_base(self) -> int:
@@ -743,12 +857,12 @@ class AuctionCounterfactual:
         """Gross revenue change; `delta_rewards` usually moves the other way."""
         return self.protocol_fees_loo - self.protocol_fees_base
 
-    @property
+    @cached_property
     def quote_fee_recharge(self) -> int:
         """Σ (fee against replacement − fee against recorded quote) over recharged orders."""
         return sum(self.quote_fee_recharges.values())
 
-    @property
+    @cached_property
     def quote_fee_recharge_partner(self) -> int:
         return sum(self.quote_partner_fee_recharges.values())
 
@@ -758,11 +872,11 @@ class AuctionCounterfactual:
 
     @property
     def rewards_base(self) -> int:
-        return sum(r.uncapped_reward for r in self.baseline_rewards.values())
+        return self.base_totals.rewards
 
     @property
     def rewards_loo(self) -> int:
-        return sum(r.uncapped_reward for r in self.loo_rewards.values())
+        return self.loo_totals.rewards
 
     @property
     def delta_rewards(self) -> int:
@@ -779,11 +893,11 @@ class AuctionCounterfactual:
 
     @property
     def rewards_base_capped(self) -> Decimal | None:
-        return self._capped_total(self.baseline_rewards)
+        return self.base_totals.rewards_capped
 
     @property
     def rewards_loo_capped(self) -> Decimal | None:
-        return self._capped_total(self.loo_rewards)
+        return self.loo_totals.rewards_capped
 
     @property
     def delta_rewards_capped(self) -> Decimal | None:
@@ -805,11 +919,11 @@ class AuctionCounterfactual:
 
     @property
     def consistency_budget_base(self) -> Decimal | None:
-        return self._consistency_budget(self.baseline_rewards)
+        return self.base_totals.consistency_budget
 
     @property
     def consistency_budget_loo(self) -> Decimal | None:
-        return self._consistency_budget(self.loo_rewards)
+        return self.loo_totals.consistency_budget
 
     @property
     def delta_consistency_budget(self) -> Decimal | None:
@@ -838,11 +952,11 @@ class AuctionCounterfactual:
 
     @property
     def margin_above_cap_base(self) -> Decimal | None:
-        return self._margin_above_cap(self.reference_margins_base, self.baseline_rewards)
+        return self.base_totals.margin_above_cap
 
     @property
     def margin_above_cap_loo(self) -> Decimal | None:
-        return self._margin_above_cap(self.reference_margins_loo, self.loo_rewards)
+        return self.loo_totals.margin_above_cap
 
     @property
     def delta_margin_above_cap(self) -> Decimal | None:
@@ -866,11 +980,11 @@ class AuctionCounterfactual:
 
     @property
     def pressed_rewards_capped_base(self) -> Decimal | None:
-        return self._pressed_capped(self.reference_margins_base, self.baseline_rewards)
+        return self.base_totals.pressed_rewards_capped
 
     @property
     def pressed_rewards_capped_loo(self) -> Decimal | None:
-        return self._pressed_capped(self.reference_margins_loo, self.loo_rewards)
+        return self.loo_totals.pressed_rewards_capped
 
     @property
     def delta_pressed_rewards_capped(self) -> Decimal | None:
@@ -905,11 +1019,17 @@ class AuctionCounterfactual:
 
     @property
     def settled_margin_base(self) -> int:
-        return self._settled_margin(self.reference_margins_base, self.baseline_rewards)
+        margin = self.base_totals.settled_margin
+        if margin is None:  # raises the missing reward row's KeyError
+            return self._settled_margin(self.reference_margins_base, self.baseline_rewards)
+        return margin
 
     @property
     def settled_margin_loo(self) -> int:
-        return self._settled_margin(self.reference_margins_loo, self.loo_rewards)
+        margin = self.loo_totals.settled_margin
+        if margin is None:  # raises the missing reward row's KeyError
+            return self._settled_margin(self.reference_margins_loo, self.loo_rewards)
+        return margin
 
     @property
     def delta_score(self) -> int:
@@ -1047,6 +1167,509 @@ def _shift_moves_winners(
     return arbitrate(shifted, max_winners).winner_uids != loo_winner_uids
 
 
+UNMOVED_SHARED = (
+    "diff_totals",
+    "base_totals",
+    "loo_totals",
+    "reference_margin_rises",
+    "reference_margin_falls",
+    "quote_fee_recharge",
+    "quote_fee_recharge_partner",
+)
+"""`AuctionCounterfactual` cached properties that read none of the fields in which one
+auction's unmoved results differ (`removed_present`, `solver_won_db`,
+`filter_guess_could_matter`), so `PreparedAuction` shares them among those results."""
+
+_SCENARIO_CACHED = frozenset(
+    name
+    for name, value in vars(AuctionCounterfactual).items()
+    if isinstance(value, cached_property)
+) - frozenset(UNMOVED_SHARED)
+"""Every other cached property: never copied from one scenario's result to another's."""
+
+
+class PreparedAuction:
+    """One auction valued and arbitrated with every solver present: all of it that no
+    removal changes, computed once and shared by every scenario and outcome rule.
+    `analyse` adds the side without the removed solvers; `analyse_auction` does both."""
+
+    def __init__(
+        self,
+        bundle: AuctionBundle,
+        weth: str,
+        *,
+        mode: Mode = "score",
+        max_winners: int = MAX_WINNERS,
+        settled: Mapping[int, Settlement] | None = None,
+        solution_caps: Mapping[int, SolutionCap] | None = None,
+    ) -> None:
+        self.bundle = bundle
+        self.weth = weth
+        self.mode: Mode = mode
+        self.max_winners = max_winners
+        self.settled: Mapping[int, Settlement] = settled or {}
+        self.caps: Mapping[int, SolutionCap] = solution_caps if solution_caps else {}
+        self.db_winner_uids = frozenset(b.uid for b in bundle.bids if b.is_winner)
+        self.bidders = frozenset(b.solver for b in bundle.bids)
+        self.db_winning_solvers = frozenset(b.solver for b in bundle.bids if b.is_winner)
+        self.order_uids = frozenset(o.uid for b in bundle.bids for o in b.orders)
+        self.suspects = price_suspects(bundle.bids, bundle.native_prices)
+        self.valued, self.failures = build_solutions(
+            bundle.bids,
+            bundle.native_prices,
+            weth,
+            mode=mode,
+            fee_context=bundle.fee_context,
+        )
+        self.solutions = [v.solution for v in self.valued]
+        self.by_uid = {v.bid.uid: v for v in self.valued}
+        self._executed: dict[OutcomeRule, tuple[int, int, int]] = {}
+        self._absent: dict[OutcomeRule, AuctionCounterfactual] = {}
+        self._inherit: dict[OutcomeRule, dict[Pair, bool] | None] = {}
+        self._base: dict[OutcomeRule, SideOutcomes] = {}
+        self._base_diffs: dict[OutcomeRule, tuple[OrderDiff, ...]] = {}
+        self._unmoved_first: dict[OutcomeRule, AuctionCounterfactual] = {}
+        self._baseline_rewards: dict[OutcomeRule, dict[str, SolverReward]] = {}
+
+    def executed_volume(self, outcome_rule: OutcomeRule) -> tuple[int, int, int]:
+        if outcome_rule not in self._executed:
+            self._executed[outcome_rule] = (
+                (0, 0, 0)
+                if self.failures
+                else recorded_executed_volume(
+                    self.valued,
+                    self.db_winner_uids,
+                    outcome_rule=outcome_rule,
+                    settled=self.settled,
+                )
+            )
+        return self._executed[outcome_rule]
+
+    @cached_property
+    def arbitration(self) -> Arbitration:
+        return Arbitration(self.solutions, self.max_winners)
+
+    @cached_property
+    def baseline(self) -> Ranking:
+        return self.arbitration.ranking
+
+    @cached_property
+    def multi_pair(self) -> int:
+        """Baseline side: its baselines are the higher, so this never understates."""
+        return sum(1 for s in self.baseline.tested if len(s.pair_values) > 1)
+
+    @cached_property
+    def baseline_guess_could_matter(self) -> bool:
+        return filter_guess_could_matter(self.baseline, self.max_winners)
+
+    @cached_property
+    def baseline_references(self) -> dict[str, ReferenceScore]:
+        return self.arbitration.references
+
+    @cached_property
+    def baseline_reference_scores(self) -> dict[str, int]:
+        return self.arbitration.reference_scores
+
+    @cached_property
+    def baseline_by_solver(self) -> dict[str, frozenset[int]]:
+        return _winning_uids_by_solver(self.baseline)
+
+    @cached_property
+    def baseline_margins(self) -> dict[str, int]:
+        """Every winning solver's `reference_margin`."""
+        return {
+            solver: reference_margin(
+                self.baseline.winning_score, self.baseline_reference_scores[solver]
+            )
+            for solver in self.baseline_by_solver
+        }
+
+    def inherit(self, outcome_rule: OutcomeRule) -> dict[Pair, bool] | None:
+        if outcome_rule not in self._inherit:
+            self._inherit[outcome_rule] = (
+                recorded_settlement_by_pair(self.by_uid, self.db_winner_uids, self.settled)
+                if outcome_rule == "inherited"
+                else None
+            )
+        return self._inherit[outcome_rule]
+
+    def side(
+        self,
+        ranking: Ranking,
+        outcome_rule: OutcomeRule,
+        by_uid: Mapping[int, ValuedBid] | None = None,
+    ) -> SideOutcomes:
+        valued = by_uid if by_uid is not None else self.by_uid
+        return side_outcomes(
+            [valued[s.solution_uid] for s in ranking.winners],
+            outcome_rule=outcome_rule,
+            settled=self.settled,
+            recorded_winner_uids=self.db_winner_uids,
+            inherit=self.inherit(outcome_rule),
+        )
+
+    def base_side(self, outcome_rule: OutcomeRule) -> SideOutcomes:
+        if outcome_rule not in self._base:
+            self._base[outcome_rule] = self.side(self.baseline, outcome_rule)
+        return self._base[outcome_rule]
+
+    def base_diffs(self, outcome_rule: OutcomeRule) -> tuple[OrderDiff, ...]:
+        """The baseline diffed against itself: the diffs of a removal that moves no winner."""
+        if outcome_rule not in self._base_diffs:
+            orders = self.base_side(outcome_rule).orders
+            self._base_diffs[outcome_rule] = diff_outcomes(orders, orders)
+        return self._base_diffs[outcome_rule]
+
+    @cached_property
+    def cap_by_pair(self) -> dict[Pair, tuple[int, SolutionCap]]:
+        return recorded_caps_by_pair(self.by_uid, self.db_winner_uids, self.caps)
+
+    def winner_caps(self, ranking: Ranking) -> SideCaps:
+        return winner_caps(
+            [self.by_uid[s.solution_uid] for s in ranking.winners],
+            self.db_winner_uids,
+            self.caps,
+            self.cap_by_pair,
+        )
+
+    @cached_property
+    def base_caps(self) -> SideCaps:
+        return self.winner_caps(self.baseline)
+
+    def rewards(
+        self,
+        ranking: Ranking,
+        side: SideOutcomes,
+        caps: SideCaps,
+        reference_scores: Mapping[str, int],
+    ) -> dict[str, SolverReward]:
+        # Auction-level cap facts (flat floor, exclusion) ride on every recorded winner's row.
+        any_cap = next(iter(self.caps.values()), None)
+        return uncapped_rewards(
+            [
+                Win(
+                    s.solver,
+                    s.total,
+                    side.solution_executed[s.solution_uid],
+                    caps.by_uid[s.solution_uid],
+                    caps.penalty_by_uid[s.solution_uid],
+                )
+                for s in ranking.winners
+            ],
+            reference_scores,
+            lower_cap=any_cap.lower if any_cap else None,
+            excluded=any_cap.excluded if any_cap else False,
+        )
+
+    def baseline_rewards(self, outcome_rule: OutcomeRule) -> dict[str, SolverReward]:
+        if outcome_rule not in self._baseline_rewards:
+            self._baseline_rewards[outcome_rule] = self.rewards(
+                self.baseline,
+                self.base_side(outcome_rule),
+                self.base_caps,
+                self.baseline_reference_scores,
+            )
+        return self._baseline_rewards[outcome_rule]
+
+    def _unarbitrated(
+        self, outcome_rule: OutcomeRule, removed_present: frozenset[str], won_db: bool
+    ) -> AuctionCounterfactual:
+        executed_volume, executed_orders, executed_orders_all = self.executed_volume(
+            outcome_rule
+        )
+        return AuctionCounterfactual(
+            auction_id=self.bundle.auction_id,
+            n_solutions=len(self.bundle.bids),
+            solver_present=bool(removed_present),
+            removed_present=removed_present,
+            solver_won_db=won_db,
+            valuation_failures=tuple(sorted(self.failures.items())),
+            block_deadline=self.bundle.block_deadline,
+            price_suspect_uids=self.suspects,
+            executed_volume_base=executed_volume,
+            executed_orders_base=executed_orders,
+            executed_orders_all_base=executed_orders_all,
+        )
+
+    def _unmoved_fields(self, outcome_rule: OutcomeRule) -> dict[str, Any]:
+        """Every field of an unmoved result but the three a scenario sets itself."""
+        baseline = self.baseline
+        base = self.base_side(outcome_rule)
+        executed_volume, executed_orders, executed_orders_all = self.executed_volume(
+            outcome_rule
+        )
+        rewards: dict[str, SolverReward] = {}
+        cap_double_inherited = 0
+        cap_orphans: frozenset[int] = frozenset()
+        if self.mode == "score":
+            cap_double_inherited = 2 * self.base_caps.double_inherited
+            cap_orphans = self.base_caps.orphans
+            rewards = self.baseline_rewards(outcome_rule)
+        return dict(
+            auction_id=self.bundle.auction_id,
+            n_solutions=len(self.bundle.bids),
+            solver_present=True,
+            solver_won_baseline=False,
+            baseline_winner_uids=baseline.winner_uids,
+            loo_winner_uids=baseline.winner_uids,
+            baseline_reference_scores=self.baseline_reference_scores,
+            loo_reference_scores=self.baseline_reference_scores,
+            reference_margins_base=self.baseline_margins,
+            reference_margins_loo=self.baseline_margins,
+            baseline_rewards=rewards,
+            loo_rewards=rewards,
+            cap_double_inherited=cap_double_inherited,
+            cap_orphans_loo=cap_orphans,
+            price_suspect_uids=self.suspects,
+            multi_pair_solutions=self.multi_pair,
+            multi_pair_filter_proxied=len(baseline.proxied_uids),
+            block_deadline=self.bundle.block_deadline,
+            executed_volume_base=executed_volume,
+            executed_orders_base=executed_orders,
+            executed_orders_all_base=executed_orders_all,
+            order_diffs=self.base_diffs(outcome_rule),
+            replacements_base=base.replacements,
+            replacements_loo=base.replacements,
+            inherited_reverts_loo=base.inherited_reverts,
+            orphans_base=base.orphans,
+            orphans_loo=base.orphans,
+            baseline_matches_db=baseline.winner_uids == self.db_winner_uids,
+        )
+
+    def _unmoved(
+        self,
+        outcome_rule: OutcomeRule,
+        removed_present: frozenset[str],
+        won_db: bool,
+        guess_could_matter: bool,
+    ) -> AuctionCounterfactual:
+        """A removal that moves nothing (`Arbitration.unmoved_by`) and carries no quote:
+        the side without it is the baseline. What `analyse` would build, from the cache."""
+        first = self._unmoved_first.get(outcome_rule)
+        if first is None:
+            first = self._unmoved_first[outcome_rule] = AuctionCounterfactual(
+                **self._unmoved_fields(outcome_rule),
+                removed_present=removed_present,
+                solver_won_db=won_db,
+                filter_guess_could_matter=guess_could_matter,
+            )
+            return first
+        # The first one with this scenario's three fields. Every other field is the same
+        # by construction, and so is what the first has derived from them by now
+        # (`UNMOVED_SHARED`, cached as `Analysis.add` reads it). Copied, not constructed:
+        # `__init__` of 46 frozen fields costs more than all the rest of this path.
+        result = object.__new__(AuctionCounterfactual)
+        state = result.__dict__
+        state.update(first.__dict__)
+        for name in _SCENARIO_CACHED:
+            state.pop(name, None)
+        state["removed_present"] = removed_present
+        state["solver_won_db"] = won_db
+        state["filter_guess_could_matter"] = guess_could_matter
+        return result
+
+    def analyse(
+        self,
+        removed: frozenset[str],
+        *,
+        outcome_rule: OutcomeRule = "inherited",
+        counterfactual_quotes: Mapping[str, Quote] | None = None,
+    ) -> AuctionCounterfactual:
+        """This auction without every solver of `removed`, diffed against the baseline."""
+        removed_present = self.bidders & removed
+        if not removed_present and not counterfactual_quotes:
+            # Most scenarios in most auctions: the result every such scenario shares.
+            absent = self._absent.get(outcome_rule)
+            if absent is not None:
+                return absent
+        bundle = self.bundle
+        max_winners = self.max_winners
+        present = bool(removed_present)
+        executed_volume, executed_orders, executed_orders_all = self.executed_volume(
+            outcome_rule
+        )
+
+        # An auction holding a replacement quote is arbitrated even without a removed bidder.
+        quoted: frozenset[str] = frozenset()
+        if counterfactual_quotes:
+            quoted = frozenset(
+                uid for uid in self.order_uids if uid in counterfactual_quotes
+            )
+
+        if self.failures or (not present and not quoted):
+            if present:
+                return self._unarbitrated(
+                    outcome_rule, removed_present, bool(removed & self.db_winning_solvers)
+                )
+            # Without a removed bidder the result is the same for every scenario.
+            if outcome_rule not in self._absent:
+                self._absent[outcome_rule] = self._unarbitrated(
+                    outcome_rule, removed_present, False
+                )
+            return self._absent[outcome_rule]
+
+        valued = self.valued
+        by_uid = self.by_uid
+
+        # Quotes change only fees, so arbitration runs on `solutions` either way.
+        substituted: frozenset[str] = frozenset()
+        by_uid_loo = by_uid
+        if quoted and counterfactual_quotes:
+            loo_valued, substituted = _quote_overlay(
+                bundle, valued, quoted, counterfactual_quotes, self.weth, self.mode
+            )
+            if loo_valued is not None:
+                by_uid_loo = {v.bid.uid: v for v in loo_valued}
+
+        baseline = self.baseline
+        won_db = bool(removed & self.db_winning_solvers)
+        if not substituted and self.arbitration.unmoved_by(removed):
+            # Only guessed verdicts need the ranking without `removed`.
+            guess_could_matter = self.baseline_guess_could_matter or (
+                bool(baseline.proxied_uids)
+                and filter_guess_could_matter(
+                    self.arbitration.without(removed).ranking, max_winners
+                )
+            )
+            return self._unmoved(outcome_rule, removed_present, won_db, guess_could_matter)
+
+        loo, loo_reference_scores, verdicts_moved = self.arbitration.without(removed)
+        guess_could_matter = self.baseline_guess_could_matter or filter_guess_could_matter(
+            loo, max_winners
+        )
+        # With every verdict standing, nothing is un-filtered and nothing can be lost.
+        relaxed = un_filtered(baseline, loo, removed) if verdicts_moved else frozenset[int]()
+        # The same winners come in the same order (`score_order`), so everything that
+        # follows from the winners alone is the baseline's.
+        same_winners = loo.winner_uids == baseline.winner_uids
+
+        base = self.base_side(outcome_rule)
+        # Recorded quotes: the fee delta carries nothing of the quote.
+        loo_side = base if same_winners else self.side(loo, outcome_rule)
+
+        recharged: frozenset[str] = frozenset()
+        unclearable: frozenset[str] = frozenset()
+        shift_moves_winners = False
+        fee_recharges: dict[str, int] = {}
+        partner_recharges: dict[str, int] = {}
+        if substituted and counterfactual_quotes:
+            loo_replaced = self.side(loo, outcome_rule, by_uid_loo)
+            recharged = frozenset(
+                uid
+                for uid in substituted
+                if (outcome := loo_side.orders.get(uid)) is not None
+                and outcome.executed
+                and _charges_price_improvement(bundle.fee_context, uid)
+            )
+            for uid in recharged:
+                before, after = loo_side.orders[uid], loo_replaced.orders[uid]
+                if before.fee_native is not None and after.fee_native is not None:
+                    fee_recharges[uid] = after.fee_native - before.fee_native
+                    partner_recharges[uid] = (after.partner_fee_native or 0) - (
+                        before.partner_fee_native or 0
+                    )
+            unclearable, shifts = _limit_checks(
+                valued,
+                substituted,
+                {uid: outcome.solution_uid for uid, outcome in loo_side.orders.items()},
+                counterfactual_quotes,
+                bundle.fee_context,
+                bundle.native_prices,
+            )
+            unclearable &= recharged
+            shift_moves_winners = bool(shifts) and _shift_moves_winners(
+                self.solutions, removed, shifts, loo.winner_uids, max_winners
+            )
+
+        baseline_references = self.baseline_references
+        baseline_reference_scores = self.baseline_reference_scores
+
+        pressed = (
+            {s: uids for s, uids in self.baseline_by_solver.items() if s not in removed}
+            if same_winners
+            else pressed_winners(baseline, loo, removed)
+        )
+        margins_base = {
+            solver: reference_margin(baseline.winning_score, baseline_reference_scores[solver])
+            for solver in pressed
+        }
+        margins_loo = {
+            solver: reference_margin(loo.winning_score, loo_reference_scores[solver])
+            for solver in pressed
+        }
+        pressed_volume = sum(
+            by_uid[uid].valuation.order_volume_native[order.uid]
+            for solver, uids in pressed.items()
+            if margins_base[solver] != margins_loo[solver]
+            for uid in uids
+            for order in by_uid[uid].bid.orders
+        )
+
+        baseline_rewards: dict[str, SolverReward] = {}
+        loo_rewards: dict[str, SolverReward] = {}
+        cap_double_inherited = 0
+        cap_orphans: frozenset[int] = frozenset()
+        if self.mode == "score":
+            base_caps = self.base_caps
+            loo_caps = base_caps if same_winners else self.winner_caps(loo)
+            cap_double_inherited = base_caps.double_inherited + loo_caps.double_inherited
+            cap_orphans = loo_caps.orphans
+            baseline_rewards = self.baseline_rewards(outcome_rule)
+            loo_rewards = (
+                baseline_rewards
+                if same_winners and loo_reference_scores == baseline_reference_scores
+                else self.rewards(loo, loo_side, loo_caps, loo_reference_scores)
+            )
+
+        return AuctionCounterfactual(
+            auction_id=bundle.auction_id,
+            n_solutions=len(bundle.bids),
+            solver_present=present,
+            removed_present=removed_present,
+            solver_won_baseline=any(s.solver in removed for s in baseline.winners),
+            solver_won_db=won_db,
+            baseline_winner_uids=baseline.winner_uids,
+            loo_winner_uids=loo.winner_uids,
+            baseline_reference_scores=baseline_reference_scores,
+            loo_reference_scores=loo_reference_scores,
+            reference_margins_base=margins_base,
+            reference_margins_loo=margins_loo,
+            pressed_volume_base=pressed_volume,
+            runner_up_uids=runner_up_uids(baseline, baseline_references, removed),
+            baseline_rewards=baseline_rewards,
+            loo_rewards=loo_rewards,
+            cap_double_inherited=cap_double_inherited,
+            cap_orphans_loo=cap_orphans,
+            price_suspect_uids=self.suspects,
+            multi_pair_solutions=self.multi_pair,
+            multi_pair_filter_proxied=len(baseline.proxied_uids),
+            filter_guess_could_matter=guess_could_matter,
+            block_deadline=bundle.block_deadline,
+            executed_volume_base=executed_volume,
+            executed_orders_base=executed_orders,
+            executed_orders_all_base=executed_orders_all,
+            un_filtered_uids=relaxed,
+            un_filtered_winner_uids=relaxed & loo.winner_uids,
+            quote_carried_uids=substituted,
+            quote_substituted_uids=recharged,
+            quote_fee_recharges=fee_recharges,
+            quote_partner_fee_recharges=partner_recharges,
+            quote_limit_unclearable_uids=unclearable,
+            quote_shift_winner_set_changed=shift_moves_winners,
+            order_diffs=(
+                self.base_diffs(outcome_rule)
+                if same_winners
+                else diff_outcomes(base.orders, loo_side.orders)
+            ),
+            replacements_base=base.replacements,
+            replacements_loo=loo_side.replacements,
+            inherited_reverts_loo=loo_side.inherited_reverts,
+            orphans_base=base.orphans,
+            orphans_loo=loo_side.orphans,
+            baseline_matches_db=baseline.winner_uids == self.db_winner_uids,
+        )
+
+
 def analyse_auction(
     bundle: AuctionBundle,
     weth: str,
@@ -1064,255 +1687,17 @@ def analyse_auction(
     `solution_caps` (recorded winners) enables the capped-reward estimate. Under
     `counterfactual_quotes` bids, executions and ranking stay as recorded and only the fee
     is recomputed, reported as `quote_fee_recharge` and never added to the fee delta. This
-    applies where no removed solver bid too: the quote winner often does not bid on its order."""
-    settled = settled or {}
-    db_winner_uids = frozenset(b.uid for b in bundle.bids if b.is_winner)
-    removed_present = frozenset(b.solver for b in bundle.bids) & removed
-    present = bool(removed_present)
-    suspects = price_suspects(bundle.bids, bundle.native_prices)
-
-    valued, failures = build_solutions(
-        bundle.bids,
-        bundle.native_prices,
+    applies where no removed solver bid too: the quote winner often does not bid on its order.
+    Several scenarios over one auction share a `PreparedAuction` instead."""
+    return PreparedAuction(
+        bundle,
         weth,
         mode=mode,
-        fee_context=bundle.fee_context,
-    )
-
-    executed_volume = executed_orders = executed_orders_all = 0
-    if not failures:
-        executed_volume, executed_orders, executed_orders_all = recorded_executed_volume(
-            valued, db_winner_uids, outcome_rule=outcome_rule, settled=settled
-        )
-
-    # An auction holding a replacement quote is arbitrated even without a removed bidder.
-    quoted: frozenset[str] = frozenset()
-    if counterfactual_quotes:
-        quoted = frozenset(
-            order.uid
-            for bid in bundle.bids
-            for order in bid.orders
-            if order.uid in counterfactual_quotes
-        )
-
-    if failures or (not present and not quoted):
-        return AuctionCounterfactual(
-            auction_id=bundle.auction_id,
-            n_solutions=len(bundle.bids),
-            solver_present=present,
-            removed_present=removed_present,
-            solver_won_db=bool(removed & {b.solver for b in bundle.bids if b.is_winner}),
-            valuation_failures=tuple(sorted(failures.items())),
-            block_deadline=bundle.block_deadline,
-            price_suspect_uids=suspects,
-            executed_volume_base=executed_volume,
-            executed_orders_base=executed_orders,
-            executed_orders_all_base=executed_orders_all,
-        )
-
-    solutions = [v.solution for v in valued]
-    by_uid = {v.bid.uid: v for v in valued}
-
-    # Quotes change only fees, so arbitration runs on `solutions` either way.
-    substituted: frozenset[str] = frozenset()
-    by_uid_loo = by_uid
-    if quoted and counterfactual_quotes:
-        loo_valued, substituted = _quote_overlay(
-            bundle, valued, quoted, counterfactual_quotes, weth, mode
-        )
-        if loo_valued is not None:
-            by_uid_loo = {v.bid.uid: v for v in loo_valued}
-
-    baseline = arbitrate(solutions, max_winners)
-    # Baseline side: its baselines are the higher, so this never understates.
-    multi_pair = sum(1 for s in baseline.tested if len(s.pair_values) > 1)
-    loo = leave_one_out(solutions, removed, max_winners)
-    guess_could_matter = filter_guess_could_matter(
-        baseline, max_winners
-    ) or filter_guess_could_matter(loo, max_winners)
-    relaxed = un_filtered(baseline, loo, removed)
-
-    inherit = (
-        recorded_settlement_by_pair(by_uid, db_winner_uids, settled)
-        if outcome_rule == "inherited"
-        else None
-    )
-
-    base = side_outcomes(
-        [by_uid[s.solution_uid] for s in baseline.winners],
-        outcome_rule=outcome_rule,
+        max_winners=max_winners,
         settled=settled,
-        recorded_winner_uids=db_winner_uids,
-        inherit=inherit,
-    )
-    # Recorded quotes: the fee delta carries nothing of the quote.
-    loo_side = side_outcomes(
-        [by_uid[s.solution_uid] for s in loo.winners],
-        outcome_rule=outcome_rule,
-        settled=settled,
-        recorded_winner_uids=db_winner_uids,
-        inherit=inherit,
-    )
-
-    recharged: frozenset[str] = frozenset()
-    unclearable: frozenset[str] = frozenset()
-    shift_moves_winners = False
-    fee_recharges: dict[str, int] = {}
-    partner_recharges: dict[str, int] = {}
-    if substituted and counterfactual_quotes:
-        loo_replaced = side_outcomes(
-            [by_uid_loo[s.solution_uid] for s in loo.winners],
-            outcome_rule=outcome_rule,
-            settled=settled,
-            recorded_winner_uids=db_winner_uids,
-            inherit=inherit,
-        )
-        recharged = frozenset(
-            uid
-            for uid in substituted
-            if (outcome := loo_side.orders.get(uid)) is not None
-            and outcome.executed
-            and _charges_price_improvement(bundle.fee_context, uid)
-        )
-        for uid in recharged:
-            before, after = loo_side.orders[uid], loo_replaced.orders[uid]
-            if before.fee_native is not None and after.fee_native is not None:
-                fee_recharges[uid] = after.fee_native - before.fee_native
-                partner_recharges[uid] = (after.partner_fee_native or 0) - (
-                    before.partner_fee_native or 0
-                )
-        unclearable, shifts = _limit_checks(
-            valued,
-            substituted,
-            {uid: outcome.solution_uid for uid, outcome in loo_side.orders.items()},
-            counterfactual_quotes,
-            bundle.fee_context,
-            bundle.native_prices,
-        )
-        unclearable &= recharged
-        shift_moves_winners = bool(shifts) and _shift_moves_winners(
-            solutions, removed, shifts, loo.winner_uids, max_winners
-        )
-
-    baseline_references = compute_reference_outcomes(baseline, max_winners)
-    baseline_reference_scores = {
-        solver: ref.score for solver, ref in baseline_references.items()
-    }
-    loo_reference_scores = compute_reference_scores(loo, max_winners)
-
-    pressed = pressed_winners(baseline, loo, removed)
-    margins_base = {
-        solver: reference_margin(baseline.winning_score, baseline_reference_scores[solver])
-        for solver in pressed
-    }
-    margins_loo = {
-        solver: reference_margin(loo.winning_score, loo_reference_scores[solver])
-        for solver in pressed
-    }
-    pressed_volume = sum(
-        by_uid[uid].valuation.order_volume_native[order.uid]
-        for solver, uids in pressed.items()
-        if margins_base[solver] != margins_loo[solver]
-        for uid in uids
-        for order in by_uid[uid].bid.orders
-    )
-
-    baseline_rewards: dict[str, SolverReward] = {}
-    loo_rewards: dict[str, SolverReward] = {}
-    cap_double_inherited = 0
-    cap_orphans: frozenset[int] = frozenset()
-    if mode == "score":
-        # Auction-level cap facts (flat floor, exclusion) ride on every recorded winner's row.
-        caps: Mapping[int, SolutionCap] = solution_caps if solution_caps else {}
-        any_cap = next(iter(caps.values()), None)
-        lower_cap = any_cap.lower if any_cap else None
-        excluded = any_cap.excluded if any_cap else False
-        cap_by_pair = recorded_caps_by_pair(by_uid, db_winner_uids, caps)
-
-        base_caps = winner_caps(
-            [by_uid[s.solution_uid] for s in baseline.winners],
-            db_winner_uids, caps, cap_by_pair,
-        )
-        loo_caps = winner_caps(
-            [by_uid[s.solution_uid] for s in loo.winners],
-            db_winner_uids, caps, cap_by_pair,
-        )
-        cap_double_inherited = base_caps.double_inherited + loo_caps.double_inherited
-        cap_orphans = loo_caps.orphans
-
-        baseline_rewards = uncapped_rewards(
-            [
-                Win(
-                    s.solver,
-                    s.total,
-                    base.solution_executed[s.solution_uid],
-                    base_caps.by_uid[s.solution_uid],
-                    base_caps.penalty_by_uid[s.solution_uid],
-                )
-                for s in baseline.winners
-            ],
-            baseline_reference_scores,
-            lower_cap=lower_cap,
-            excluded=excluded,
-        )
-        loo_rewards = uncapped_rewards(
-            [
-                Win(
-                    s.solver,
-                    s.total,
-                    loo_side.solution_executed[s.solution_uid],
-                    loo_caps.by_uid[s.solution_uid],
-                    loo_caps.penalty_by_uid[s.solution_uid],
-                )
-                for s in loo.winners
-            ],
-            loo_reference_scores,
-            lower_cap=lower_cap,
-            excluded=excluded,
-        )
-
-    return AuctionCounterfactual(
-        auction_id=bundle.auction_id,
-        n_solutions=len(bundle.bids),
-        solver_present=present,
-        removed_present=removed_present,
-        solver_won_baseline=any(s.solver in removed for s in baseline.winners),
-        solver_won_db=bool(removed & {b.solver for b in bundle.bids if b.is_winner}),
-        baseline_winner_uids=baseline.winner_uids,
-        loo_winner_uids=loo.winner_uids,
-        baseline_reference_scores=baseline_reference_scores,
-        loo_reference_scores=loo_reference_scores,
-        reference_margins_base=margins_base,
-        reference_margins_loo=margins_loo,
-        pressed_volume_base=pressed_volume,
-        runner_up_uids=runner_up_uids(baseline, baseline_references, removed),
-        baseline_rewards=baseline_rewards,
-        loo_rewards=loo_rewards,
-        cap_double_inherited=cap_double_inherited,
-        cap_orphans_loo=cap_orphans,
-        price_suspect_uids=suspects,
-        multi_pair_solutions=multi_pair,
-        multi_pair_filter_proxied=len(baseline.proxied_uids),
-        filter_guess_could_matter=guess_could_matter,
-        block_deadline=bundle.block_deadline,
-        executed_volume_base=executed_volume,
-        executed_orders_base=executed_orders,
-        executed_orders_all_base=executed_orders_all,
-        un_filtered_uids=relaxed,
-        un_filtered_winner_uids=relaxed & loo.winner_uids,
-        quote_carried_uids=substituted,
-        quote_substituted_uids=recharged,
-        quote_fee_recharges=fee_recharges,
-        quote_partner_fee_recharges=partner_recharges,
-        quote_limit_unclearable_uids=unclearable,
-        quote_shift_winner_set_changed=shift_moves_winners,
-        order_diffs=diff_outcomes(base.orders, loo_side.orders),
-        replacements_base=base.replacements,
-        replacements_loo=loo_side.replacements,
-        inherited_reverts_loo=loo_side.inherited_reverts,
-        orphans_base=base.orphans,
-        orphans_loo=loo_side.orphans,
-        baseline_matches_db=baseline.winner_uids == db_winner_uids,
+        solution_caps=solution_caps,
+    ).analyse(
+        removed, outcome_rule=outcome_rule, counterfactual_quotes=counterfactual_quotes
     )
 
 
@@ -1561,8 +1946,10 @@ class Analysis:
             return
 
         self.auctions_with_solver += 1
-        self._add_quote_checks(result)
-        self.addresses_seen |= result.removed_present
+        if result.quote_carried_uids:  # every other quote field is a subset of it
+            self._add_quote_checks(result)
+        if not result.removed_present <= self.addresses_seen:
+            self.addresses_seen |= result.removed_present
         self.multi_pair_solutions += result.multi_pair_solutions
         self.multi_pair_filter_proxied += result.multi_pair_filter_proxied
         self.auctions_filter_guess_could_matter += result.filter_guess_could_matter
@@ -1571,20 +1958,21 @@ class Analysis:
         self.auctions_filter_relaxed += result.filter_relaxed
         self.auctions_newly_kept_won += bool(result.un_filtered_winner_uids)
         self.auctions_baseline_differs_from_db += not result.baseline_matches_db
-        self.surplus_base += result.surplus_base
-        self.surplus_loo += result.surplus_loo
-        if result.fees_complete:
+        diffs, base, loo = result.diff_totals, result.base_totals, result.loo_totals
+        self.surplus_base += diffs.surplus_base
+        self.surplus_loo += diffs.surplus_loo
+        if diffs.fees_complete:
             self.auctions_fees_counted += 1
-            self.protocol_and_partner_fees_base += result.protocol_and_partner_fees_base
-            self.protocol_and_partner_fees_loo += result.protocol_and_partner_fees_loo
-            self.partner_fees_base += result.partner_fees_base
-            self.partner_fees_loo += result.partner_fees_loo
+            self.protocol_and_partner_fees_base += diffs.fees_base
+            self.protocol_and_partner_fees_loo += diffs.fees_loo
+            self.partner_fees_base += diffs.partner_fees_base
+            self.partner_fees_loo += diffs.partner_fees_loo
             self.quote_fee_recharge += result.quote_fee_recharge
             self.quote_partner_fee_recharge += result.quote_fee_recharge_partner
         else:
             self.auctions_fees_incomplete += 1
-        self.rewards_base += result.rewards_base
-        self.rewards_loo += result.rewards_loo
+        self.rewards_base += base.rewards
+        self.rewards_loo += loo.rewards
         self.removed_reward_base += sum(
             r.uncapped_reward
             for solver, r in result.baseline_rewards.items()
@@ -1601,10 +1989,10 @@ class Analysis:
                 self.negative_reward_sum_loo += reward.uncapped_reward
 
         if self.capped_estimate:
-            base_capped = result.rewards_base_capped
-            loo_capped = result.rewards_loo_capped
-            base_budget = result.consistency_budget_base
-            loo_budget = result.consistency_budget_loo
+            base_capped = base.rewards_capped
+            loo_capped = loo.rewards_capped
+            base_budget = base.consistency_budget
+            loo_budget = loo.consistency_budget
             if (
                 base_capped is None
                 or loo_capped is None
@@ -1627,8 +2015,8 @@ class Analysis:
         self.orphans_base += len(result.orphans_base)
         self.orphans_loo += len(result.orphans_loo)
         self.auctions_runner_up += result.runner_up
-        self.reference_margin_base += result.reference_margin_base
-        self.reference_margin_loo += result.reference_margin_loo
+        self.reference_margin_base += base.reference_margin
+        self.reference_margin_loo += loo.reference_margin
         self.reference_margin_rises += result.reference_margin_rises
         self.reference_margin_falls += result.reference_margin_falls
         self.auctions_reference_margin_moved += bool(
@@ -1636,9 +2024,9 @@ class Analysis:
         )
         self.reference_margin_volume += result.pressed_volume_base
         if self.mode == "score":
-            above_base, above_loo = result.margin_above_cap_base, result.margin_above_cap_loo
-            paid_base = result.pressed_rewards_capped_base
-            paid_loo = result.pressed_rewards_capped_loo
+            above_base, above_loo = base.margin_above_cap, loo.margin_above_cap
+            paid_base = base.pressed_rewards_capped
+            paid_loo = loo.pressed_rewards_capped
             if above_base is None or above_loo is None or paid_base is None or paid_loo is None:
                 self.auctions_margin_cap_unknown += 1
             else:
@@ -1649,12 +2037,11 @@ class Analysis:
                 self.settled_margin_base += result.settled_margin_base
                 self.settled_margin_loo += result.settled_margin_loo
 
-        for diff in result.order_diffs:
-            self.orders_compared += 1
-            self.orders_only_with_solver += diff.only_with_solver
-            self.orders_only_without_solver += diff.only_without_solver
-            self.orders_unsettled_base += diff.unsettled_base
-            self.orders_lost_to_lateness += diff.late_base
+        self.orders_compared += len(result.order_diffs)
+        self.orders_only_with_solver += diffs.only_with_solver
+        self.orders_only_without_solver += diffs.only_without_solver
+        self.orders_unsettled_base += diffs.unsettled_base
+        self.orders_lost_to_lateness += diffs.late_base
 
         if result.anything_moved:
             self.changed.append(result)

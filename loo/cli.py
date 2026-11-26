@@ -498,23 +498,25 @@ def run_analyse(args: argparse.Namespace) -> int:
     never_bid: list[str] = []
     reduced: dict[str, list[str]] = {}
     skipped = False
-    for solver_run in window.runs:
-        report_analysis(
-            solver_run.analysis, args, solver_run.cow, solver_run.quote, solver_run.paid
-        )
-        if args.out:
-            path = report_path(
-                args.out, solver_run.solver, solver_run.analysis.outcome_rule
+    with run.sparse_gc():
+        for solver_run in window.runs:
+            paid = solver_run.paid  # sliced afresh on each access
+            report_analysis(
+                solver_run.analysis, args, solver_run.cow, solver_run.quote, paid
             )
-            run.write_report(path, window, solver_run)
-            print(f"\nfull report written to {path}", file=sys.stderr)
-        absent = run.absent_members(solver_run)
-        if absent and len(absent) == len(solver_run.members):
-            if solver_run.solver not in never_bid:
-                never_bid.append(solver_run.solver)
-        elif absent:
-            reduced.setdefault(solver_run.solver, absent)
-        skipped = skipped or bool(solver_run.analysis.auctions_skipped)
+            if args.out:
+                path = report_path(
+                    args.out, solver_run.solver, solver_run.analysis.outcome_rule
+                )
+                run.write_report(path, window, solver_run, paid)
+                print(f"\nfull report written to {path}", file=sys.stderr)
+            absent = run.absent_members(solver_run)
+            if absent and len(absent) == len(solver_run.members):
+                if solver_run.solver not in never_bid:
+                    never_bid.append(solver_run.solver)
+            elif absent:
+                reduced.setdefault(solver_run.solver, absent)
+            skipped = skipped or bool(solver_run.analysis.auctions_skipped)
 
     if never_bid:
         # All-zero deltas from a solver that never bid would read as "costs users nothing".

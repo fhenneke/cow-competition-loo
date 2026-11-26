@@ -269,12 +269,16 @@ Connection = PgConnection | Snapshot
 
 def as_int(value: Any) -> int:
     """`numeric` → `int`; a fractional value means a wrong column, so it raises."""
+    if isinstance(value, Decimal):  # the common case, so first
+        try:
+            integral = int(value)  # truncates; NaN raises here, Infinity OverflowError
+        except ValueError:
+            raise ValueError(f"expected an integral numeric, got {value}") from None
+        if integral != value:
+            raise ValueError(f"expected an integral numeric, got {value}")
+        return integral
     if isinstance(value, int):
         return value
-    if isinstance(value, Decimal):
-        if value != value.to_integral_value():
-            raise ValueError(f"expected an integral numeric, got {value}")
-        return int(value)
     raise TypeError(f"cannot convert {type(value).__name__} to int: {value!r}")
 
 

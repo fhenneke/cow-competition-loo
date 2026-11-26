@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from statistics import median
-from typing import Any
+from typing import Any, NamedTuple
 
 from .db import Connection, Row, as_int, cache_dir, chunked, fetch, settled
 from .fees import (
@@ -28,7 +28,7 @@ from .fees import (
 )
 from .primitives import usd_per_native, usd_reference_tokens
 from .rewards import SolverReward, Win
-from .valuation import Order
+from .valuation import Order, Side
 
 CHUNK_SIZE = 200
 
@@ -437,13 +437,19 @@ def load_auctions(
 
         executions: dict[tuple[int, int], list[Row]] = {}
         for row in execution_rows:
-            executions.setdefault(
-                (row["auction_id"], row["solution_uid"]), []
-            ).append(row)
+            key = (row["auction_id"], row["solution_uid"])
+            if key in executions:
+                executions[key].append(row)
+            else:
+                executions[key] = [row]
 
+        limits: dict[str, _Limit] = {}
         solutions: dict[int, list[Row]] = {}
         for row in solution_rows:
-            solutions.setdefault(row["auction_id"], []).append(row)
+            if row["auction_id"] in solutions:
+                solutions[row["auction_id"]].append(row)
+            else:
+                solutions[row["auction_id"]] = [row]
 
         lost = sorted(a for a in unpriced if a in solutions)
         if lost:
@@ -468,7 +474,7 @@ def load_auctions(
                 continue
 
             bids = tuple(
-                _build_bid(row, executions.get((auction_id, row["uid"]), []))
+                _build_bid(row, executions.get((auction_id, row["uid"]), []), limits)
                 for row in solutions[auction_id]
             )
 
@@ -556,28 +562,50 @@ def _load_fee_contexts(
     }
 
 
-def _build_bid(row: Row, execution_rows: list[Row]) -> Bid:
+class _Limit(NamedTuple):
+    """An order's own fields, joined from `stg_backend_data__orders` by uid: the same in
+    every execution of it, so converted once per chunk."""
+
+    sell_token: str
+    buy_token: str
+    sell_amount: int
+    buy_amount: int
+    side: Side
+    partially_fillable: bool
+
+
+def _build_bid(row: Row, execution_rows: list[Row], limits: dict[str, _Limit]) -> Bid:
     orders: list[Order] = []
 
     for execution in execution_rows:
         uid = execution["order_uid"]
-        if execution["sell_token"] is None:
-            raise MissingOrderError(
-                f"auction {row['auction_id']} solution {row['uid']}: auction order "
-                f"{uid} is not in stg_backend_data__orders"
+        limit = limits.get(uid)
+        if limit is None:
+            if execution["sell_token"] is None:
+                raise MissingOrderError(
+                    f"auction {row['auction_id']} solution {row['uid']}: auction order "
+                    f"{uid} is not in stg_backend_data__orders"
+                )
+            limit = limits[uid] = _Limit(
+                execution["sell_token"],
+                execution["buy_token"],
+                as_int(execution["sell_amount"]),
+                as_int(execution["buy_amount"]),
+                execution["kind"],
+                bool(execution["partially_fillable"]),
             )
 
         orders.append(
             Order(
                 uid=uid,
-                sell_token=execution["sell_token"],
-                buy_token=execution["buy_token"],
-                sell_amount=as_int(execution["sell_amount"]),
-                buy_amount=as_int(execution["buy_amount"]),
+                sell_token=limit.sell_token,
+                buy_token=limit.buy_token,
+                sell_amount=limit.sell_amount,
+                buy_amount=limit.buy_amount,
                 executed_sell=as_int(execution["executed_sell"]),
                 executed_buy=as_int(execution["executed_buy"]),
-                side=execution["kind"],
-                partially_fillable=bool(execution["partially_fillable"]),
+                side=limit.side,
+                partially_fillable=limit.partially_fillable,
             )
         )
 

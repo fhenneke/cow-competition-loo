@@ -87,9 +87,9 @@ for solver_run in window.runs:
 The run waits on the analytics DB for ~96% of its time, so runtime is the DB's and varies
 2x or more by day: one mainnet day took 42 s of wall time and 1.7 s of CPU for one solver
 (2026-09-15). A month of mainnet with every solver removed in turn has taken 12–25
-minutes on different days, two outcome rules about 1.4x one. Arbitration adds ~8 s of CPU
-per (solver, rule) per month. Measure before promising: `--limit 3000` over one day gives
-the DB's current rate.
+minutes on different days, two outcome rules about 1.4x one. Each further (solver, rule)
+adds about 1.5 s of CPU per month (2026-11-26). Measure before promising: `--limit 3000`
+over one day gives the DB's current rate.
 
 #### Snapshots: a rerun of a past window needs no DB
 
@@ -101,9 +101,10 @@ query, a different `--solver` set, `--limit` or `--quotes` therefore reads only 
 queries it does not share with earlier runs, from the DB, and adds them; a run that
 replays everything opens no connection. The last stderr line counts the queries replayed,
 read and kept, and read but not kept. Measured on mainnet, 2026-11-03..17 with every
-solver removed in turn (69,312 auctions, 29 scenarios, 2026-11-26): the first run took
-22:52 of wall time and 7:58 of CPU, the replay 7:27 of wall time and 7:24 of CPU, all of
-it the analysis itself. Its snapshot is 96 MB in 3,554 files and loads in 3.5 s.
+solver removed in turn (69,312 auctions, 29 scenarios, 2026-11-26): the replay took 43 s
+of wall time, all of it the analysis itself, and peaked at 2.2 GB; a first run adds the
+wait on the DB, about 15 minutes that day. Its snapshot is 96 MB in 3,554 files and loads
+in 3.5 s.
 
 Not kept, and so read again on every run until the DB settles them: the rewards of
 auctions not yet accounted, the weekly reward marts of periods not yet paid out,

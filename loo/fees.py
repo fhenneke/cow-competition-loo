@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
+from functools import lru_cache
 from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol
 
 from .primitives import ONE_ETH, ceil_div
@@ -63,8 +64,10 @@ def mul_f64(amount: int, factor: float) -> int:
     return amount * round(factor * 1e18) // ONE_ETH
 
 
+@lru_cache(maxsize=1 << 16)
 def quote_fee(gas_amount: float, gas_price: float, sell_token_price: float) -> int:
-    """`dto/quote.rs:16`: exact rational, floored; widen before dividing."""
+    """`dto/quote.rs:16`: exact rational, floored; widen before dividing. Cached: an
+    order's quote is read again in every chunk of auctions it trades in."""
     if sell_token_price == 0.0:
         raise FeeError("quote has a zero sell token price")
     value = Fraction(gas_amount) * Fraction(gas_price) / Fraction(sell_token_price)
@@ -226,8 +229,7 @@ def policy_fees(
     return tuple(fees)
 
 
-@dataclass(frozen=True)
-class FeeSplit:
+class FeeSplit(NamedTuple):
     total: int
     """Every policy: what enters the score; the DB's `protocol_fee_native`."""
     partner: int

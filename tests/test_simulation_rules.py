@@ -25,6 +25,8 @@ from loo.fees import Quote
 from loo.quotes import Estimate, Pricing, QuoteRequest, StreamTake, UnrecordedStreamError
 from loo.valuation import Order
 from loo.winner_selection import (
+    Arbitration,
+    Ranking,
     Solution,
     arbitrate,
     compute_reference_scores,
@@ -157,6 +159,46 @@ def test_arbitration_differential(seed: int) -> None:
                         winner_pairs=s.winner_pairs) for s in solutions]
         lit_kept = {s.solution_uid for s in arbitrate(lit, max_winners).ranked}
         assert {s.solution_uid for s in ranking.ranked} <= lit_kept
+        check_rearbitration(solutions, ranking, max_winners, rng)
+
+
+def check_rearbitration(
+    solutions: list[Solution], ranking: Ranking, max_winners: int, rng: random.Random
+) -> None:
+    """`Arbitration.without` is `arbitrate` of the rest, whatever it reuses, for every
+    single removal and a few joint ones; `unmoved_by` claims nothing moved only if so."""
+    arbitration = Arbitration(solutions, max_winners)
+    solvers = sorted({s.solver for s in solutions})
+    removals = [frozenset({s}) for s in solvers] + [
+        frozenset(rng.sample(solvers, rng.randint(1, len(solvers)))) for _ in range(3)
+    ] + [frozenset({"ff" * 20})]
+    for removed in removals:
+        fresh = arbitrate([s for s in solutions if s.solver not in removed], max_winners)
+        again = arbitration.without(removed)
+        loo = again.ranking
+        assert [s.solution_uid for s in loo.ranked] == [s.solution_uid for s in fresh.ranked]
+        assert [s.solution_uid for s in loo.filtered_out] == [
+            s.solution_uid for s in fresh.filtered_out]
+        assert loo.winner_uids == fresh.winner_uids
+        assert loo.baselines == fresh.baselines
+        assert loo.proxied_uids == fresh.proxied_uids
+        assert again.reference_scores == compute_reference_scores(fresh, max_winners)
+        assert list(again.reference_scores) == list(compute_reference_scores(fresh, max_winners))
+        kept = {s.solution_uid for s in ranking.ranked} - {
+            s.solution_uid for s in solutions if s.solver in removed}
+        if not again.verdicts_moved:
+            assert {s.solution_uid for s in fresh.ranked} == kept
+        lowered = any(fresh.baselines.get(p, 0) != v for p, v in ranking.baselines.items())
+        won = any(s.solver in removed for s in ranking.winners)
+        set_reference = any(
+            s.solver in removed
+            for ref in arbitration.references.values()
+            for s in ranking.ranked if s.solution_uid in ref.setter_uids)
+        assert arbitration.unmoved_by(removed) == (not (lowered or won or set_reference))
+        if arbitration.unmoved_by(removed):
+            assert not again.verdicts_moved
+            assert fresh.winner_uids == ranking.winner_uids
+            assert again.reference_scores == compute_reference_scores(ranking, max_winners)
 
 
 # --- the quote competition ------------------------------------------------------------

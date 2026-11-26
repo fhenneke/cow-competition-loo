@@ -1,25 +1,29 @@
 """Leave-one-out analysis of removal scenarios over one window (`analyse` CLI core).
 
-All scenarios and outcome rules share one extraction pass, which dominates cost.
+All scenarios and outcome rules share one extraction pass and, per auction, one valuation
+and baseline arbitration (`PreparedAuction`); each scenario adds only its side without
+the removed solvers.
 """
 
 from __future__ import annotations
 
+import gc
 import json
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from decimal import Decimal
 from types import MappingProxyType
-from typing import Any, NamedTuple, cast
+from typing import Any, Literal, NamedTuple, cast
 
 from . import ch, extract, payouts, quotes
-from .aggregate import REPORT_FORMAT, SIGN_CONVENTION_ID, eth
+from .aggregate import REPORT_FORMAT, SIGN_CONVENTION_ID
 from .counterfactual import (
     OUTCOME_RULE,
     Analysis,
     AuctionCounterfactual,
     OutcomeRule,
-    analyse_auction,
+    PreparedAuction,
 )
 from .db import Connection, Snapshot
 from .fees import Quote
@@ -132,6 +136,23 @@ class WindowAnalysis:
     """Excluded before arbitration: no solver competition to re-run."""
 
 
+@contextmanager
+def sparse_gc(young: int = 100_000) -> Generator[None]:
+    """Run the cyclic garbage collector every `young` net allocations instead of 700.
+
+    An analysis keeps millions of objects to its end and makes next to no cyclic garbage
+    (reference counting frees the rest), and at the default the collector re-scanned
+    them so often that it took 12 s of a 67 s two-week mainnet replay (2026-11-26).
+    Collections still run, so a cycle is still freed, only later."""
+    thresholds = gc.get_threshold()
+    gc.set_threshold(young, *thresholds[1:])
+    try:
+        yield
+    finally:
+        gc.set_threshold(*thresholds)
+
+
+@sparse_gc()
 def analyse_window(
     conn: Connection,
     solvers: Sequence[str],
@@ -288,17 +309,20 @@ def analyse_window(
     for bundle in extract.load_auctions(conn, auction_ids, fast_path=window.fast_path):
         with_bids.append(bundle.auction_id)
         deadlines.append(bundle.block_deadline)
+        # Valued and arbitrated once; each run adds only its side without the removal.
+        prepared = PreparedAuction(
+            bundle,
+            weth,
+            mode=mode,
+            max_winners=max_winners,
+            settled=settled.get(bundle.auction_id, {}),
+            solution_caps=caps.get(bundle.auction_id, {}),
+        )
         for run in runs:
             run.analysis.add(
-                analyse_auction(
-                    bundle,
-                    weth,
+                prepared.analyse(
                     run.addresses,
-                    mode=mode,
-                    max_winners=max_winners,
                     outcome_rule=run.analysis.outcome_rule,
-                    settled=settled.get(bundle.auction_id, {}),
-                    solution_caps=caps.get(bundle.auction_id, {}),
                     counterfactual_quotes=run.quote_substitutions,
                 )
             )
@@ -317,19 +341,13 @@ def analyse_window(
     )
     for run in runs:
         run.recorded = recorded
-    for label, _, addresses, _ in resolved:
-        rewards = recorded.for_addresses(addresses)
-        unaccounted = rewards.unaccounted_any
-        emit(
-            f"recorded rewards {label!r}: {eth(rewards.total)} ETH over "
-            f"{rewards.auctions} auctions"
-            + (f", {unaccounted} not yet accounted" if unaccounted else "")
-            + (
-                f", {len(rewards.mismatches)} int-table/mart mismatches"
-                if rewards.mismatches
-                else ""
-            )
-        )
+    # Each scenario's own totals are in its report: slicing one out costs as much as the
+    # report's own slice, so it is not done twice just to log it.
+    emit(
+        f"recorded rewards for {len(resolved)} scenarios over {len(recorded.auctions)} "
+        f"auctions"
+        + (f", {len(recorded.mismatches)} int-table/mart mismatches" if recorded.mismatches else "")
+    )
 
     if mode == "score":
         # One rate query for all runs; the table must be touched sparingly.
@@ -394,17 +412,39 @@ _AUCTION_PROPERTIES = (
 )
 
 
+_REPORTED: dict[type[Any], tuple[tuple[str, ...], bool]] = {}
+"""Per dataclass, its reported field names and whether that is every field; looked up
+once rather than per row."""
+
+
 def _fields_and_properties(obj: Any, properties: Sequence[str]) -> dict[str, Any]:
-    data = {
-        f.name: getattr(obj, f.name)
-        for f in fields(obj)
-        if f.metadata.get("report", True)
-    }
+    kind: type[Any] = obj.__class__
+    known = _REPORTED.get(kind)
+    if known is None:
+        every = fields(obj)
+        names = tuple(f.name for f in every if f.metadata.get("report", True))
+        known = _REPORTED[kind] = (names, len(names) == len(every))
+    names, everything = known
+    # A dataclass keeps its fields in the instance dict, in declaration order; when
+    # every one is reported and nothing is cached beside them, that dict is the row.
+    state = obj.__dict__
+    data = (
+        dict(state)
+        if everything and len(state) == len(names)
+        else {name: state[name] for name in names}
+    )
     data.update({name: getattr(obj, name) for name in properties})
     return data
 
 
+_BY_TYPE: dict[type[Any], Callable[[Any], Any]] = {Decimal: str, frozenset: sorted, set: sorted}
+"""`_json_default` for the exact types it meets most, looked up before the general tests."""
+
+
 def _json_default(value: Any) -> Any:
+    convert = _BY_TYPE.get(value.__class__)
+    if convert is not None:
+        return convert(value)
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, frozenset | set):
@@ -491,9 +531,16 @@ def _quote_window_payload(quote_window: QuoteWindow) -> dict[str, Any]:
     }
 
 
-def report_payload(window: WindowAnalysis, run: SolverRun) -> dict[str, Any]:
+def report_payload(
+    window: WindowAnalysis,
+    run: SolverRun,
+    paid: payouts.RecordedRewards | Literal["slice"] | None = "slice",
+) -> dict[str, Any]:
+    """The report; `changed` still holds the results, which `write_report` turns into
+    rows one at a time. `paid` is `run.paid`, sliced here unless the caller has it."""
     analysis = run.analysis
-    paid = run.paid
+    if paid == "slice":
+        paid = run.paid
     payload: dict[str, Any] = {
         "format": REPORT_FORMAT,
         "sign_convention": SIGN_CONVENTION_ID,
@@ -511,13 +558,31 @@ def report_payload(window: WindowAnalysis, run: SolverRun) -> dict[str, Any]:
         ),
     }
     payload.update(_fields_and_properties(analysis, _ANALYSIS_PROPERTIES))
-    payload["changed"] = [
-        _fields_and_properties(result, _AUCTION_PROPERTIES)
-        for result in analysis.changed
-    ]
     return payload
 
 
-def write_report(path: str, window: WindowAnalysis, run: SolverRun) -> None:
+def write_report(
+    path: str,
+    window: WindowAnalysis,
+    run: SolverRun,
+    paid: payouts.RecordedRewards | Literal["slice"] | None = "slice",
+) -> None:
+    """One top-level key per line and one changed auction per line, written as it is
+    encoded. `indent` would make `json` fall back to its pure-Python encoder, several
+    times slower on a large report."""
+    encode = json.JSONEncoder(default=_json_default).encode
+    items = list(report_payload(window, run, paid).items())
     with open(path, "w") as handle:
-        json.dump(report_payload(window, run), handle, indent=2, default=_json_default)
+        handle.write("{\n")
+        for index, (key, value) in enumerate(items):
+            comma = "," if index < len(items) - 1 else ""
+            if key != "changed":
+                handle.write(f"  {encode(key)}: {encode(value)}{comma}\n")
+                continue
+            results = cast("list[AuctionCounterfactual]", value)
+            handle.write(f"  {encode(key)}: [")
+            for row, result in enumerate(results):
+                handle.write(",\n    " if row else "\n    ")
+                handle.write(encode(_fields_and_properties(result, _AUCTION_PROPERTIES)))
+            handle.write(f"\n  ]{comma}\n" if results else f"]{comma}\n")
+        handle.write("}\n")

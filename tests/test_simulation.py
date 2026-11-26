@@ -13,8 +13,15 @@ from sim.harness import Sim, simulate
 from sim.oracle import Bid
 from sim.world import World, generate
 
-from loo import aggregate, extract, validate
-from loo.counterfactual import Analysis, AuctionCounterfactual, analyse_auction, leave_one_out
+from loo import aggregate, extract, run, validate
+from loo.counterfactual import (
+    UNMOVED_SHARED,
+    Analysis,
+    AuctionCounterfactual,
+    PreparedAuction,
+    analyse_auction,
+    leave_one_out,
+)
 from loo.extract import AuctionBundle
 from loo.valuation import build_solutions
 from loo.winner_selection import (
@@ -188,7 +195,8 @@ def check_record_reproduced(world: World, bundle: AuctionBundle) -> Ranking:
 
 
 def check_counterfactual(
-    world: World, bundle: AuctionBundle, removed: frozenset[str], rule: str
+    world: World, bundle: AuctionBundle, removed: frozenset[str], rule: str,
+    shared: dict[int, PreparedAuction],
 ) -> AuctionCounterfactual:
     auction = next(a for a in world.auctions if a.auction_id == bundle.auction_id)
     settled = {u: extract.Settlement(s.landed, s.in_time) for u, s in auction.settlements.items()}
@@ -200,6 +208,16 @@ def check_counterfactual(
     result = analyse_auction(bundle, world.weth, removed, max_winners=world.max_winners,
                              outcome_rule=rule,  # type: ignore[arg-type]
                              settled=settled, solution_caps=caps)
+    # `analyse_window` shares one preparation across every scenario and rule of an
+    # auction, and copies one unmoved result, with what it derived, into the next.
+    if bundle.auction_id not in shared:
+        shared[bundle.auction_id] = PreparedAuction(
+            bundle, world.weth, max_winners=world.max_winners, settled=settled,
+            solution_caps=caps)
+    again = shared[bundle.auction_id].analyse(removed, outcome_rule=rule)  # type: ignore[arg-type]
+    assert again == result
+    for name in UNMOVED_SHARED:
+        assert getattr(again, name) == getattr(result, name), name
     present = any(s.solver in removed for s in auction.solutions)
     assert result.solver_present == present
     assert result.n_solutions == len(auction.solutions)
@@ -389,6 +407,23 @@ def group_addresses(world: World, entry: str) -> frozenset[str]:
     return out
 
 
+def check_report_is_direct(
+    world: World, tmp_path: Path, ids: list[int], payload: dict[str, object], direct: Analysis
+) -> None:
+    """The CLI shares each auction's valuation, arbitration and unmoved results across its
+    scenarios; the report must be what one fresh `analyse_auction` per auction gives,
+    in every analysis field and every changed auction."""
+    solver_run = run.SolverRun(solver=direct.solver, addresses=direct.addresses, matches=[],
+                               members=(), analysis=direct)
+    window = run.WindowAnalysis(world.network, world.start, world.end, ids, [solver_run])
+    path = tmp_path / "direct" / "report.json"
+    path.parent.mkdir(exist_ok=True)
+    run.write_report(str(path), window, solver_run, None)
+    fresh = json.loads(path.read_text())
+    for key in fresh.keys() - {"cow", "paid", "quote", "fast_path_auctions"}:
+        assert payload[key] == fresh[key], key
+
+
 def test_world(seed: int, tmp_path: Path) -> None:
     exercise(generate(seed), tmp_path, random.Random(seed ^ 0x5EED))
 
@@ -411,11 +446,13 @@ def exercise(
 
         entries = entries or scenarios(world, rng)
         removals = {e: group_addresses(world, e) for e in entries}
+        shared: dict[int, PreparedAuction] = {}
         direct: dict[tuple[str, str], Analysis] = {}
         for entry, addresses in removals.items():
             by_rule: dict[str, list[AuctionCounterfactual]] = {}
             for rule in ("inherited", "assume-settled"):
-                results = [check_counterfactual(world, b, addresses, rule) for b in bundles]
+                results = [check_counterfactual(world, b, addresses, rule, shared)
+                           for b in bundles]
                 by_rule[rule] = results
                 for exclude in (False, True):
                     analysis = Analysis(solver=entry, addresses=addresses,
@@ -456,6 +493,7 @@ def exercise(
             assert report.window_volume == analysis.window_volume_base
             assert payload["price_suspect_auctions"] == analysis.price_suspect_auctions
             assert payload["auctions_with_solver"] == analysis.auctions_with_solver
+            check_report_is_direct(world, tmp_path, ids, payload, analysis)
         cli_checks.check_reports_and_compare(sim, world, tmp_path, entries, direct, result.code)
         cli_checks.check_validate(sim, world, tmp_path, bundles)
         cli_checks.check_validate_rewards(sim, world, tmp_path)

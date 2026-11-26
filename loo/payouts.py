@@ -138,6 +138,10 @@ def _sql_time(moment: datetime) -> str:
     return f"{moment:%Y-%m-%d %H:%M:%S}"
 
 
+_ZERO = Decimal(0)
+_WEI = Decimal(1)
+
+
 def _decimal(value: float | Decimal | None) -> Decimal:
     """Double precision through `str`, as `extract.load_conversion_rates` does."""
     if value is None:
@@ -333,7 +337,7 @@ class WeeklyPeriod:
         if not reward or not total:
             return {}
         return {
-            auction: (reward * _decimal(metric) / total).quantize(Decimal(1))
+            auction: (reward * _decimal(metric) / total).quantize(_WEI)
             for auction, metric in self.window.get(solver, {}).items()
         }
 
@@ -374,7 +378,9 @@ class RecordedWindow:
         def add(index: int, amounts: Mapping[int, Decimal]) -> None:
             for auction, amount in amounts.items():
                 if amount:
-                    values = per_auction.setdefault(auction, [Decimal(0)] * 3)
+                    values = per_auction.get(auction)
+                    if values is None:
+                        values = per_auction[auction] = [_ZERO, _ZERO, _ZERO]
                     values[index] += amount
 
         for solver in chosen:
