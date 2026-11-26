@@ -1,16 +1,30 @@
-"""Mirrors `services/crates/winner-selection/src/primitives.rs`.
+"""Mirrors `services/crates/winner-selection/src/primitives.rs` and the chain vocabulary
+of `services/crates/chain-types` (EVM and Solana).
 
-Addresses and order uids are lowercase hex *without* `0x` (as `encode(col, 'hex')`).
+Addresses and order uids are lowercase hex *without* `0x` (as `encode(col, 'hex')`). On
+Solana they are 32 bytes (pubkeys and intent hashes), on the EVM networks 20 and 56.
 """
 
 from __future__ import annotations
 
 from decimal import Decimal
 
+SOLANA = "solana"
+"""The one non-EVM network: its tables, ids and native-price scale differ
+([docs](../docs/analytics-db.md#solana))."""
+
 # `Address::repeat_byte(0xee)` — the sentinel for the native token.
 NATIVE_TOKEN = "ee" * 20
 
+# `chain_types::solana::NATIVE_SOL`: the System Program id, the buy token of an order
+# paid out in native SOL.
+NATIVE_SOL = "00" * 32
+
 ONE_ETH = 10**18
+
+# The native-token decimals where they are not 18: native amounts are in the chain's
+# smallest unit (wei, lamports), and a whole token is 10**decimals of them.
+NATIVE_DECIMALS = {SOLANA: 9}
 
 # Verified against services contracts/src/main.rs. Add only verified addresses:
 # a wrong one is worse than the KeyError.
@@ -26,6 +40,7 @@ WRAPPED_NATIVE_TOKEN = {
     "ink": "4200000000000000000000000000000000000006",  # WETH
     "linea": "e5d7c2a44ffddf6b295a15c148167daaaf5cf34f",  # WETH
     "plasma": "6100e367285b01f48d07953803a2d8dca5d19873",  # WXPL
+    SOLANA: "069b8857feab8184fb687f634618c035dac439dc1aeb3b5598a0f00000000001",  # wSOL
 }
 
 # Stablecoin address -> decimals; their auction native prices imply USD/native (median).
@@ -80,6 +95,10 @@ USD_REFERENCE_TOKENS: dict[str, dict[str, int]] = {
         "5d3a1ff2b6bab83b63cd9ad0787074081a52ef34": 18,  # dollar token
         "6695c0f8706c5ace3bdf8995073179cca47926dc": 18,  # dollar token
     },
+    SOLANA: {
+        "c6fa7af3bedbad3a3d65f36aabc97431b1bbe4c2d2f6e0e47ca60203452f5d61": 6,  # USDC
+        "ce010e60afedb22717bd63192f54145a3f965a33bb83134e31593825f29c16eb": 6,  # USDT
+    },
 }
 
 # `crates/configs/src/autopilot/run_loop.rs:11`
@@ -110,14 +129,59 @@ def usd_reference_tokens(network: str) -> dict[str, int]:
         ) from None
 
 
-def usd_per_native(price: int, decimals: int) -> Decimal:
-    """USD per native token implied by a stablecoin's native price. Display only."""
-    return Decimal(10) ** (36 - decimals) / Decimal(price)
+def native_decimals(network: str) -> int:
+    return NATIVE_DECIMALS.get(network, 18)
 
 
-def as_erc20(token: str, weth: str) -> str:
-    """Map the native token sentinel to its wrapped ERC20 (`primitives.rs:9`)."""
-    return weth if token == NATIVE_TOKEN else token
+def native_price_scale(network: str) -> int:
+    """What a network's recorded native prices are multiplied by to reach the 1e18
+    denominator `price_in_eth` divides by: 1 on the EVM networks, 1e9 on Solana, whose
+    prices are lamports per atom × 1e9 (`NATIVE_PRICE_DENOMINATOR`). Exact, since
+    `amount * (price * 1e9) // 1e18 == amount * price // 1e9`, so every native amount
+    stays in the chain's own unit."""
+    return 10 ** (18 - native_decimals(network))
+
+
+def usd_per_native(price: int, decimals: int, native: int = 18) -> Decimal:
+    """USD per whole native token implied by a stablecoin's native price on the 1e18
+    denominator (`native_price_scale`), for a native token of `native` decimals. Display
+    only."""
+    return Decimal(10) ** (18 + native - decimals) / Decimal(price)
+
+
+def canonical_token(token: str, wrapped: str) -> str:
+    """Map the native-token sentinel to the wrapped token whose pair it trades
+    (`ChainTypes::canonical_token`, `primitives.rs:9`). The two sentinels differ in
+    width, so neither can be mistaken for a token of the other chain."""
+    return wrapped if token in (NATIVE_TOKEN, NATIVE_SOL) else token
+
+
+_BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def base58_to_hex(text: str) -> str:
+    """A Solana address as the DB's `encode(col, 'hex')` spells it. Raises `ValueError`
+    on a character outside the alphabet."""
+    number = 0
+    for char in text:
+        digit = _BASE58.find(char)
+        if digit < 0:
+            raise ValueError(f"{text!r} is not base58")
+        number = number * 58 + digit
+    body = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
+    leading = len(text) - len(text.lstrip("1"))  # each leading '1' is a zero byte
+    return (b"\0" * leading + body).hex()
+
+
+def hex_to_base58(address: str) -> str:
+    """The canonical Solana rendering of a hex address: the catalogue's and explorers'."""
+    raw = bytes.fromhex(address)
+    number = int.from_bytes(raw, "big")
+    digits = ""
+    while number:
+        number, digit = divmod(number, 58)
+        digits = _BASE58[digit] + digits
+    return "1" * (len(raw) - len(raw.lstrip(b"\0"))) + digits
 
 
 def price_in_eth(price: int, amount: int) -> int:

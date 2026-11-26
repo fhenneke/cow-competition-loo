@@ -38,8 +38,9 @@ comfortably covers a read transaction held open through hours of ClickHouse work
 One database per network, models in schema `dbt`: `prod_mainnet`, `prod_xdai`,
 `prod_base`, `prod_arbitrum-one`, `prod_avalanche`, `prod_polygon`, `prod_bnb`,
 `prod_ink`, `prod_linea`, `prod_plasma`, `prod_lens` (stopped 2026-03-03), `prod_sepolia`,
-each with a `staging_*` counterpart. Raw backend tables are mirrored in
-`raw_prod_<network>`. `prod_mainnet` also has personal dev schemas; use `dbt`.
+`prod_solana` (from 2026-10-27, its own model names: [Solana](#solana)), each with a
+`staging_*` counterpart. Raw backend tables are mirrored in `raw_prod_<network>`.
+`prod_mainnet` also has personal dev schemas; use `dbt`.
 
 ## Tables
 
@@ -407,3 +408,54 @@ Materialised tables carry no SQL in the DB; the models are in `~/Work/Code/cow-d
 (`cow_dagster/cow_dbt/models/solver_accounting/{staging,intermediary,marts}/`, seeds in
 `cow_dagster/cow_dbt/seeds/solver_accounting/`). `find ~/Work/Code/cow-dagster -name
 "<table>.sql"`. Check the checkout against `origin/main` first.
+
+## Solana
+
+`prod_solana`, live since 2026-10-27, asks the same questions of `solana_`-prefixed
+models: `extract.SOLANA_SQL` maps each EVM query to its Solana counterpart, which returns
+the same columns, and `extract.sql_for` picks by the connection's network
+(`db.network_of`). Solana runs the same arbitrator (services `crates/autopilot-svm`
+instantiates `winner-selection` for Solana; production `max-winners = 20`). What differs:
+
+- **Tables.** `stg_solana_backend_data__*`, `int_solana_backend_data__*` and
+  `fct_solana_*`, with the raw tables in `raw_prod_solana`. Where `loo` reads them, the
+  columns are the EVM ones except as below.
+- **The window.** `stg_solana_backend_data__competition_auctions` holds only auctions
+  with a winner, and its `auction_timestamp` is the time of the deadline slot, so the
+  window is read from it directly; on 2026-11-26 every raw auction with a bid was in it.
+  There are no blocks: `deadline_slot` stands where `block_deadline` does.
+- **Native prices** are lamports per atom × 1e9 (`NATIVE_PRICE_DENOMINATOR` in services
+  `crates/chain-types`), not wei × 1e18. `extract.fetch_prices` multiplies them by 1e9 onto
+  the 1e18 denominator, which is exact, floor included (`a·(p·1e9)/1e18 = a·p/1e9`), so
+  every native amount, score and reward stays in lamports. Read Solana prices only through
+  it: a missed scale is a factor of 1e9 that raises nothing.
+- **Ids** are 32 bytes: pubkeys for tokens and solvers, the intent hash for orders. An
+  order paid out in native SOL buys the System Program id `00…00` (`NATIVE_SOL`, about 30%
+  of orders), priced like wSOL at 1e9 and claiming the wSOL pair (`canonical_token`).
+- **Solvers** are catalogued in `dune_data__solana_solvers` with base58 addresses, which
+  SQL cannot decode: `loo` reads the catalogue and every window bidder's activity and
+  matches in Python. `--solver` takes a name, a base58 address or hex; `--all-solvers`
+  names an uncatalogued bidder in base58.
+- **No fees.** autopilot-svm can apply protocol-fee policies, but production configures
+  none (the backend's `solana.fee_policies` is empty, 2026-11-26), and Solana orders carry
+  no partner fee. No fee-policy table reaches the analytics DB, so `loo` takes every fee
+  as known to be zero. That is exact only while the backend table stays empty; a fee
+  would show in `validate` as a recorded score above the recomputed surplus.
+- **Not there:** the fast path, JIT owners, `proposed_solution_data` (so no
+  `--cross-check-surplus`) and quote data in ClickHouse (so no `--quotes`).
+- **Rewards.** `fct_solana_solver_rewards_per_auction` is the EVM formula keyed on
+  `deadline_slot`. Its upper cap is `scaling_factor × (protocol fee − partner fee)`, so 0
+  until Solana charges protocol fees. `int_solana_backend_data__solution_data.lower_reward_cap`
+  is NULL (0 in a no-penalty window): there is no flat floor, so a solver with a win
+  lacking a penalty cap has a NULL floor and a NULL reward (`rewards.AuctionCaps`). Every
+  capped reward to date is 0, and so is every weekly consistency and quote budget.
+- **Not read:** the weekly marts and the COW conversion. Solana's weekly accounting has no
+  per-auction quote-share table to split a week by, so a Solana report's recorded rewards
+  and COW figures are `null`, not zero.
+- **Display:** amounts in SOL, 9 decimals (`aggregate.NativeFormat`); USD per SOL from
+  USDC and USDT, applied per 1e9 lamports (`UsdContext.unit`). The artifact page does the
+  same: `scripts/artifact_data.py` emits whole SOL and a USD rate per lamport.
+
+Validated 2026-11-26 over 2026-10-28..11-26: `validate` reproduced 3,409 of 3,409
+auctions (winners, filter, reference scores) and `validate-rewards` 3,652 of 3,652 mart
+rows.

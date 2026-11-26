@@ -60,6 +60,9 @@ penalty_cap_native(solution) = Σ over its user orders of the order's CIP-87 cap
   `fct_consistency_rewards_per_solver_and_accounting_period`.
 - The caps come out of Postgres with ~40 significant digits; Python's default `Decimal`
   context (28) silently rounds per-solver sums, so `loo.rewards` uses 78 digits.
+- Solana has no flat floor: its `lower_reward_cap` is NULL outside a no-penalty window, so
+  the third case is NULL, and so is the solver's capped reward
+  ([analytics-db](analytics-db.md#solana)).
 
 ### Since 2026-09-08 the lower cap is per order (CIP-87)
 

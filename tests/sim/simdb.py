@@ -73,7 +73,7 @@ class SimServer:
         q = extract.price_query
         network = self.world.network
         orders_sql = quotes.ORDERS_SQL.format(raw_schema="raw_prod_" + network.replace("-", "_"))
-        return {
+        routes: dict[str, Callable[[dict[str, Any]], list[Row]]] = {
             extract.WINDOW_SQL: self._window,
             extract.AUCTIONS_SQL: self._auctions,
             extract.SOLUTIONS_SQL: self._solutions,
@@ -105,6 +105,21 @@ class SimServer:
             payouts.CONSISTENCY_MART_SQL: self._consistency_mart,
             payouts.QUOTE_MART_SQL: self._quote_mart,
         }
+        if not self.world.solana:
+            return routes
+        # Solana answers the same questions from its own tables, and only those: an EVM
+        # query reaching a Solana world fails as unknown.
+        solana = {
+            extract.SOLANA_SQL[sql]: handler
+            for sql, handler in routes.items()
+            if sql in extract.SOLANA_SQL
+        }
+        # Lamport prices, raw: scaling them is `loo`'s job, not the table's.
+        solana[extract.price_query(extract.PRICES_SQL, "solana")] = self._prices
+        solana[extract.price_query(extract.USD_PRICES_SQL, "solana")] = self._usd_prices
+        solana[extract.SOLANA_CATALOGUE_SQL] = self._solana_catalogue
+        solana[extract.SOLANA_ACTIVITY_SQL] = self._solana_activity
+        return solana
 
     def query(self, conn: SimConnection, sql: str, params: Any) -> list[Row]:
         self.queries.append(sql)
@@ -322,7 +337,7 @@ class SimServer:
                     "score": Decimal(s.score),
                     "is_settled_in_time": a.settlements[s.uid].in_time,
                     "upper_reward_cap": cap.upper,
-                    "lower_reward_cap": Decimal(a.flat_lower),
+                    "lower_reward_cap": None if a.flat_lower is None else Decimal(a.flat_lower),
                     "penalty_cap_native": cap.penalty,
                     "is_excluded": a.excluded,
                 })
@@ -346,9 +361,9 @@ class SimServer:
                     "observed_score": Decimal(r.observed),
                     "reference_score": Decimal(r.reference),
                     "uncapped_reward": Decimal(r.uncapped + (1 if off else 0)),
-                    "upper_reward_cap": r.upper if r.upper is not None else Decimal(0),
-                    "lower_reward_cap": r.lower if r.lower is not None else Decimal(0),
-                    "batch_reward_native": r.capped if r.capped is not None else Decimal(0),
+                    "upper_reward_cap": r.upper,
+                    "lower_reward_cap": r.lower,
+                    "batch_reward_native": r.capped,
                 })
         return self._unordered(rows)
 
@@ -480,6 +495,22 @@ class SimServer:
                 labels.add(solver.name)
         return [{"label": label} for label in sorted(labels)]
 
+    def _solana_catalogue(self, params: dict[str, Any]) -> list[Row]:
+        """`dune_data__solana_solvers`: every catalogued address, in base58."""
+        return self._unordered([
+            {"name": solver.name, "solver": base58(address),
+             "environment": solver.environment, "active": solver.active}
+            for solver in self.world.solvers
+            for address in solver.addresses
+        ])
+
+    def _solana_activity(self, params: dict[str, Any]) -> list[Row]:
+        return self._unordered([
+            {"solver": address, "solutions": n, "auctions_bid": len(auctions),
+             "winning_solutions": won}
+            for address, (n, auctions, won) in self._activity(params).items()
+        ])
+
     def _db_surplus(self, params: dict[str, Any]) -> list[Row]:
         from .oracle import Refused, user_surplus
 
@@ -576,6 +607,19 @@ class SimServer:
             for a, token, price in self._price_rows(set(params["ids"]))
             if (a, token) in wanted
         ])
+
+
+_BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def base58(address: str) -> str:
+    """A hex address as the Solana catalogue spells it; written here, not imported."""
+    raw = bytes.fromhex(address)
+    number, digits = int.from_bytes(raw, "big"), ""
+    while number:
+        number, digit = divmod(number, 58)
+        digits = _BASE58[digit] + digits
+    return "1" * (len(raw) - len(raw.lstrip(b"\0"))) + digits
 
 
 class SimCursor:

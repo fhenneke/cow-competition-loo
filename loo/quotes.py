@@ -29,7 +29,7 @@ from . import ch
 from .db import Connection, as_int, chunked, fetch, raw_schema
 from .extract import fetch_prices
 from .fees import FeeError, Quote, quote_fee
-from .primitives import ONE_ETH, as_erc20, price_in_eth, wrapped_native_token
+from .primitives import ONE_ETH, canonical_token, price_in_eth, wrapped_native_token
 
 if TYPE_CHECKING:  # only `shifted_limit` needs the type; `valuation` imports `fees` too
     from .valuation import Order
@@ -1026,7 +1026,7 @@ def load_order_trades(conn: Connection, start: str, end: str) -> list[OrderTrade
 
 def _priced_token(token: str, weth: str) -> str:
     """The native sentinel is priced as its wrapped ERC20."""
-    return as_erc20(token, weth)
+    return canonical_token(token, weth)
 
 
 def load_trade_prices(

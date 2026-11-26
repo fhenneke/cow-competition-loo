@@ -112,7 +112,11 @@ uv run loo analyse --network mainnet \
 - A full month per chain takes minutes and re-imports `loo/` on each invocation — do not
   edit `loo/` while a run is in flight, and check `REPORT_FORMAT` (currently 14) matches
   the reports; `compare` refuses stale ones.
-- **`--quotes` where the chain has quote data** (every chain but lens and sepolia): it
+- **Solana** (`--network solana`) is a chain like the others on the page, its native
+  figures in SOL. Its reports carry no recorded rewards and no quote side
+  (docs/analytics-db.md#solana), so a Solana-only solver has no row in the reward and
+  quote tables: say so in the prose rather than leave a reader to read the gap as zero.
+- **`--quotes` where the chain has quote data** (every chain but lens, sepolia and solana): it
   removes the solver from the quote competition too. Before quoting a quote-side bps
   figure, look at the executed volume on `compare`'s window row: a token *pair* both price
   feeds misprice by one factor still passes the price checks and can make that denominator

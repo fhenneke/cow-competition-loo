@@ -21,6 +21,8 @@ from fractions import Fraction
 
 ONE = 10**18
 NATIVE = "ee" * 20
+LAMPORTS = 10**9
+"""Solana's `NATIVE_PRICE_DENOMINATOR`: its prices are lamports per atom × 1e9."""
 
 Pair = tuple[str, str]
 
@@ -210,17 +212,18 @@ def partner_part(fees: Sequence[int], partners: int) -> int | None:
     return sum(fees[len(fees) - partners:])
 
 
-def native(trade: Trade, atoms: int, prices: Mapping[str, int]) -> int:
-    """Surplus-token atoms to native wei, through the buy token's price; a buy order's
-    sell-token amount goes through its own limit ratio first."""
+def native(trade: Trade, atoms: int, prices: Mapping[str, int], unit: int = ONE) -> int:
+    """Surplus-token atoms to native wei (lamports on Solana, whose prices divide by
+    `unit` = 1e9), through the buy token's price; a buy order's sell-token amount goes
+    through its own limit ratio first."""
     price = prices.get(trade.buy_token)
     if price is None:
         raise Refused("unpriced buy token")
     if trade.kind == "sell":
-        return atoms * price // ONE
+        return atoms * price // unit
     if trade.sell_amount == 0:
         raise Refused("zero limit sell")
-    return (atoms * trade.buy_amount // trade.sell_amount) * price // ONE
+    return (atoms * trade.buy_amount // trade.sell_amount) * price // unit
 
 
 @dataclass(frozen=True)
@@ -240,18 +243,19 @@ def order_score(
     quote: QuoteTerms | None,
     partners: int,
     prices: Mapping[str, int],
+    unit: int = ONE,
 ) -> OrderScore:
     """`compute_order_score`, with its decomposition: score = native(surplus + fees)."""
     surplus = user_surplus(trade)
     fees = protocol_fees(trade, policies, quote)
     total = sum(fees)
-    score = native(trade, surplus + total, prices)
-    surplus_native = native(trade, surplus, prices)
+    score = native(trade, surplus + total, prices, unit)
+    surplus_native = native(trade, surplus, prices, unit)
     partner = partner_part(fees, partners)
     partner_native = (
         None
         if partner is None
-        else score - native(trade, surplus + total - partner, prices)
+        else score - native(trade, surplus + total - partner, prices, unit)
     )
     return OrderScore(surplus, total, surplus_native, score, score - surplus_native,
                       partner_native)
@@ -270,7 +274,7 @@ class Bid:
     values: Mapping[Pair, int]
     """What the fairness filter compares, per raw directed pair."""
     claims: frozenset[Pair]
-    """`as_erc20`-normalised pairs, which is what winners must not share."""
+    """`canonical_token`-normalised pairs, which is what winners must not share."""
 
 
 @dataclass
@@ -373,8 +377,14 @@ def rewards(
     reference: Mapping[str, int],
     flat_lower: int | None,
     excluded: bool,
+    *,
+    capped: bool | None = None,
 ) -> dict[str, RewardRow]:
-    """`fct_solver_rewards_per_auction`, from docs/rewards.md."""
+    """`fct_solver_rewards_per_auction`, from docs/rewards.md. Caps are computed when
+    `capped` (default: when there is a flat floor). Solana's mart has no flat floor: a
+    win without a penalty cap leaves the solver's floor, and its capped reward, NULL."""
+    if capped is None:
+        capped = flat_lower is not None
     winning = sum(w.score for w in wins)
     rows: dict[str, RewardRow] = {}
     for solver in dict.fromkeys(w.solver for w in wins):
@@ -384,8 +394,8 @@ def rewards(
         uncapped = winning - competition + observed - min(winning, reference[solver])
         upper: Decimal | None = None
         lower: Decimal | None = None
-        capped: Decimal | None = None
-        if flat_lower is not None:
+        clamped: Decimal | None = None
+        if capped:
             upper = (
                 None
                 if any(w.upper is None for w in mine)
@@ -394,14 +404,14 @@ def rewards(
             if flat_lower == 0:
                 lower = Decimal(0)
             elif any(w.penalty is None for w in mine):
-                lower = Decimal(flat_lower)
+                lower = None if flat_lower is None else Decimal(flat_lower)
             else:
                 lower = -sum((w.penalty for w in mine if w.penalty is not None and not w.settled),
                              Decimal(0))
-            if upper is not None:
-                capped = Decimal(0) if excluded else min(max(Decimal(uncapped), lower), upper)
+            if upper is not None and lower is not None:
+                clamped = Decimal(0) if excluded else min(max(Decimal(uncapped), lower), upper)
         rows[solver] = RewardRow(competition, observed, reference[solver], uncapped,
-                                 upper, lower, capped)
+                                 upper, lower, clamped)
     return rows
 
 
@@ -472,14 +482,15 @@ def stream_forwards(answers: Sequence[Answer], is_sell: bool, in_amount: float,
 # --- display --------------------------------------------------------------------------
 
 
-def eth_text(wei: int | Decimal, places: int) -> str:
-    """Native wei as ETH, rounded half away from zero, by `Decimal` quantize."""
-    value = Decimal(int(wei)) / Decimal(ONE)
+def eth_text(wei: int | Decimal, places: int, decimals: int = 18) -> str:
+    """Native wei as ETH (lamports as SOL: `decimals` 9), rounded half away from zero,
+    by `Decimal` quantize."""
+    value = Decimal(int(wei)) / Decimal(10**decimals)
     quantum = Decimal(1).scaleb(-places)
 
     return str(value.quantize(quantum, rounding=ROUND_HALF_UP))
 
 
-def signed_eth_text(wei: int | Decimal, places: int = 4) -> str:
-    return ("+" if int(wei) > 0 else "") + eth_text(wei, places)
+def signed_eth_text(wei: int | Decimal, places: int = 4, decimals: int = 18) -> str:
+    return ("+" if int(wei) > 0 else "") + eth_text(wei, places, decimals)
 

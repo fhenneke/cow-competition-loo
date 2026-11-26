@@ -35,6 +35,17 @@ class Win(NamedTuple):
 
 
 @dataclass(frozen=True)
+class AuctionCaps:
+    """The auction-level cap facts, repeated on every winning row of `solution_data`."""
+
+    flat_floor: int | None
+    """`lower_reward_cap`: the floor of a solver with a win that has no penalty cap. None
+    on Solana, whose mart has no such fallback: that solver's floor, and so its capped
+    reward, is unknown (`fct_solana_solver_rewards_per_auction`)."""
+    excluded: bool = False
+
+
+@dataclass(frozen=True)
 class SolverReward:
     solver: str
     competition_score: int
@@ -46,15 +57,16 @@ class SolverReward:
     capped_reward: Decimal | None = None
 
 
-def lower_reward_cap(wins: Iterable[Win], flat: int) -> Decimal:
+def lower_reward_cap(wins: Iterable[Win], flat: int | None) -> Decimal | None:
     """Solver's reward floor: −Σ penalty_cap of unsettled wins if every win has a cap,
-    else `flat` (the solution_data column, which is not the CIP-87 floor)."""
+    else `flat` (the solution_data column, which is not the CIP-87 floor), unknown where
+    there is none. A flat 0 waives penalties."""
     if flat == 0:
         return Decimal(0)
     floor = Decimal(0)
     for win in wins:
         if win.penalty_cap is None:
-            return Decimal(flat)
+            return None if flat is None else Decimal(flat)
         if not win.settled:
             floor -= win.penalty_cap
     return floor
@@ -64,10 +76,9 @@ def uncapped_rewards(
     wins: Iterable[Win],
     reference_scores: Mapping[str, int],
     *,
-    lower_cap: int | None = None,
-    excluded: bool = False,
+    caps: AuctionCaps | None = None,
 ) -> dict[str, SolverReward]:
-    """Reward per winning solver; capped fields only when `lower_cap` (flat floor) is given."""
+    """Reward per winning solver; capped fields only when `caps` are given."""
     wins = list(wins)
     winning_score = sum(win.score for win in wins)
 
@@ -104,16 +115,16 @@ def uncapped_rewards(
             - min(winning_score, reference_score)
         )
 
-        upper_cap = upper[solver] if lower_cap is not None else None
+        upper_cap = upper[solver] if caps is not None else None
         floor = (
-            lower_reward_cap(by_solver[solver], lower_cap)
-            if lower_cap is not None
+            lower_reward_cap(by_solver[solver], caps.flat_floor)
+            if caps is not None
             else None
         )
         capped: Decimal | None = None
-        if floor is not None and upper_cap is not None:
+        if caps is not None and floor is not None and upper_cap is not None:
             clamped = min(max(Decimal(uncapped), floor), upper_cap)
-            capped = Decimal(0) if excluded else clamped
+            capped = Decimal(0) if caps.excluded else clamped
 
         rewards[solver] = SolverReward(
             solver=solver,

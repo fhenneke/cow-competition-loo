@@ -18,7 +18,7 @@ with `git ls-remote origin main` before trusting it.
 | clearing prices | `calculate_custom_prices_from_executed` |
 | winner picking | `pick_winners` |
 | reference scores | `compute_reference_scores` |
-| `price_in_eth`, `as_erc20` | `crates/winner-selection/src/primitives.rs` |
+| `price_in_eth`, `canonical_token` | `crates/winner-selection/src/primitives.rs`, `crates/chain-types` |
 | autopilot wrapper | `crates/autopilot/src/domain/competition/winner_selection.rs` |
 | config defaults | `crates/configs/src/autopilot/run_loop.rs` |
 
@@ -81,8 +81,8 @@ while that array stays empty; if a surplus-capturing owner returns, it is wrong.
 
 ### One asymmetry to preserve
 
-Step 1 keys pairs on the **raw** tokens; step 5 normalises through `as_erc20`, mapping
-`0xee…ee` to WETH. ETH→USDC and WETH→USDC are scored under separate pairs but conflict
+Step 1 keys pairs on the **raw** tokens; step 5 normalises through `canonical_token`,
+mapping `0xee…ee` to WETH (and Solana's native SOL, `00…00`, to wSOL). ETH→USDC and WETH→USDC are scored under separate pairs but conflict
 when picking winners. Mirror it, do not tidy it.
 
 ### Fast-path auctions are excluded

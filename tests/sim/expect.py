@@ -29,7 +29,7 @@ def suspect_uids(auction: Auction) -> set[int]:
         ps, pb = auction.prices.get(t.sell_token), auction.prices.get(t.buy_token)
         if ps is None or pb is None:
             return None
-        return sold * ps // oracle.ONE, bought * pb // oracle.ONE
+        return sold * ps // auction.unit, bought * pb // auction.unit
 
     def way(v: tuple[int, int]) -> int:
         """+1 the sell side worth more, -1 the buy side, 0 within the threshold."""
@@ -181,7 +181,8 @@ def counterfactual(
             wins.append(oracle.WinRecord(bid.solver, bid.total, result.executed[bid.uid],
                                          upper, penalty))
         result.rewards = oracle.rewards(wins, result.references, flat,
-                                        auction.excluded if recorded else False)
+                                        auction.excluded if recorded else False,
+                                        capped=bool(recorded))
         return result
 
     b, lo = side(base), side(loo)
@@ -228,7 +229,10 @@ def counterfactual(
 
 
 def covered(auction: Auction) -> set[str]:
-    return {t.uid for s in auction.solutions if not s.filtered_out for t in s.trades}
+    """Orders whose fee is known: those of the solutions the filter kept, whose policies
+    are recorded; on Solana, which has no fees, every order."""
+    return {t.uid for s in auction.solutions if auction.solana or not s.filtered_out
+            for t in s.trades}
 
 
 def executed_volume(world: World, auction: Auction, rule: str) -> tuple[int, int, int]:
@@ -242,7 +246,7 @@ def executed_volume(world: World, auction: Auction, rule: str) -> tuple[int, int
             every += 1
             if t.partially_fillable:
                 continue
-            volume += t.executed_buy * auction.prices[t.buy_token] // oracle.ONE
+            volume += t.executed_buy * auction.prices[t.buy_token] // auction.unit
             fok += 1
     return volume, fok, every
 

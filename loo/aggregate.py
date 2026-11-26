@@ -10,9 +10,10 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal, getcontext
 from statistics import median
-from typing import Any
+from typing import Any, NamedTuple
 
 from .payouts import COMPONENTS, Component, RecordedRewards
+from .primitives import SOLANA, native_decimals
 
 # Capped rewards are ~40-digit Decimals; 28 digits would round their sums and fail
 # `load_report`'s totals check.
@@ -870,24 +871,31 @@ class UsdContext:
     """Per-auction USD rates for one network; `fallback` is the window median."""
 
     rates: Mapping[int, Decimal]
+    """USD per whole native token."""
     fallback: Decimal
+    unit: Decimal = WEI
+    """Native amounts per whole native token: 1e18 wei, 1e9 lamports."""
 
     def rate(self, auction_id: int) -> Decimal:
         return self.rates.get(auction_id, self.fallback)
 
 
-def usd_context(rates: Mapping[int, Decimal]) -> UsdContext | None:
+def usd_context(rates: Mapping[int, Decimal], network: str = "mainnet") -> UsdContext | None:
     """`None` when no auction had a rate."""
     if not rates:
         return None
-    return UsdContext(rates=dict(rates), fallback=median(rates.values()))
+    return UsdContext(
+        rates=dict(rates),
+        fallback=median(rates.values()),
+        unit=Decimal(10) ** native_decimals(network),
+    )
 
 
 def usd_total(deltas: Mapping[int, int | Decimal], usd: UsdContext) -> Decimal:
     return sum(
         (Decimal(delta) * usd.rate(auction_id) for auction_id, delta in deltas.items()),
         Decimal(0),
-    ) / WEI
+    ) / usd.unit
 
 
 @dataclass(frozen=True)
@@ -940,11 +948,13 @@ def group_reports(reports: Sequence[Report]) -> list[SolverWindow]:
 # --- formatting (also used by cli.py) ---------------------------------------------
 
 
-def eth(wei: int | Decimal, places: int = 6) -> str:
-    """Native wei as decimal text, rounding half away from zero; Decimals truncate to wei."""
+def eth(wei: int | Decimal, places: int = 6, decimals: int = 18) -> str:
+    """Native wei (or another native token's smallest unit, `decimals` to the whole
+    token) as decimal text, rounding half away from zero; Decimals truncate to wei."""
     wei = int(wei)
     sign = "-" if wei < 0 else ""
-    scaled = (abs(wei) * 10**places + 10**18 // 2) // 10**18
+    whole = 10**decimals
+    scaled = (abs(wei) * 10**places + whole // 2) // whole
     return f"{sign}{scaled // 10**places}.{scaled % 10**places:0{places}d}"
 
 
@@ -967,8 +977,26 @@ def usd_amount(usd: Decimal) -> str:
     return f"{'-' if usd < 0 else ''}${magnitude:,.{places}f}"
 
 
-def signed_eth(wei: int | Decimal, places: int = 4) -> str:
-    return ("+" if int(wei) > 0 else "") + eth(wei, places)
+def signed_eth(wei: int | Decimal, places: int = 4, decimals: int = 18) -> str:
+    return ("+" if int(wei) > 0 else "") + eth(wei, places, decimals)
+
+
+class NativeFormat(NamedTuple):
+    """How one network's native amounts read: SOL on Solana, and ETH on every EVM
+    network whatever its token, as these tables have always labelled them."""
+
+    decimals: int
+    unit: str
+
+    @classmethod
+    def of(cls, network: str) -> NativeFormat:
+        return cls(native_decimals(network), "SOL" if network == SOLANA else "ETH")
+
+    def __call__(self, amount: int | Decimal, places: int = 6) -> str:
+        return eth(amount, places, self.decimals)
+
+    def signed(self, amount: int | Decimal, places: int = 4) -> str:
+        return signed_eth(amount, places, self.decimals)
 
 
 # --- the comparison table ----------------------------------------------------------
@@ -992,7 +1020,8 @@ def _column_title(window: SolverWindow, windows_differ: bool) -> str:
 
 
 def _surplus_cell(report: Report, usd: UsdContext | None) -> str:
-    cell = f"{signed_eth(report.delta_surplus)} ETH"
+    native = NativeFormat.of(report.network)
+    cell = f"{native.signed(report.delta_surplus)} {native.unit}"
     if usd:
         deltas = {m.auction_id: m.delta_surplus for m in report.moves}
         cell += f" ({usd_amount(usd_total(deltas, usd))})"
@@ -1005,7 +1034,8 @@ def _fee_cell(
     total: int,
     per_auction: Callable[[AuctionMove], int],
 ) -> str:
-    cell = f"{signed_eth(total)} ETH"
+    native = NativeFormat.of(report.network)
+    cell = f"{native.signed(total)} {native.unit}"
     if usd:
         deltas = {move.auction_id: per_auction(move) for move in report.moves}
         cell += f" ({usd_amount(usd_total(deltas, usd))})"
@@ -1095,6 +1125,7 @@ def comparison(
     for window in windows:
         report = window.headline
         usd = usd_by_network.get(report.network)
+        native = NativeFormat.of(report.network)
 
         exclusions: list[str] = []
         if report.price_suspects and report.price_suspects_excluded:
@@ -1120,13 +1151,13 @@ def comparison(
 
         moved = distribution({m.auction_id: m.delta_surplus for m in report.moves})
         if moved.median_abs is not None:
-            cell = f"{eth(moved.median_abs)} ETH"
+            cell = f"{native(moved.median_abs)} {native.unit}"
             if usd:
-                cell += f" ({usd_amount(moved.median_abs * usd.fallback / WEI)})"
+                cell += f" ({usd_amount(moved.median_abs * usd.fallback / usd.unit)})"
             surplus_median.append(f"{cell} over {moved.n_nonzero:,} auctions")
             surplus_signs.append(
-                f"{moved.n_positive:,} ({signed_eth(moved.sum_positive)} ETH) / "
-                f"{moved.n_negative:,} ({signed_eth(moved.sum_negative)} ETH)"
+                f"{moved.n_positive:,} ({native.signed(moved.sum_positive)} {native.unit}) / "
+                f"{moved.n_negative:,} ({native.signed(moved.sum_negative)} {native.unit})"
             )
         else:
             surplus_median.append("no auction moved")
@@ -1138,7 +1169,7 @@ def comparison(
                 else ""
             )
             surplus_whale.append(
-                f"{signed_eth(moved.largest)} ETH{share} "
+                f"{native.signed(moved.largest)} {native.unit}{share} "
                 f"(auction {moved.largest_auction_id})"
             )
         else:
@@ -1162,7 +1193,7 @@ def comparison(
                 report, usd, report.delta_protocol_fees, lambda m: m.delta_protocol_fees
             )
         )
-        protocol_fees_base_row.append(f"{eth(report.protocol_fees_base, 4)} ETH")
+        protocol_fees_base_row.append(f"{native(report.protocol_fees_base, 4)} {native.unit}")
 
         rewards_uncapped.append(_rewards_cell(report, usd, capped=False))
         rewards_capped.append(_rewards_cell(report, usd, capped=True))
@@ -1180,6 +1211,7 @@ def comparison(
                     paid.totals_by_auction(),
                     paid.unaccounted_any,
                     usd,
+                    native,
                     none_accounted=min(paid.unaccounted.values()) >= paid.auctions,
                 )
             )
@@ -1190,6 +1222,7 @@ def comparison(
                         paid.amounts(component),
                         paid.unaccounted[component],
                         usd,
+                        native,
                         none_accounted=paid.unaccounted[component] >= paid.auctions,
                     )
                 )
@@ -1199,7 +1232,7 @@ def comparison(
             f"{pct(report.orders_only_with_solver, report.orders_compared)} "
             f"of {report.orders_compared:,} compared"
         )
-        saved_cell = f"{signed_eth(report.delta_surplus_only_with)} ETH"
+        saved_cell = f"{native.signed(report.delta_surplus_only_with)} {native.unit}"
         if usd:
             only_with_deltas = {
                 m.auction_id: m.delta_surplus_only_with for m in report.moves
@@ -1237,7 +1270,7 @@ def comparison(
         )
         if weighted is not None and impact.median_bps is not None:
             price_change.append(
-                f"{bps(weighted)} volume-weighted over {eth(impact.volume_base, 2)} ETH "
+                f"{bps(weighted)} volume-weighted over {native(impact.volume_base, 2)} {native.unit} "
                 f"({impact.orders_moved:,} of {impact.orders_still_traded:,} orders "
                 f"moved{partial})"
             )
@@ -1248,7 +1281,7 @@ def comparison(
         overall = report.overall_bps
         if overall is not None:
             price_overall.append(
-                f"{bps(overall, 3)} of {eth(report.window_volume, 2)} ETH traded "
+                f"{bps(overall, 3)} of {native(report.window_volume, 2)} {native.unit} traded "
                 f"({report.window_orders:,} orders)"
             )
         else:
@@ -1282,7 +1315,7 @@ def comparison(
         margin_ratio.append(_settled_margin_ratio_cell(report))
         margin_bps.append(
             f"{bps(report.reference_margin_bps)} of "
-            f"{eth(report.reference_margin_volume, 2)} ETH "
+            f"{native(report.reference_margin_volume, 2)} {native.unit} "
             f"({report.mode}, not a price change)"
             if report.reference_margin_bps is not None
             else "n/a"
@@ -1297,7 +1330,7 @@ def comparison(
                 else ""
             )
             margin_whale.append(
-                f"{signed_eth(spread.largest)} ETH{share} "
+                f"{native.signed(spread.largest)} {native.unit}{share} "
                 f"(auction {spread.largest_auction_id})"
             )
         else:
@@ -1319,14 +1352,14 @@ def comparison(
                 cells.append("no quote data")
         else:
             quote_price.append(
-                f"{bps(quote.window_bps, 3)} of {eth(quote.window_volume_native, 2)} "
-                f"ETH executed ({quote.window_orders:,} quoted orders, "
-                f"{eth(quote.window_quoted_volume_native, 2)} ETH quoted"
+                f"{bps(quote.window_bps, 3)} of {native(quote.window_volume_native, 2)} "
+                f"{native.unit} executed ({quote.window_orders:,} quoted orders, "
+                f"{native(quote.window_quoted_volume_native, 2)} {native.unit} quoted"
                 + (
                     f"; {quote.price_suspects:,} failing a price check left out — "
                     f"{quote.price_suspects_one_sided:,} one-sided, "
                     f"{quote.price_suspects_two_sided:,} two-sided — "
-                    f"{eth(quote.price_suspect_volume_native, 2)} ETH at the api's price"
+                    f"{native(quote.price_suspect_volume_native, 2)} {native.unit} at the api's price"
                     if quote.price_suspects
                     else ""
                 )
@@ -1381,15 +1414,15 @@ def comparison(
                 )
             )
             recharge_detail = (
-                f"; median recharged order {signed_eth(quote.fee_recharge_median, 6)} ETH, "
+                f"; median recharged order {native.signed(quote.fee_recharge_median, 6)} {native.unit}, "
                 f"largest {quote.fee_recharge_largest_share:.0%} of the total"
                 if quote.fee_recharge_median is not None
                 and quote.fee_recharge_largest_share is not None
                 else ""
             )
             quote_fee.append(
-                f"{signed_eth(quote.fee_recharge_protocol)} ETH to the DAO, "
-                f"{signed_eth(quote.fee_recharge_partner)} ETH to partners — not added to "
+                f"{native.signed(quote.fee_recharge_protocol)} {native.unit} to the DAO, "
+                f"{native.signed(quote.fee_recharge_partner)} {native.unit} to partners — not added to "
                 f"the fee rows above{recharge_detail}"
             )
             quote_substituted.append(
@@ -1435,6 +1468,7 @@ def comparison(
 
 
 def _rewards_cell(report: Report, usd: UsdContext | None, *, capped: bool) -> str:
+    native = NativeFormat.of(report.network)
     delta = report.delta_rewards_capped if capped else report.delta_rewards
     if delta is None:
         return "not computed" + ("" if capped else " (surplus mode)")
@@ -1453,14 +1487,15 @@ def _rewards_cell(report: Report, usd: UsdContext | None, *, capped: bool) -> st
             deltas = {m.auction_id: m.delta_rewards for m in report.moves}
         parts.append(usd_amount(usd_total(deltas, usd)))
     detail = f" ({', '.join(parts)})" if parts else ""
-    return f"{signed_eth(delta)} ETH{detail}"
+    return f"{native.signed(delta)} {native.unit}{detail}"
 
 
 def _margin_cell(report: Report, usd: UsdContext | None) -> str:
+    native = NativeFormat.of(report.network)
     moved = report.reference_margin_rises + report.reference_margin_falls
     if not moved:
         return "no other winner's margin moved"
-    cell = f"{signed_eth(report.delta_reference_margin)} ETH"
+    cell = f"{native.signed(report.delta_reference_margin)} {native.unit}"
     if usd:
         deltas = {m.auction_id: m.delta_reference_margin for m in report.moves}
         cell += f" ({usd_amount(usd_total(deltas, usd))})"
@@ -1472,7 +1507,8 @@ def _margin_cell(report: Report, usd: UsdContext | None) -> str:
 
 
 def _score_cell(report: Report, usd: UsdContext | None) -> str:
-    cell = f"{signed_eth(report.delta_score)} ETH"
+    native = NativeFormat.of(report.network)
+    cell = f"{native.signed(report.delta_score)} {native.unit}"
     if usd:
         deltas = {m.auction_id: m.delta_score for m in report.moves}
         cell += f" ({usd_amount(usd_total(deltas, usd))})"
@@ -1482,10 +1518,11 @@ def _score_cell(report: Report, usd: UsdContext | None) -> str:
 
 
 def _pressed_rewards_cell(report: Report, usd: UsdContext | None) -> str:
+    native = NativeFormat.of(report.network)
     delta = report.delta_pressed_rewards_capped
     if delta is None:
         return "not computed (surplus mode)"
-    cell = f"{signed_eth(delta)} ETH"
+    cell = f"{native.signed(delta)} {native.unit}"
     if usd:
         deltas: dict[int, int | Decimal] = {
             m.auction_id: m.delta_pressed_rewards_capped
@@ -1499,10 +1536,11 @@ def _pressed_rewards_cell(report: Report, usd: UsdContext | None) -> str:
 
 
 def _above_cap_cell(report: Report, usd: UsdContext | None) -> str:
+    native = NativeFormat.of(report.network)
     above = report.delta_margin_above_cap
     if above is None:
         return "not computed (surplus mode)"
-    cell = f"{signed_eth(above)} ETH"
+    cell = f"{native.signed(above)} {native.unit}"
     if usd:
         deltas: dict[int, int | Decimal] = {
             m.auction_id: m.delta_margin_above_cap
@@ -1516,10 +1554,11 @@ def _above_cap_cell(report: Report, usd: UsdContext | None) -> str:
 
 
 def _settled_margin_cell(report: Report, usd: UsdContext | None) -> str:
+    native = NativeFormat.of(report.network)
     margin = report.delta_settled_margin
     if margin is None:
         return "not computed (surplus mode)"
-    cell = f"{signed_eth(margin)} ETH"
+    cell = f"{native.signed(margin)} {native.unit}"
     if usd:
         deltas: dict[int, int | Decimal] = {
             m.auction_id: v for m in report.moves if (v := m.delta_settled_margin) is not None
@@ -1543,10 +1582,11 @@ def _settled_margin_ratio_cell(report: Report) -> str:
 
 def _net_cell(report: Report, usd: UsdContext | None) -> str:
     """Δsurplus − capped Δrewards: only the capped figure is at payout scale."""
+    native = NativeFormat.of(report.network)
     if report.delta_rewards_capped is None:
         return "n/a without a capped estimate"
     net = Decimal(report.delta_surplus) - report.delta_rewards_capped
-    cell = f"{signed_eth(net)} ETH"
+    cell = f"{native.signed(net)} {native.unit}"
     if usd:
         surplus = {m.auction_id: m.delta_surplus for m in report.moves}
         capped = {
@@ -1560,11 +1600,12 @@ def _net_cell(report: Report, usd: UsdContext | None) -> str:
 
 def _budget_cell(report: Report, usd: UsdContext | None, *, with_capped: bool) -> str:
     """Δconsistency budget, or its sum with the capped Δrewards (= Δ Σ upper caps)."""
+    native = NativeFormat.of(report.network)
     budget, capped = report.delta_consistency_budget, report.delta_rewards_capped
     if budget is None or capped is None:
         return "not computed"
     total = budget + capped if with_capped else budget
-    cell = f"{signed_eth(total)} ETH"
+    cell = f"{native.signed(total)} {native.unit}"
     if usd:
         deltas: dict[int, int | Decimal] = {
             m.auction_id: m.delta_consistency_budget
@@ -1582,6 +1623,7 @@ def _paid_cell(
     per_auction: Mapping[int, Decimal],
     unaccounted: int,
     usd: UsdContext | None,
+    native: NativeFormat,
     *,
     none_accounted: bool = False,
 ) -> str:
@@ -1589,7 +1631,7 @@ def _paid_cell(
     nothing accounted yet there is no amount to show, not a zero."""
     if unaccounted and none_accounted:
         return f"not yet accounted ({unaccounted:,} auctions)"
-    cell = f"{eth(amount, 4)} ETH"
+    cell = f"{native(amount, 4)} {native.unit}"
     if usd:
         cell += f" ({usd_amount(usd_total(per_auction, usd))})"
     if unaccounted:
@@ -1726,9 +1768,9 @@ def summary(
             return usd_total(per_auction, usd_by_network[report.network])
         return Decimal(total)
 
-    def text(value: Decimal, *, signed: bool) -> str:
+    def text(value: Decimal, *, signed: bool, decimals: int = 18) -> str:
         if not in_usd:
-            return signed_eth(value, 4) if signed else eth(value, 4)
+            return signed_eth(value, 4, decimals) if signed else eth(value, 4, decimals)
         whole = value.quantize(Decimal(1), rounding=ROUND_HALF_UP)
         sign = "-" if whole < 0 else ("+" if signed and whole > 0 else "")
         return f"{sign}${abs(whole):,}"
@@ -1738,7 +1780,8 @@ def summary(
     warnings: list[str] = []
     for window in windows:
         report = window.headline
-        total = totals.setdefault(report.window, _SummaryTotal())
+        native = native_decimals(report.network)
+        total = totals.setdefault(report.window, _SummaryTotal(decimals=native))
         total.rows += 1
         surplus_moves = {m.auction_id: m.delta_surplus for m in report.moves}
         score_moves = {m.auction_id: m.delta_score for m in report.moves}
@@ -1756,7 +1799,9 @@ def summary(
                 total.incomplete.add(component)
             else:
                 value = amount(report, paid.amount(component), paid.amounts(component))
-                reward[component] = text(value, signed=False) + ("*" if missing else "")
+                reward[component] = text(value, signed=False, decimals=native) + (
+                    "*" if missing else ""
+                )
                 total.paid[component] += value
                 if missing:
                     total.incomplete.add(component)
@@ -1771,7 +1816,9 @@ def summary(
                 if (v := m.delta_settled_margin) is not None
             }
             margin_amount = amount(report, Decimal(margin), margin_moves)
-            margin_cell = text(margin_amount, signed=True) + _largest_share(margin_moves)
+            margin_cell = text(margin_amount, signed=True, decimals=native) + _largest_share(
+                margin_moves
+            )
             total.margin += margin_amount
             total.margin_native += margin
             if paid is not None:
@@ -1792,15 +1839,18 @@ def summary(
         elif in_usd:
             # One amount for the window, not per auction: the window-median rate.
             rate = usd_by_network[report.network].fallback
-            quote_cell = text(quote.delta_volume_native * rate / WEI, signed=True)
+            quote_cell = text(
+                quote.delta_volume_native * rate / usd_by_network[report.network].unit,
+                signed=True,
+            )
         else:
-            quote_cell = text(quote.delta_volume_native, signed=True)
+            quote_cell = text(quote.delta_volume_native, signed=True, decimals=native)
         cells = [
             pct(report.auctions_solver_won, report.analysed),
-            text(surplus, signed=True) + _largest_share(surplus_moves),
+            text(surplus, signed=True, decimals=native) + _largest_share(surplus_moves),
             f"{report.orders_only_with_solver:,}",
             # winning
-            text(score, signed=True),
+            text(score, signed=True, decimals=native),
             reward["performance"],
             # second-best bids
             f"{report.auctions_runner_up:,}",
@@ -1826,9 +1876,17 @@ def summary(
         if total.rows < 2:
             continue
         label = "total" + (f" ({key[0]} {key[1]}..{key[2]}, {key[3]})" if windows_differ else "")
-        rows.append((label, total.cells(lambda v, signed: text(v, signed=signed))))
+        rows.append((
+            label,
+            total.cells(lambda v, signed, d: text(v, signed=signed, decimals=d)),
+        ))
 
-    unit = "USD, each auction at its own rate" if in_usd else "ETH (the native token)"
+    units = sorted({NativeFormat.of(w.network).unit for w in windows}) or ["ETH"]
+    unit = (
+        "USD, each auction at its own rate" if in_usd
+        else f"{units[0]} (the native token)" if len(units) == 1
+        else f"each row's native token ({', '.join(units)})"
+    )
     notes = (
         f"Sorted by Δsurplus, most negative first. Amounts in {unit}; (n%) is the "
         "largest single auction's share of the total.",
@@ -1891,21 +1949,26 @@ class _SummaryTotal:
     network-window."""
     incomplete: set[str] = field(default_factory=set[str])
     """Columns where some row was n/a, pending or partly accounted."""
+    decimals: int = 18
+    """The network's native decimals, for amounts shown in the native token."""
 
-    def cells(self, text: Callable[[Decimal, bool], str]) -> list[str]:
+    def cells(self, text: Callable[[Decimal, bool, int], str]) -> list[str]:
         def mark(column: str) -> str:
             return "*" if column in self.incomplete else ""
+
+        def show(value: Decimal, signed: bool) -> str:
+            return text(value, signed, self.decimals)
 
         ratio = _consistency_ratio(self.consistency_native, self.margin_native)
         return [
             "", "", "", "",
-            text(self.paid["performance"], False) + mark("performance"),
+            show(self.paid["performance"], False) + mark("performance"),
             "",
-            text(self.margin, True) + mark("margin"),
-            text(self.paid["consistency"], False) + mark("consistency"),
+            show(self.margin, True) + mark("margin"),
+            show(self.paid["consistency"], False) + mark("consistency"),
             ratio + (mark("consistency") or mark("margin")),
             "",
-            text(self.paid["quote"], False) + mark("quote"),
+            show(self.paid["quote"], False) + mark("quote"),
         ]
 
 

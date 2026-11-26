@@ -8,10 +8,19 @@ import random
 from decimal import Decimal
 from pathlib import Path
 
-from sim import aggregation, autopilot_checks, cli_checks, expect, oracle, quote_checks, runner_up
+from sim import (
+    aggregation,
+    autopilot_checks,
+    cli_checks,
+    expect,
+    oracle,
+    quote_checks,
+    runner_up,
+    solana_checks,
+)
 from sim.harness import Sim, simulate
 from sim.oracle import Bid
-from sim.world import World, generate
+from sim.world import World, generate, solana_knobs
 
 from loo import aggregate, extract, run, validate
 from loo.counterfactual import (
@@ -110,8 +119,11 @@ def check_bundle_matches_world(world: World, bundle: AuctionBundle) -> None:
                     order.buy_amount, order.side, order.partially_fillable) == (
                 trade.executed_sell, trade.executed_buy, trade.sell_amount,
                 trade.buy_amount, trade.kind, trade.partially_fillable)
-            assert bundle.native_prices[order.buy_token] == auction.prices[order.buy_token]
-            assert bundle.native_prices[order.sell_token] == auction.prices[order.sell_token]
+            # Solana's lamport prices arrive on the 1e18 denominator.
+            scale = world.price_scale
+            assert bundle.native_prices[order.buy_token] == auction.prices[order.buy_token] * scale
+            assert (bundle.native_prices[order.sell_token]
+                    == auction.prices[order.sell_token] * scale)
     for uid in covered:
         policies = bundle.fee_context.policies.get(uid, ())
         assert len(policies) == len(world.orders[uid].policies)
@@ -137,7 +149,7 @@ def check_valuation(world: World, bundle: AuctionBundle) -> None:
             truth = solution.order_scores[trade.uid]
             assert v.order_surplus_native[trade.uid] == truth.surplus_native
             assert v.order_volume_native[trade.uid] == (
-                trade.executed_buy * auction.prices[trade.buy_token] // oracle.ONE)
+                trade.executed_buy * auction.prices[trade.buy_token] // auction.unit)
             known = trade.uid in covered and truth.partner_native is not None
             assert (trade.uid not in v.fees_unknown) == known
             if known:
@@ -428,6 +440,13 @@ def test_world(seed: int, tmp_path: Path) -> None:
     exercise(generate(seed), tmp_path, random.Random(seed ^ 0x5EED))
 
 
+def test_solana_world(seed: int, tmp_path: Path) -> None:
+    """The same layers over a Solana world: lamport prices on a 1e9 denominator, 32-byte
+    ids, the native-SOL sentinel, no fee and no flat reward floor."""
+    world = generate(seed, solana_knobs(random.Random(seed)))
+    exercise(world, tmp_path, random.Random(seed ^ 0x5EED))
+
+
 def exercise(
     world: World, tmp_path: Path, rng: random.Random, entries: list[str] | None = None
 ) -> dict[tuple[str, str], Analysis]:
@@ -494,6 +513,10 @@ def exercise(
             assert payload["price_suspect_auctions"] == analysis.price_suspect_auctions
             assert payload["auctions_with_solver"] == analysis.auctions_with_solver
             check_report_is_direct(world, tmp_path, ids, payload, analysis)
+        if world.solana:
+            solana_checks.check_cli(sim, world, tmp_path, entries, direct, result)
+            cli_checks.check_validate_rewards(sim, world, tmp_path)
+            return direct
         cli_checks.check_reports_and_compare(sim, world, tmp_path, entries, direct, result.code)
         cli_checks.check_validate(sim, world, tmp_path, bundles)
         cli_checks.check_validate_rewards(sim, world, tmp_path)

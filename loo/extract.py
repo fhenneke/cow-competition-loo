@@ -2,6 +2,9 @@
 
 Reads staging, not `int_backend_data__proposed_solution_data` (lags; no `filtered_out`).
 `proposed_trade_executions.solution_uid` joins `proposed_solutions.uid`, never `.id`.
+
+Each query is written for the EVM tables; `SOLANA_SQL` holds what Solana answers it with,
+and `sql_for` picks by the connection's network.
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any, NamedTuple
 
-from .db import Connection, Row, as_int, cache_dir, chunked, fetch, settled
+from .db import Connection, Row, as_int, cache_dir, chunked, fetch, network_of, settled
 from .fees import (
     EMPTY_FEE_CONTEXT,
     FeeContext,
@@ -26,8 +29,16 @@ from .fees import (
     Quote,
     quote_fee,
 )
-from .primitives import usd_per_native, usd_reference_tokens
-from .rewards import SolverReward, Win
+from .primitives import (
+    SOLANA,
+    base58_to_hex,
+    hex_to_base58,
+    native_decimals,
+    native_price_scale,
+    usd_per_native,
+    usd_reference_tokens,
+)
+from .rewards import AuctionCaps, SolverReward, Win
 from .valuation import Order, Side
 
 CHUNK_SIZE = 200
@@ -373,20 +384,160 @@ order by coalesce(a.solutions, 0) desc, c.name
 """
 
 
+# --- Solana: the same questions, asked of its own tables ([docs](../docs/analytics-db.md#solana))
+#
+# Its staging holds only auctions with a winner, timed by their deadline slot, so the
+# window is read from it directly. There is no fast path, and no fee policy, partner fee,
+# quote, block or proposed-solution-data table to read.
+
+SOLANA_WINDOW_SQL = """
+select auction_id
+from dbt.stg_solana_backend_data__competition_auctions
+where auction_timestamp >= %(start)s and auction_timestamp < %(end)s
+order by auction_id
+"""
+
+_SOLANA_SOLUTIONS_SQL = SOLUTIONS_SQL.replace(
+    "stg_backend_data__", "stg_solana_backend_data__"
+)
+
+_SOLANA_EXECUTIONS_SQL = EXECUTIONS_SQL.replace(
+    "stg_backend_data__", "stg_solana_backend_data__"
+)
+
+_SOLANA_AUCTIONS_SQL = """
+select
+    auction_id,
+    deadline_slot                    as block_deadline,
+    price_tokens is null             as unpriced,
+    false                            as fast_path
+from dbt.stg_solana_backend_data__competition_auctions
+where auction_id = any(%(ids)s)
+"""
+
+# Lamports per atom × 1e9: `fetch_prices` scales them onto the EVM's 1e18 denominator.
+_SOLANA_ARRAY_PRICES = """
+    select ca.auction_id, ap.token, ap.price
+    from dbt.stg_solana_backend_data__competition_auctions ca
+    cross join lateral unnest(ca.price_tokens, ca.price_values) as ap (token, price)
+    where ca.auction_id = any(%(ids)s)
+"""
+
+_SOLANA_PRICES_SQL = PRICES_SQL.replace("stg_backend_data__", "stg_solana_backend_data__")
+
+_SOLANA_REFERENCE_SCORES_SQL = REFERENCE_SCORES_SQL.replace(
+    "stg_backend_data__", "stg_solana_backend_data__"
+)
+
+_SOLANA_SETTLEMENTS_SQL = """
+select
+    auction_id,
+    solution_uid,
+    (tx_signature is not null)  as landed,
+    is_settled_in_time          as in_time
+from dbt.int_solana_backend_data__winning_solutions_with_onchain_status
+where auction_id = any(%(ids)s)
+"""
+
+# `lower_reward_cap` is NULL but in no-penalty auctions: Solana has no flat floor.
+_SOLANA_REWARD_INPUTS_SQL = REWARD_INPUTS_SQL.replace(
+    "int_backend_data__solution_data", "int_solana_backend_data__solution_data"
+)
+
+_SOLANA_FCT_REWARDS_SQL = FCT_REWARDS_SQL.replace(
+    "fct_solver_rewards_per_auction", "fct_solana_solver_rewards_per_auction"
+)
+
+SOLANA_SQL = {
+    WINDOW_SQL: SOLANA_WINDOW_SQL,
+    SOLUTIONS_SQL: _SOLANA_SOLUTIONS_SQL,
+    EXECUTIONS_SQL: _SOLANA_EXECUTIONS_SQL,
+    AUCTIONS_SQL: _SOLANA_AUCTIONS_SQL,
+    PRICES_SQL: _SOLANA_PRICES_SQL,
+    USD_PRICES_SQL: USD_PRICES_SQL,
+    REFERENCE_SCORES_SQL: _SOLANA_REFERENCE_SCORES_SQL,
+    SETTLEMENTS_SQL: _SOLANA_SETTLEMENTS_SQL,
+    REWARD_INPUTS_SQL: _SOLANA_REWARD_INPUTS_SQL,
+    FCT_REWARDS_SQL: _SOLANA_FCT_REWARDS_SQL,
+}
+"""EVM query -> its Solana counterpart, which returns the same columns."""
+
+# The catalogue holds base58 strings, which SQL cannot decode, so solvers are matched in
+# Python: the whole catalogue (a few dozen rows) and every window bidder's activity.
+SOLANA_CATALOGUE_SQL = """
+select name, solver, environment, is_active as active
+from dbt.dune_data__solana_solvers
+"""
+
+SOLANA_ACTIVITY_SQL = """
+with window_auctions as (
+    select auction_id
+    from dbt.stg_solana_backend_data__competition_auctions
+    where auction_timestamp >= %(start)s and auction_timestamp < %(end)s
+)
+select
+    encode(ps.solver, 'hex')             as solver,
+    count(*)                             as solutions,
+    count(distinct ps.auction_id)        as auctions_bid,
+    count(*) filter (where ps.is_winner) as winning_solutions
+from dbt.stg_solana_backend_data__proposed_solutions ps
+join window_auctions using (auction_id)
+where ps.auction_id between (select min(auction_id) from window_auctions)
+                        and (select max(auction_id) from window_auctions)
+group by 1
+"""
+
+
+class NoSolanaCounterpartError(KeyError):
+    """An EVM query was sent to Solana, which has no table to answer it."""
+
+
+def sql_for(sql: str, network: str) -> str:
+    """`sql`, or on Solana its counterpart in `SOLANA_SQL`."""
+    if network != SOLANA:
+        return sql
+    try:
+        return SOLANA_SQL[sql]
+    except KeyError:
+        first = next(line for line in sql.splitlines() if line.strip())
+        raise NoSolanaCounterpartError(
+            f"Solana has no table for this query ({first.strip()} ...)"
+        ) from None
+
+
+def _on(conn: Connection, sql: str) -> str:
+    return sql_for(sql, network_of(conn))
+
+
 def auctions_in_window(conn: Connection, start: str, end: str) -> list[int]:
     """Auction ids with at least one bid in `[start, end)`; sparse, not contiguous."""
-    rows = fetch(conn, WINDOW_SQL, {"start": start, "end": end}, final=lambda _: settled(end))
+    rows = fetch(
+        conn, _on(conn, WINDOW_SQL), {"start": start, "end": end},
+        final=lambda _: settled(end),
+    )
     return [row["auction_id"] for row in rows]
 
 
-def price_query(sql: str) -> str:
-    """`sql` with its `{auction_prices}` relation filled in from the price arrays."""
-    return sql.format(auction_prices=f"({_ARRAY_PRICES})")
+def price_query(sql: str, network: str = "mainnet") -> str:
+    """`sql` for `network`, its `{auction_prices}` relation filled in from the price
+    arrays."""
+    relation = _SOLANA_ARRAY_PRICES if network == SOLANA else _ARRAY_PRICES
+    return sql_for(sql, network).format(auction_prices=f"({relation})")
 
 
 def fetch_prices(conn: Connection, sql: str, params: dict[str, Any]) -> list[Row]:
-    """Run a query over `{auction_prices}` for the auctions in `params["ids"]`."""
-    return fetch(conn, price_query(sql), params)
+    """Run a query over `{auction_prices}` for the auctions in `params["ids"]`.
+
+    Its `price` column comes back on the 1e18 denominator `price_in_eth` divides by:
+    Solana's lamport prices are scaled onto it (`native_price_scale`), which values every
+    amount in lamports, exactly as its autopilot does."""
+    network = network_of(conn)
+    rows = fetch(conn, price_query(sql, network), params)
+    scale = native_price_scale(network)
+    if scale != 1:
+        for row in rows:
+            row["price"] = row["price"] * scale
+    return rows
 
 
 def _auction_span(auction_ids: Collection[int]) -> str:
@@ -412,13 +563,13 @@ def load_auctions(
         params = {"ids": ids}
 
         contexts = {
-            row["auction_id"]: row for row in fetch(conn, AUCTIONS_SQL, params)
+            row["auction_id"]: row for row in fetch(conn, _on(conn, AUCTIONS_SQL), params)
         }
         unpriced = {a for a, context in contexts.items() if context["unpriced"]}
-        solution_rows = fetch(conn, SOLUTIONS_SQL, params)
-        execution_rows = fetch(conn, EXECUTIONS_SQL, params)
+        solution_rows = fetch(conn, _on(conn, SOLUTIONS_SQL), params)
+        execution_rows = fetch(conn, _on(conn, EXECUTIONS_SQL), params)
         price_rows = fetch_prices(conn, PRICES_SQL, params)
-        reference_rows = fetch(conn, REFERENCE_SCORES_SQL, params)
+        reference_rows = fetch(conn, _on(conn, REFERENCE_SCORES_SQL), params)
         fee_contexts = (
             _load_fee_contexts(conn, ids, execution_rows, solution_rows)
             if with_fees
@@ -493,6 +644,19 @@ def _load_fee_contexts(
 ) -> dict[int, FeeContext]:
     """Policies are recorded iff the order is in a non-filtered-out solution."""
     known: dict[int, set[str]] = {}
+    if network_of(conn) == SOLANA:
+        # No order carries a fee on Solana: protocol fees are configured but empty and
+        # partner fees do not exist (docs/analytics-db.md#solana), so every fee is known
+        # to be zero. `validate` would see a fee as a score above the surplus.
+        for row in execution_rows:
+            known.setdefault(row["auction_id"], set()).add(row["order_uid"])
+        return {
+            auction_id: FeeContext(
+                policies={}, quotes={}, partner_counts={},
+                known=frozenset(known.get(auction_id, ())),
+            )
+            for auction_id in ids
+        }
     filtered_out = {
         (row["auction_id"], row["uid"]): bool(row["filtered_out"]) for row in solution_rows
     }
@@ -626,7 +790,7 @@ def load_settlement_outcomes(
     """Outcome per winning solution, keyed by auction then `solution_uid`."""
     outcomes: dict[int, dict[int, Settlement]] = {}
     for chunk in chunked(list(auction_ids), chunk_size):
-        for row in fetch(conn, SETTLEMENTS_SQL, {"ids": list(chunk)}):
+        for row in fetch(conn, _on(conn, SETTLEMENTS_SQL), {"ids": list(chunk)}):
             outcomes.setdefault(row["auction_id"], {})[row["solution_uid"]] = Settlement(
                 landed=bool(row["landed"]),
                 in_time=bool(row["in_time"]),
@@ -640,7 +804,8 @@ class SolutionCap:
     settled; `lower` (the flat floor) and `excluded` are auction-level."""
 
     upper: Decimal
-    lower: int
+    lower: int | None
+    """None on Solana, which has no flat floor (`rewards.AuctionCaps`)."""
     excluded: bool
     penalty: Decimal | None = None
     """CIP-87 penalty cap, independent of landing. `None` means none (flat `lower`
@@ -650,15 +815,14 @@ class SolutionCap:
 @dataclass(frozen=True)
 class RewardInputs:
     wins: tuple[Win, ...]
-    lower_cap: int
-    excluded: bool
+    caps: AuctionCaps
 
 
 def _reward_input_rows(
     conn: Connection, auction_ids: Sequence[int], chunk_size: int
 ) -> Iterator[Row]:
     for chunk in chunked(list(auction_ids), chunk_size):
-        yield from fetch(conn, REWARD_INPUTS_SQL, {"ids": list(chunk)})
+        yield from fetch(conn, _on(conn, REWARD_INPUTS_SQL), {"ids": list(chunk)})
 
 
 def load_reward_inputs(
@@ -671,7 +835,7 @@ def load_reward_inputs(
 
     inputs: dict[int, RewardInputs] = {}
     for auction_id, rows in rows_by_auction.items():
-        lower_caps = {as_int(r["lower_reward_cap"]) for r in rows}
+        lower_caps = {_optional_int(r["lower_reward_cap"]) for r in rows}
         excluded = {bool(r["is_excluded"]) for r in rows}
         if len(lower_caps) != 1 or len(excluded) != 1:
             raise ValueError(
@@ -689,8 +853,7 @@ def load_reward_inputs(
                 )
                 for r in rows
             ),
-            lower_cap=lower_caps.pop(),
-            excluded=excluded.pop(),
+            caps=AuctionCaps(flat_floor=lower_caps.pop(), excluded=excluded.pop()),
         )
     return inputs
 
@@ -704,11 +867,15 @@ def load_solution_caps(
     for row in _reward_input_rows(conn, auction_ids, chunk_size):
         caps.setdefault(row["auction_id"], {})[row["solution_uid"]] = SolutionCap(
             upper=Decimal(row["upper_reward_cap"]),
-            lower=as_int(row["lower_reward_cap"]),
+            lower=_optional_int(row["lower_reward_cap"]),
             excluded=bool(row["is_excluded"]),
             penalty=_optional_decimal(row["penalty_cap_native"]),
         )
     return caps
+
+
+def _optional_int(value: Decimal | int | None) -> int | None:
+    return None if value is None else as_int(value)
 
 
 def _optional_decimal(value: Decimal | None) -> Decimal | None:
@@ -722,7 +889,7 @@ def load_reference_scores(
     """Recorded reference scores keyed by auction then solver; winners only."""
     references: dict[int, dict[str, int]] = {}
     for chunk in chunked(list(auction_ids), chunk_size):
-        for row in fetch(conn, REFERENCE_SCORES_SQL, {"ids": list(chunk)}):
+        for row in fetch(conn, _on(conn, REFERENCE_SCORES_SQL), {"ids": list(chunk)}):
             references.setdefault(row["auction_id"], {})[row["solver"]] = as_int(
                 row["reference_score"]
             )
@@ -735,16 +902,17 @@ def load_fct_rewards(
     """Ground truth from `fct_solver_rewards_per_auction`, keyed by auction then solver."""
     rewards: dict[int, dict[str, SolverReward]] = {}
     for chunk in chunked(list(auction_ids), chunk_size):
-        for row in fetch(conn, FCT_REWARDS_SQL, {"ids": list(chunk)}):
+        for row in fetch(conn, _on(conn, FCT_REWARDS_SQL), {"ids": list(chunk)}):
             rewards.setdefault(row["auction_id"], {})[row["solver"]] = SolverReward(
                 solver=row["solver"],
                 competition_score=as_int(row["competition_score"]),
                 observed_score=as_int(row["observed_score"]),
                 reference_score=as_int(row["reference_score"]),
                 uncapped_reward=as_int(row["uncapped_reward"]),
-                upper_cap=Decimal(row["upper_reward_cap"]),
-                lower_cap=Decimal(row["lower_reward_cap"]),
-                capped_reward=Decimal(row["batch_reward_native"]),
+                # NULL on Solana where a win lacks a penalty cap: no floor, no payout.
+                upper_cap=_optional_decimal(row["upper_reward_cap"]),
+                lower_cap=_optional_decimal(row["lower_reward_cap"]),
+                capped_reward=_optional_decimal(row["batch_reward_native"]),
             )
     return rewards
 
@@ -774,7 +942,7 @@ def load_conversion_rates(
         return {}
     rows = fetch(
         conn,
-        CONVERSION_RATES_SQL,
+        _on(conn, CONVERSION_RATES_SQL),
         {"first": first, "last": last},
         final=lambda rows: all(
             row["conversion_rate_cow_to_native"] is not None for row in rows
@@ -812,13 +980,14 @@ def load_usd_rates(
     wanted = set(auction_ids)
     missing = sorted(wanted - cached.keys())
     token_bytes = [bytes.fromhex(token) for token in reference]
+    native = native_decimals(network)
     per_auction: dict[int, list[Decimal]] = {}
     for chunk in chunked(missing, chunk_size):
         ids = list(chunk)
         rows = fetch_prices(conn, USD_PRICES_SQL, {"ids": ids, "tokens": token_bytes})
         for row in rows:
             per_auction.setdefault(row["auction_id"], []).append(
-                usd_per_native(as_int(row["price"]), reference[row["token"]])
+                usd_per_native(as_int(row["price"]), reference[row["token"]], native)
             )
     fetched = {auction_id: median(rates) for auction_id, rates in per_auction.items()}
     if fetched:
@@ -832,14 +1001,82 @@ def load_usd_rates(
 
 def solver_matches(conn: Connection, solver: str, start: str, end: str) -> list[SolverMatch]:
     """Catalogue entries matching `solver`, with how much each one bid in the window."""
+    if network_of(conn) == SOLANA:
+        return _solana_solver_matches(conn, solver, start, end)
     rows = fetch(conn, SOLVER_SQL, {"solver": solver, "start": start, "end": end})
     return [SolverMatch(**row) for row in rows]
 
 
 def all_solvers(conn: Connection, start: str, end: str) -> list[str]:
     """Every competitor that bid in `[start, end)`, named as `--solver` would name it."""
+    if network_of(conn) == SOLANA:
+        return _solana_all_solvers(conn, start, end)
     rows = fetch(conn, ALL_SOLVERS_SQL, {"start": start, "end": end})
     return [row["label"] for row in rows]
+
+
+class _Catalogued(NamedTuple):
+    address: str
+    """Hex, as the bid tables encode it."""
+    name: str
+    environment: str
+    active: bool
+
+
+def _solana_catalogue(conn: Connection) -> list[_Catalogued]:
+    return [
+        _Catalogued(base58_to_hex(row["solver"]), row["name"], row["environment"],
+                    bool(row["active"]))
+        for row in fetch(conn, SOLANA_CATALOGUE_SQL)
+    ]
+
+
+def _solana_activity(conn: Connection, start: str, end: str) -> dict[str, Row]:
+    rows = fetch(conn, SOLANA_ACTIVITY_SQL, {"start": start, "end": end})
+    return {row["solver"]: row for row in rows}
+
+
+def _solana_solver_matches(
+    conn: Connection, solver: str, start: str, end: str
+) -> list[SolverMatch]:
+    """`SOLVER_SQL` in Python: by exact name, case-insensitively, or by address in base58
+    or in hex with or without `0x`."""
+    hexish = (solver[2:] if solver[:2].lower() == "0x" else solver).lower()
+    try:
+        decoded = base58_to_hex(solver)
+    except ValueError:
+        decoded = None
+    activity = _solana_activity(conn, start, end)
+    matches: list[SolverMatch] = []
+    for entry in _solana_catalogue(conn):
+        named = entry.name.lower() == solver.lower() and entry.name != "Uncatalogued"
+        if not named and entry.address not in (hexish, decoded):
+            continue
+        row = activity.get(entry.address, {})
+        matches.append(SolverMatch(
+            address=entry.address,
+            name=entry.name,
+            environment=entry.environment,
+            active=entry.active,
+            solutions=row.get("solutions", 0),
+            auctions_bid=row.get("auctions_bid", 0),
+            winning_solutions=row.get("winning_solutions", 0),
+        ))
+    matches.sort(key=lambda m: (-m.solutions, m.name))
+    return matches
+
+
+def _solana_all_solvers(conn: Connection, start: str, end: str) -> list[str]:
+    """`ALL_SOLVERS_SQL` in Python; an uncatalogued address is named in base58."""
+    names = {
+        entry.address: entry.name
+        for entry in _solana_catalogue(conn)
+        if entry.name != "Uncatalogued"
+    }
+    return sorted(
+        {names.get(address) or hex_to_base58(address)
+         for address in _solana_activity(conn, start, end)}
+    )
 
 
 def resolve_solver(
@@ -848,10 +1085,14 @@ def resolve_solver(
     """Every address of `--solver` that bid in the window, and the matches behind them."""
     matches = solver_matches(conn, solver, start, end)
     if not matches:
+        catalogue = (
+            "dune_data__solana_solvers" if network_of(conn) == SOLANA
+            else "dune_data__cow_protocol__solvers"
+        )
         raise SolverResolutionError(
-            f"{solver!r} matches no solver in dune_data__cow_protocol__solvers. Names are "
-            f"matched exactly and are case-insensitive; addresses may be given with or "
-            f"without a 0x prefix."
+            f"{solver!r} matches no solver in {catalogue}. Names are matched exactly and "
+            f"are case-insensitive; addresses may be given with or without a 0x prefix"
+            f"{', or in base58' if network_of(conn) == SOLANA else ''}."
         )
 
     live = [m for m in matches if m.solutions]
@@ -872,7 +1113,7 @@ def load_db_order_surplus(
     independent check on `valuation.order_surplus`, for auctions the lagging model has."""
     surplus: dict[tuple[int, int, str], int] = {}
     for chunk in chunked(list(auction_ids), chunk_size):
-        for row in fetch(conn, DB_SURPLUS_SQL, {"ids": list(chunk)}):
+        for row in fetch(conn, _on(conn, DB_SURPLUS_SQL), {"ids": list(chunk)}):
             if row["surplus"] is None:
                 continue
             key = (row["auction_id"], row["solution_uid"], row["order_uid"])

@@ -40,7 +40,7 @@ class Solution:
     order_uids: frozenset[str] = frozenset()
 
     winner_pairs: frozenset[Pair] = frozenset()
-    """`pair_values` pairs, `as_erc20`-normalised. JIT orders claim none."""
+    """`pair_values` pairs, `canonical_token`-normalised. JIT orders claim none."""
 
 
 FilterScale = Literal["score", "surplus"]

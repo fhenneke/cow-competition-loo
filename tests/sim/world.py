@@ -29,6 +29,10 @@ from .oracle import Answer, Bid, FeePolicy, Pair, QuoteTerms, Refused, Trade, Wi
 ONE = 10**18
 NATIVE = "ee" * 20
 ZERO_ADDRESS = "00" * 20
+SOLANA = "solana"
+NATIVE_SOL = "00" * 32
+"""The System Program id: the buy token of an order paid out in native SOL."""
+LAMPORTS = oracle.LAMPORTS
 
 # Copied, not imported: a mutated constant in `loo` must not move the world with it.
 WRAPPED = {
@@ -43,6 +47,7 @@ WRAPPED = {
     "ink": "4200000000000000000000000000000000000006",
     "linea": "e5d7c2a44ffddf6b295a15c148167daaaf5cf34f",
     "plasma": "6100e367285b01f48d07953803a2d8dca5d19873",
+    SOLANA: "069b8857feab8184fb687f634618c035dac439dc1aeb3b5598a0f00000000001",
 }
 STABLES = {
     "mainnet": {"a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": 6,
@@ -67,6 +72,8 @@ STABLES = {
               "a219439258ca9da29e9cc4ce5596924745e12b93": 6},
     "plasma": {"b8ce59fc3717ada4c02eadf9682a9e934f625ebb": 6,
                "5d3a1ff2b6bab83b63cd9ad0787074081a52ef34": 18},
+    SOLANA: {"c6fa7af3bedbad3a3d65f36aabc97431b1bbe4c2d2f6e0e47ca60203452f5d61": 6,
+             "ce010e60afedb22717bd63192f54145a3f965a33bb83134e31593825f29c16eb": 6},
 }
 CHAIN_IDS = {"mainnet": 1, "xdai": 100, "base": 8453, "arbitrum-one": 42161, "bnb": 56,
              "polygon": 137, "avalanche": 43114, "ink": 57073, "linea": 59144,
@@ -183,15 +190,22 @@ class Auction:
         default_factory=dict[str, frozenset[str]])
     settlements: dict[int, Settlement] = field(default_factory=dict[int, Settlement])
     caps: dict[int, Cap] = field(default_factory=dict[int, Cap])
-    flat_lower: int = -(10**16)
+    flat_lower: int | None = -(10**16)
+    """None on Solana, whose mart has no flat floor."""
     excluded: bool = False
     fast_path: bool = False
     unpriced: bool = False
     mart: dict[str, oracle.RewardRow] = field(default_factory=dict[str, oracle.RewardRow])
+    solana: bool = False
 
     @property
     def winners(self) -> list[Solution]:
         return [s for s in self.solutions if s.is_winner]
+
+    @property
+    def unit(self) -> int:
+        """What a native price divides by: 1e18, or Solana's 1e9."""
+        return LAMPORTS if self.solana else ONE
 
 
 @dataclass
@@ -289,6 +303,34 @@ class World:
         return WRAPPED[self.network]
 
     @property
+    def solana(self) -> bool:
+        return self.network == SOLANA
+
+    @property
+    def native(self) -> str:
+        """The native-token sentinel: 0xee…ee, or Solana's System Program id."""
+        return NATIVE_SOL if self.solana else NATIVE
+
+    @property
+    def unit(self) -> int:
+        """What a native price divides by; native amounts are in its smallest unit."""
+        return LAMPORTS if self.solana else ONE
+
+    @property
+    def decimals(self) -> int:
+        return 9 if self.solana else 18
+
+    @property
+    def symbol(self) -> str:
+        """How `loo` labels native amounts: SOL, and ETH on every EVM network."""
+        return "SOL" if self.solana else "ETH"
+
+    @property
+    def price_scale(self) -> int:
+        """What `loo` multiplies a recorded price by: onto the 1e18 denominator."""
+        return ONE // self.unit
+
+    @property
     def chain_id(self) -> int | None:
         return CHAIN_IDS.get(self.network)
 
@@ -354,6 +396,11 @@ def sample_knobs(rng: random.Random) -> Knobs:
     )
 
 
+def solana_knobs(rng: random.Random) -> Knobs:
+    """A Solana world: no fast path, no fee policy and no partner fee exist there."""
+    return replace(sample_knobs(rng), network=SOLANA, fast_path=0.0, partner_overflow=0.0)
+
+
 def generate(seed: int, knobs: Knobs | None = None) -> World:
     rng = random.Random(seed)
     k = knobs or sample_knobs(rng)
@@ -366,7 +413,7 @@ def generate(seed: int, knobs: Knobs | None = None) -> World:
         end=end.strftime("%Y-%m-%d"),
         max_winners=k.max_winners,
         tokens=_tokens(rng, k.network),
-        solvers=_solvers(rng),
+        solvers=_solvers(rng, 32 if k.network == SOLANA else 20),
         orders={},
         auctions=[],
     )
@@ -390,6 +437,15 @@ def generate(seed: int, knobs: Knobs | None = None) -> World:
 
 
 def _tokens(rng: random.Random, network: str) -> dict[str, int]:
+    if network == SOLANA:
+        # Lamports per atom × 1e9: SOL itself, wrapped or native, at the denominator.
+        tokens = {WRAPPED[network]: LAMPORTS, NATIVE_SOL: LAMPORTS}
+        for stable, decimals in STABLES[network].items():
+            # $1 at ~70 USD per SOL.
+            tokens[stable] = LAMPORTS * LAMPORTS // 10**decimals // rng.randint(60, 80)
+        for _ in range(rng.randint(2, 5)):
+            tokens[_hex(rng, 32)] = rng.randint(1, 9) * 10 ** rng.randint(0, 21)
+        return tokens
     tokens = {WRAPPED[network]: ONE, NATIVE: ONE}
     for stable, decimals in STABLES[network].items():
         # $1 at ~3,000 USD per native token.
@@ -399,7 +455,7 @@ def _tokens(rng: random.Random, network: str) -> dict[str, int]:
     return tokens
 
 
-def _solvers(rng: random.Random) -> list[Solver]:
+def _solvers(rng: random.Random, nbytes: int = 20) -> list[Solver]:
     names = rng.sample(SOLVER_NAMES, rng.randint(3, 6))
     if rng.random() < 0.5 and "Arc" not in names:
         names.append("Arc")
@@ -410,27 +466,27 @@ def _solvers(rng: random.Random) -> list[Solver]:
         rotated = rng.random() < 0.25
         solvers.append(Solver(
             name=name,
-            addresses=[_hex(rng, 20) for _ in range(2 if rotated else 1)],
+            addresses=[_hex(rng, nbytes) for _ in range(2 if rotated else 1)],
             # Someone always quotes, or no order could ever have been placed.
             estimator=f"est-{name.lower()}" if position == 0 or rng.random() < 0.85 else None,
         ))
     for _ in range(rng.randint(0, 2)):
-        solvers.append(Solver(name="Uncatalogued", addresses=[_hex(rng, 20)],
+        solvers.append(Solver(name="Uncatalogued", addresses=[_hex(rng, nbytes)],
                               estimator=f"est-{_hex(rng, 3)}" if rng.random() < 0.5 else None))
     # Catalogued, never bid: resolves, then fails for want of solutions.
-    solvers.append(Solver(name="Dormant", addresses=[_hex(rng, 20)], active=False,
+    solvers.append(Solver(name="Dormant", addresses=[_hex(rng, nbytes)], active=False,
                           bids=False))
     # The catalogue's bucket for unnamed addresses, never matched by name.
-    solvers.append(Solver(name="Uncatalogued", addresses=[_hex(rng, 20)], bids=False))
+    solvers.append(Solver(name="Uncatalogued", addresses=[_hex(rng, nbytes)], bids=False))
     return solvers
 
 
-def _amount(rng: random.Random, k: Knobs, price: int) -> int:
+def _amount(rng: random.Random, k: Knobs, price: int, unit: int = ONE) -> int:
     if rng.random() < k.dust:
         return rng.choice((1, 2, 3, rng.randint(1, 1000)))
     # Roughly 0.01 to 100 native tokens' worth.
-    worth = rng.randint(10**16, 10**20)
-    return max(1, worth * ONE // price)
+    worth = rng.randint(unit // 100, unit * 100)
+    return max(1, worth * unit // price)
 
 
 def _answers(
@@ -473,18 +529,20 @@ def _add_order(
     nats: Iterator[int],
 ) -> None:
     tokens = list(world.tokens)
-    sell_token, buy_token = rng.sample([t for t in tokens if t != NATIVE], 2)
+    native = world.native
+    sell_token, buy_token = rng.sample([t for t in tokens if t != native], 2)
     if rng.random() < k.native_buy:
-        buy_token = NATIVE
+        buy_token = native
         if sell_token == world.weth:
-            sell_token = rng.choice([t for t in tokens if t not in (NATIVE, world.weth)])
+            sell_token = rng.choice([t for t in tokens if t not in (native, world.weth)])
     kind = "sell" if rng.random() < 0.7 else "buy"
     market = Fraction(world.tokens[sell_token], world.tokens[buy_token])
     created = start + timedelta(seconds=rng.randint(60, int((end - start).total_seconds()) - 60))
     if rng.random() < 0.1:
         created = start - timedelta(minutes=rng.randint(1, 20))  # before the quote window
-    uid = _hex(rng, 56)
-    in_amount = _amount(rng, k, world.tokens[sell_token if kind == "sell" else buy_token])
+    uid = _hex(rng, 32 if world.solana else 56)
+    in_amount = _amount(rng, k, world.tokens[sell_token if kind == "sell" else buy_token],
+                        world.unit)
     gas_price = float(rng.randint(1, 60) * 10**9)
     sell_token_price = world.tokens[sell_token] / 1e18
     if rng.random() < 0.05:
@@ -582,7 +640,8 @@ def _add_order(
         gas_price=gas_price, sell_token_price=sell_token_price, verified=taken.verified,
         quote_id=quote_id,
     )
-    _policies(rng, k, order)
+    if not world.solana:
+        _policies(rng, k, order)
     world.orders[uid] = order
     if created >= start:
         world.linkable[uid] = how
@@ -708,8 +767,9 @@ def _execute(rng: random.Random, k: Knobs, order: Order) -> Trade:
                  order.partially_fillable)
 
 
-def as_erc20(token: str, weth: str) -> str:
-    return weth if token == NATIVE else token
+def canonical(token: str, world: World) -> str:
+    """The native-token sentinel trades its wrapped token's pair."""
+    return world.weth if token == world.native else token
 
 
 def score_solution(
@@ -721,7 +781,7 @@ def score_solution(
     for trade in trades:
         order = world.orders[trade.uid]
         scored = oracle.order_score(trade, order.policies, order.quote_terms(),
-                                    order.partners, prices)
+                                    order.partners, prices, world.unit)
         per_order[trade.uid] = scored
         pair = (trade.sell_token, trade.buy_token)
         pair_scores[pair] = pair_scores.get(pair, 0) + scored.score_native
@@ -748,7 +808,9 @@ def _add_auctions(rng: random.Random, world: World, k: Knobs, start: datetime,
             for token, price in world.tokens.items()
         }
         members = rng.sample(order_uids, min(len(order_uids), rng.randint(1, 6)))
-        auction = Auction(auction_id, block, when, prices, members)
+        auction = Auction(auction_id, block, when, prices, members, solana=world.solana)
+        if world.solana:
+            auction.flat_lower = None
         if rng.random() < k.fast_path:
             _fast_path(rng, world, auction)
         else:
@@ -846,10 +908,10 @@ def candidate(world: World, auction: Auction, address: str, trades: list[Trade])
 def record_auction(world: World, auction: Auction, candidates: list[Candidate]) -> None:
     """Arbitrate `candidates` (in tie-break order) and store them as the autopilot
     would: uids best-to-worst, winners first, filtered-out last, reference scores."""
-    weth = world.weth
     bids = [
         Bid(i, address, score, pairs,
-            frozenset((as_erc20(t.sell_token, weth), as_erc20(t.buy_token, weth)) for t in trades))
+            frozenset((canonical(t.sell_token, world), canonical(t.buy_token, world))
+                      for t in trades))
         for i, (address, trades, score, pairs, _) in enumerate(candidates)
     ]
     outcome = oracle.arbitrate(bids, world.max_winners)
@@ -884,7 +946,8 @@ def record_mart(auction: Auction) -> None:
                   auction.caps[s.uid].upper, auction.caps[s.uid].penalty)
         for s in auction.winners
     ]
-    auction.mart = oracle.rewards(wins, auction.references, auction.flat_lower, auction.excluded)
+    auction.mart = oracle.rewards(wins, auction.references, auction.flat_lower, auction.excluded,
+                                  capped=True)
 
 
 def _record_trades_and_periods(rng: random.Random, world: World) -> None:

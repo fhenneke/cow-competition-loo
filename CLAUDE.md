@@ -31,7 +31,7 @@ Results pages: the [solver-value-artifact skill](.claude/skills/solver-value-art
 10. The mart's native fees use corrected prices, but scoring did not, so diff atoms, not
     native values.
 11. Native prices come only from the `competition_auctions` price arrays. Go through
-    `extract.fetch_prices`.
+    `extract.fetch_prices`, which also puts Solana's prices (lamports ×1e9) onto 1e18.
 12. JIT orders are not read. That is exact only while `surplus_capturing_jit_order_owners`
     is empty.
 13. Fast-path auctions (`fast_path_quote_id` non-NULL) are excluded, not arbitrated.

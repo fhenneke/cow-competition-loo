@@ -27,7 +27,7 @@ from .counterfactual import (
 )
 from .db import Connection, Snapshot
 from .fees import Quote
-from .primitives import MAX_WINNERS, wrapped_native_token
+from .primitives import MAX_WINNERS, SOLANA, wrapped_native_token
 from .quotes import QuoteAnalysis, QuoteRanking, QuoteWindow
 from .valuation import Mode
 
@@ -329,6 +329,12 @@ def analyse_window(
 
     for run in runs:
         run.analysis.fast_path_auctions = list(window.fast_path)
+
+    if network == SOLANA:
+        # Its weekly accounting has no quote-share table to split a period by, and every
+        # Solana reward budget is zero to date: the payouts and COW columns stay unknown.
+        emit("recorded rewards and COW conversion: not available on solana")
+        return window
 
     # Payouts of record over every window auction, fast path included; one pass for all.
     recorded = payouts.load_recorded(

@@ -159,7 +159,7 @@ def ranked_order() -> World:
 def blocked_batch() -> World:
     """Auction 13488369's shape, through the native-token asymmetry: a single-order bid
     on ETH→X outranks a two-order batch on WETH→X and Y. Baselines key on raw pairs, so
-    the batch is fair; winners claim `as_erc20` pairs, so it is blocked. Remove the
+    the batch is fair; winners claim `canonical_token` pairs, so it is blocked. Remove the
     single order's solver and the batch wins both of its orders — one of which nobody
     else bid on: executed only without the removed solver."""
     world = blank()

@@ -11,8 +11,8 @@ from decimal import Decimal
 from typing import cast
 
 from . import aggregate, ch, counterfactual, db, extract, payouts, quotes, rewards, run, validate
-from .aggregate import cow_amount, eth, pct
-from .primitives import MAX_WINNERS, wrapped_native_token
+from .aggregate import NativeFormat, cow_amount, pct
+from .primitives import MAX_WINNERS, SOLANA, wrapped_native_token
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -213,6 +213,13 @@ def run_validate(args: argparse.Namespace) -> int:
             return 1
 
         db_surplus: dict[tuple[int, int, str], int] = {}
+        if args.cross_check_surplus and args.network == SOLANA:
+            print(
+                "ERROR: --cross-check-surplus needs a proposed-solution-data model, "
+                "which solana does not have. Drop the flag.",
+                file=sys.stderr,
+            )
+            return 3
         if args.cross_check_surplus:
             db_surplus = extract.load_db_order_surplus(conn, auction_ids)
             print(f"{len(db_surplus)} DB surplus rows for cross-check", file=sys.stderr)
@@ -290,8 +297,7 @@ def run_validate_rewards(args: argparse.Namespace) -> int:
                 rewards.uncapped_rewards(
                     auction_inputs.wins,
                     references.get(auction_id, {}),
-                    lower_cap=auction_inputs.lower_cap,
-                    excluded=auction_inputs.excluded,
+                    caps=auction_inputs.caps,
                 )
                 if auction_inputs
                 else {}
@@ -318,8 +324,12 @@ def run_validate_rewards(args: argparse.Namespace) -> int:
 def report_reward_validation(
     validation: rewards.RewardValidation, args: argparse.Namespace
 ) -> None:
+    mart = (
+        "fct_solana_solver_rewards_per_auction" if args.network == SOLANA
+        else "fct_solver_rewards_per_auction"
+    )
     print(
-        f"\n=== uncapped rewards vs fct_solver_rewards_per_auction: "
+        f"\n=== uncapped rewards vs {mart}: "
         f"{validation.auctions} auctions, {validation.auctions_with_winners} with winners ==="
     )
     print(f"solver-reward rows:         {validation.rows}")
@@ -579,7 +589,7 @@ def run_compare(args: argparse.Namespace) -> int:
                 continue
             finally:
                 conn.close()
-            context = aggregate.usd_context(rates)
+            context = aggregate.usd_context(rates, network)
             if context is not None:
                 usd_by_network[network] = context
                 print(
@@ -661,8 +671,9 @@ def report_quote_side(analysis: quotes.QuoteAnalysis) -> None:
             print(f"  excluded         {count:,} wins — {why}")
 
 
-def report_paid(paid: payouts.RecordedRewards, delta_surplus: int) -> None:
+def report_paid(paid: payouts.RecordedRewards, delta_surplus: int, network: str) -> None:
     """Recorded amounts, not deltas: what the solver was paid in the window."""
+    native = NativeFormat.of(network)
     print(
         "\nrewards paid to the solver (recorded, every auction in the window incl. price "
         "suspects and fast path)"
@@ -673,11 +684,11 @@ def report_paid(paid: payouts.RecordedRewards, delta_surplus: int) -> None:
             print(f"  {component:<12}{'not yet accounted':>26}   <- all {missing} auctions")
             continue
         print(
-            f"  {component:<12}{eth(paid.amount(component)):>22} ETH"
+            f"  {component:<12}{native(paid.amount(component)):>22} {native.unit}"
             + (f"   <- incomplete: {missing} auctions not yet accounted" if missing else "")
         )
     print(
-        f"  {'total':<12}{eth(paid.total):>22} ETH"
+        f"  {'total':<12}{native(paid.total):>22} {native.unit}"
         + (
             f"   <- incomplete: {paid.unaccounted_any} auctions not yet accounted"
             if paid.unaccounted_any
@@ -693,13 +704,13 @@ def report_paid(paid: payouts.RecordedRewards, delta_surplus: int) -> None:
         print(
             f"  week {part.period[:10]}: {part.auctions} auctions; consistency "
             + (
-                f"{eth(part.consistency_window)} of {eth(part.consistency_period)} ETH"
+                f"{native(part.consistency_window)} of {native(part.consistency_period)} {native.unit}"
                 if part.consistency_accounted
                 else "not paid out yet"
             )
             + "; quote "
             + (
-                f"{eth(part.quote_window)} of {eth(part.quote_period)} ETH"
+                f"{native(part.quote_window)} of {native(part.quote_period)} {native.unit}"
                 if part.quote_accounted
                 else "not paid out yet"
             )
@@ -724,6 +735,7 @@ def report_analysis(
     quote: quotes.QuoteAnalysis | None = None,
     paid: payouts.RecordedRewards | None = None,
 ) -> None:
+    native = NativeFormat.of(args.network)
     total = analysis.auctions
     print(f"\n=== leave one out: {analysis.solver} ===")
     print(f"window          {args.start} .. {args.end} on {args.network}")
@@ -775,20 +787,20 @@ def report_analysis(
                 "every number above and below."
             )
 
-    print(f"\nuser surplus with solver      {eth(analysis.surplus_base)} ETH")
-    print(f"user surplus without solver   {eth(analysis.surplus_loo)} ETH")
+    print(f"\nuser surplus with solver      {native(analysis.surplus_base)} {native.unit}")
+    print(f"user surplus without solver   {native(analysis.surplus_loo)} {native.unit}")
     print(
-        f"delta surplus                 {eth(analysis.delta_surplus)} ETH"
+        f"delta surplus                 {native(analysis.delta_surplus)} {native.unit}"
         "   <- every delta is counterfactual minus actual"
     )
 
-    print(f"\nprotocol fee with solver      {eth(analysis.protocol_and_partner_fees_base)} ETH")
-    print(f"  of which partner fees       {eth(analysis.partner_fees_base)} ETH")
-    print(f"  the DAO's own revenue       {eth(analysis.protocol_fees_base)} ETH")
-    print(f"delta protocol fee            {eth(analysis.delta_protocol_and_partner_fees)} ETH")
-    print(f"delta partner fees            {eth(analysis.delta_partner_fees)} ETH")
+    print(f"\nprotocol fee with solver      {native(analysis.protocol_and_partner_fees_base)} {native.unit}")
+    print(f"  of which partner fees       {native(analysis.partner_fees_base)} {native.unit}")
+    print(f"  the DAO's own revenue       {native(analysis.protocol_fees_base)} {native.unit}")
+    print(f"delta protocol fee            {native(analysis.delta_protocol_and_partner_fees)} {native.unit}")
+    print(f"delta partner fees            {native(analysis.delta_partner_fees)} {native.unit}")
     print(
-        f"delta DAO fee revenue         {eth(analysis.delta_protocol_fees)} ETH"
+        f"delta DAO fee revenue         {native(analysis.delta_protocol_fees)} {native.unit}"
         + (
             "   <- negative: the DAO collects less without the solver"
             if analysis.delta_protocol_fees < 0
@@ -805,30 +817,30 @@ def report_analysis(
             f"its fee policies are unrecorded"
         )
     print(
-        f"delta score                   {eth(analysis.delta_score)} ETH"
+        f"delta score                   {native(analysis.delta_score)} {native.unit}"
         "   <- delta surplus + delta protocol fee: what the winning bids delivered"
     )
 
     if analysis.mode == "score":
-        print(f"\nuncapped rewards with solver  {eth(analysis.rewards_base)} ETH")
-        print(f"uncapped rewards without      {eth(analysis.rewards_loo)} ETH")
-        delta_line = f"delta rewards                 {eth(analysis.delta_rewards)} ETH"
+        print(f"\nuncapped rewards with solver  {native(analysis.rewards_base)} {native.unit}")
+        print(f"uncapped rewards without      {native(analysis.rewards_loo)} {native.unit}")
+        delta_line = f"delta rewards                 {native(analysis.delta_rewards)} {native.unit}"
         if cow is not None and not cow.auctions_without_rate:
             delta_line += f"  = {cow_amount(cow.cow_wei)} COW"
         print(delta_line)
         print(
-            f"  the solver's own reward     {eth(analysis.removed_reward_base)} ETH"
+            f"  the solver's own reward     {native(analysis.removed_reward_base)} {native.unit}"
         )
         print(
             f"  rivals' rewards change      "
-            f"{eth(analysis.delta_rewards + analysis.removed_reward_base)} ETH"
+            f"{native(analysis.delta_rewards + analysis.removed_reward_base)} {native.unit}"
             "   <- positive means rivals earn more once the solver is gone"
         )
         print(f"  auctions where a reward moved {analysis.auctions_rewards_moved}")
         print(
             f"  negative uncapped rewards   "
-            f"{analysis.negative_rewards_base} base ({eth(analysis.negative_reward_sum_base)} ETH) / "
-            f"{analysis.negative_rewards_loo} loo ({eth(analysis.negative_reward_sum_loo)} ETH)"
+            f"{analysis.negative_rewards_base} base ({native(analysis.negative_reward_sum_base)} {native.unit}) / "
+            f"{analysis.negative_rewards_loo} loo ({native(analysis.negative_reward_sum_loo)} {native.unit})"
         )
         print(
             "  NOTE: uncapped is the mechanism's accounting, not a payout — the real\n"
@@ -837,22 +849,22 @@ def report_analysis(
         )
 
         print(
-            f"\ncapped rewards (estimate)     {eth(analysis.rewards_base_capped)} ETH with, "
-            f"{eth(analysis.rewards_loo_capped)} ETH without"
+            f"\ncapped rewards (estimate)     {native(analysis.rewards_base_capped)} {native.unit} with, "
+            f"{native(analysis.rewards_loo_capped)} {native.unit} without"
         )
         capped_line = (
-            f"delta rewards (capped)        {eth(analysis.delta_rewards_capped)} ETH"
+            f"delta rewards (capped)        {native(analysis.delta_rewards_capped)} {native.unit}"
         )
         if cow is not None and not cow.auctions_without_rate:
             capped_line += f"  = {cow_amount(cow.cow_wei_capped)} COW"
         print(capped_line)
         print(
-            f"delta consistency budget      {eth(analysis.delta_consistency_budget)} ETH"
+            f"delta consistency budget      {native(analysis.delta_consistency_budget)} {native.unit}"
             "   <- Σ (upper cap − capped reward), paid out in full each week"
         )
         print(
             f"  sum = delta Σ upper caps    "
-            f"{eth(analysis.delta_rewards_capped + analysis.delta_consistency_budget)} ETH"
+            f"{native(analysis.delta_rewards_capped + analysis.delta_consistency_budget)} {native.unit}"
         )
         print(
             f"  over {analysis.auctions_capped} auctions"
@@ -870,11 +882,11 @@ def report_analysis(
         if cow is not None and cow.auctions_without_rate:
             print(
                 f"  COW conversion unavailable: {cow.auctions_without_rate} auctions "
-                f"({eth(cow.native_without_rate)} ETH uncapped, "
-                f"{eth(cow.capped_without_rate)} ETH capped) fall in an accounting "
+                f"({native(cow.native_without_rate)} {native.unit} uncapped, "
+                f"{native(cow.capped_without_rate)} {native.unit} capped) fall in an accounting "
                 f"period with no snapshotted rate yet"
                 + (
-                    f"; the other {eth(cow.converted_native)} ETH converts to "
+                    f"; the other {native(cow.converted_native)} {native.unit} converts to "
                     f"{cow_amount(cow.cow_wei)} COW"
                     if cow.converted_native
                     else ""
@@ -887,7 +899,7 @@ def report_analysis(
         )
 
     if paid is not None:
-        report_paid(paid, analysis.delta_surplus)
+        report_paid(paid, analysis.delta_surplus, args.network)
 
     print(f"\nuser orders compared          {analysis.orders_compared}")
     print(
@@ -933,13 +945,13 @@ def report_analysis(
     )
     print(
         f"others' margin over reference "
-        f"{eth(analysis.reference_margin_base)} ETH with, "
-        f"{eth(analysis.reference_margin_loo)} ETH without ({analysis.mode})"
+        f"{native(analysis.reference_margin_base)} {native.unit} with, "
+        f"{native(analysis.reference_margin_loo)} {native.unit} without ({analysis.mode})"
         "   <- winners winning the same solutions on both sides"
     )
     moved = analysis.reference_margin_rises + analysis.reference_margin_falls
     print(
-        f"delta margin over reference   {eth(analysis.delta_reference_margin)} ETH over "
+        f"delta margin over reference   {native(analysis.delta_reference_margin)} {native.unit} over "
         f"{moved} winners in {analysis.auctions_reference_margin_moved} auctions "
         f"({analysis.reference_margin_rises} rose, {analysis.reference_margin_falls} fell)"
     )
@@ -949,7 +961,7 @@ def report_analysis(
         )
         print(
             f"  over their winning volume   {margin_bps:+.2f} bps of "
-            f"{eth(analysis.reference_margin_volume)} ETH"
+            f"{native(analysis.reference_margin_volume)} {native.unit}"
             f"   <- {analysis.mode} room the solver's bids left, every bid held fixed; "
             f"not a price change"
         )
@@ -958,17 +970,17 @@ def report_analysis(
     settled = analysis.delta_settled_margin
     if settled is not None:
         print(
-            f"  winners that settled        {eth(settled)} ETH"
+            f"  winners that settled        {native(settled)} {native.unit}"
             "   <- uncapped: the rent the solver's bids take from them, whoever pays it"
         )
     if pressed is not None:
         print(
-            f"delta their capped rewards    {eth(pressed)} ETH"
+            f"delta their capped rewards    {native(pressed)} {native.unit}"
             "   <- paid to those winners instead of the consistency budget; bids fixed"
         )
     if above is not None:
         print(
-            f"  above the reward cap        {eth(above)} ETH"
+            f"  above the reward cap        {native(above)} {native.unit}"
             "   <- winners that settled: room to bid worse at no cost in reward"
         )
         if analysis.auctions_margin_cap_unknown:
@@ -1007,15 +1019,18 @@ def report_analysis(
     if moves:
         print(f"\n--- {len(moves)} largest changed auctions by |delta surplus| ---")
         for result in moves:
-            print_counterfactual(result)
+            print_counterfactual(result, args.network)
 
 
-def print_counterfactual(result: counterfactual.AuctionCounterfactual) -> None:
+def print_counterfactual(
+    result: counterfactual.AuctionCounterfactual, network: str
+) -> None:
+    native = NativeFormat.of(network)
     print(
         f"\nauction {result.auction_id}  {result.n_solutions} solutions  "
-        f"delta={eth(result.delta_surplus)} ETH  "
+        f"delta={native(result.delta_surplus)} {native.unit}  "
         + (
-            f"delta_rewards={eth(result.delta_rewards)} ETH  "
+            f"delta_rewards={native(result.delta_rewards)} {native.unit}  "
             if result.baseline_rewards or result.loo_rewards
             else ""
         )

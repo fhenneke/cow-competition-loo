@@ -11,7 +11,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 from .fees import EMPTY_FEE_CONTEXT, FeeContext, FeeError, order_fees
-from .primitives import Pair, as_erc20, ceil_div, price_in_eth
+from .primitives import Pair, canonical_token, ceil_div, price_in_eth
 from .winner_selection import Solution
 
 if TYPE_CHECKING:  # `extract` imports this module, so the runtime import would cycle.
@@ -143,7 +143,7 @@ class SolutionValuation:
     """Keyed by raw directed pair."""
     order_surplus_native: dict[str, int]
     winner_pairs: frozenset[Pair]
-    """`as_erc20`-normalised: what `pick_winners` claims."""
+    """`canonical_token`-normalised: what `pick_winners` claims."""
     order_uids: frozenset[str]
     order_volume_native: dict[str, int] = field(default_factory=dict[str, int])
     fee_inputs: FeeInputs | None = field(default=None, compare=False, repr=False)
@@ -249,7 +249,7 @@ def value_solution(
     for order in orders:
         uids.add(order.uid)
         winner_pairs.add(
-            (as_erc20(order.sell_token, weth), as_erc20(order.buy_token, weth))
+            (canonical_token(order.sell_token, weth), canonical_token(order.buy_token, weth))
         )
 
         surplus_atoms = order_surplus(order)

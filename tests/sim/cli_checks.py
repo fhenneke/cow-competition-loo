@@ -24,7 +24,7 @@ def usd_rates(world: World, auction_ids: set[int]) -> dict[int, Decimal]:
     for a in world.auctions:
         if a.auction_id not in auction_ids:
             continue
-        found = [Decimal(10) ** (36 - d) / Decimal(a.prices[t])
+        found = [Decimal(10) ** (2 * world.decimals - d) / Decimal(a.prices[t])
                  for t, d in STABLES[world.network].items() if t in a.prices]
         if found:
             rates[a.auction_id] = median(found)

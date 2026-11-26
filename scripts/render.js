@@ -39,11 +39,13 @@ const pct = (v, p = 2) => v === null || v === undefined ? "n/a" : `${(v * 100).t
 const concentrated = share => share !== null && share !== undefined
   && Math.round(share * 100) >= 30;
 const neg = v => v < 0 ? "num-neg" : "num-pos";
-/* A solver with no catalogue entry is named by its 40-hex submission address, which on
-   its own sets the label column to 348px — a third of the 64rem page. Abbreviate it the
-   way `loo compare` does; the full address is in the report file. */
-const label = name => /^[0-9a-f]{40}$/.test(name)
-  ? `Uncatalogued 0x${name.slice(0, 6)}…` : name;
+/* A solver with no catalogue entry is named by its submission address — 40 hex on the
+   EVM chains, 64 hex or 32–44 base58 on Solana — which on its own sets the label column
+   to 348px or more, a third of the 64rem page. Abbreviate it the way `loo compare` does;
+   the full address is in the report file. */
+const label = name => /^([0-9a-f]{40}|[0-9a-f]{64})$/.test(name)
+  ? `Uncatalogued 0x${name.slice(0, 6)}…`
+  : /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(name) ? `Uncatalogued ${name.slice(0, 6)}…` : name;
 
 /* Aggregate one solver across the chains in scope.
    USD sums; native does not (ETH + xDAI is not a number) and neither does a median of
@@ -294,7 +296,7 @@ function renderQuotes() {
 }
 
 /* The USD rate travels with the quote so the summed bps can be recomputed. */
-const chainQuote = d => ({ ...d.quote, usd_per_native: d.rate * 1e18 });
+const chainQuote = d => ({ ...d.quote, usd_per_native: d.usd_per_native });
 
 /* ---- contribution and reward, side by side ------------------------------
    Its own table, not columns in the focus band: three groups (winning, second-best bids,

@@ -15,7 +15,7 @@ from .extract import AuctionBundle, Bid, Settlement, SolutionCap
 from .fees import FeeContext, Quote
 from .primitives import MAX_WINNERS, Pair, price_in_eth
 from .quotes import shifted_limit
-from .rewards import SolverReward, Win, uncapped_rewards
+from .rewards import AuctionCaps, SolverReward, Win, uncapped_rewards
 from .valuation import Mode, Order, ValuedBid, build_solutions
 from .winner_selection import (
     Arbitration,
@@ -1357,8 +1357,7 @@ class PreparedAuction:
                 for s in ranking.winners
             ],
             reference_scores,
-            lower_cap=any_cap.lower if any_cap else None,
-            excluded=any_cap.excluded if any_cap else False,
+            caps=AuctionCaps(any_cap.lower, any_cap.excluded) if any_cap else None,
         )
 
     def baseline_rewards(self, outcome_rule: OutcomeRule) -> dict[str, SolverReward]:

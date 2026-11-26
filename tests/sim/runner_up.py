@@ -59,7 +59,7 @@ def expected(auction: Auction, bids: list[Bid], removed: frozenset[str],
         if by_uid[u].solver in removed and u not in base.winners)
     solutions = {s.uid: s for s in auction.solutions}
     volume = sum(
-        t.executed_buy * auction.prices[t.buy_token] // oracle.ONE
+        t.executed_buy * auction.prices[t.buy_token] // auction.unit
         for s, uids in pressed.items() if margins_base[s] != margins_loo[s]
         for u in uids for t in solutions[u].trades)
     return RunnerUp(margins_base, margins_loo, runner_up, volume)

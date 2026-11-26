@@ -20,7 +20,8 @@ CLICKHOUSE_USER=…
 CLICKHOUSE_PASSWORD=…
 ```
 
-The database is derived from `--network` (default `mainnet`). Details and traps:
+The database is derived from `--network` (default `mainnet`; `solana` reads its own
+tables, [what differs](docs/analytics-db.md#solana)). Details and traps:
 [docs/analytics-db.md](docs/analytics-db.md).
 
 ## The flow
@@ -164,7 +165,8 @@ scores — and names a cause for every difference. Exit 0 when every difference 
 named cause, 1 no auctions, 2 something unexplained, 3 a bad cross-check window, 6 DB.
 `--cross-check-surplus` also diffs per-order surplus against
 `int_backend_data__proposed_solution_data`; that model lags the raw tables by days, so it
-fails loudly on an uncovered window rather than checking nothing.
+fails loudly on an uncovered window rather than checking nothing. Solana has no such
+model, so the flag exits 3 there.
 
 `validate-rewards` recomputes every winner's uncapped and capped reward from the mart's
 own inputs and diffs `fct_solver_rewards_per_auction` row by row. Nothing on that path is

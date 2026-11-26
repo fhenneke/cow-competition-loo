@@ -23,7 +23,7 @@ from typing import Any
 
 from loo import aggregate, db, extract
 from loo.payouts import COMPONENTS
-from loo.primitives import ONE_ETH
+from loo.primitives import native_decimals
 
 # The unit every native amount on the page is printed in. Same networks as
 # `primitives.WRAPPED_NATIVE_TOKEN`, whose verified wrappers name the native token; a
@@ -40,6 +40,7 @@ NATIVE_SYMBOL = {
     "linea": "ETH",
     "plasma": "XPL",
     "sepolia": "ETH",
+    "solana": "SOL",
 }
 
 
@@ -91,7 +92,7 @@ def usd_contexts(
             continue
         finally:
             conn.close()
-        context = aggregate.usd_context(rates)
+        context = aggregate.usd_context(rates, network)
         if context is not None:
             contexts[network] = context
             print(
@@ -112,7 +113,7 @@ def _usd(value: int | Decimal, context: aggregate.UsdContext | None) -> float:
     """
     if context is None:
         return 0.0
-    return float(Decimal(value) * context.fallback / ONE_ETH)
+    return float(Decimal(value) * context.fallback / context.unit)
 
 
 def _usd_per_auction(
@@ -123,8 +124,9 @@ def _usd_per_auction(
     return float(aggregate.usd_total(deltas, context))
 
 
-def _native(value: int | Decimal) -> float:
-    return float(Decimal(value) / ONE_ETH)
+def _native(value: int | Decimal, network: str) -> float:
+    """A native amount in whole tokens: wei over 1e18, lamports over 1e9."""
+    return float(Decimal(value) / Decimal(10) ** native_decimals(network))
 
 
 def row(
@@ -136,6 +138,9 @@ def row(
     fees), and at the window-median rate for the window-level volumes the price columns
     divide by — the same split `aggregate.usd_total` makes.
     """
+    def native(value: int | Decimal) -> float:
+        return _native(value, report.network)
+
     impact = report.price_impact
     moved = {m.auction_id: m.delta_surplus for m in report.moves}
     largest_move = max(report.moves, key=lambda m: abs(m.delta_surplus), default=None)
@@ -194,12 +199,13 @@ def row(
     return {
         "chain": report.network,
         "sym": native_symbol(report.network),
-        # USD per native *atom* (per wei), so it multiplies the wei-denominated volumes
-        # below directly; times 1e18 it is the USD price of one native token.
-        "rate": float(context.fallback / ONE_ETH) if context else 0.0,
+        # USD per smallest native unit (wei, lamport), so it multiplies the volumes below,
+        # which are in that unit, directly. `usd_per_native` is the whole token's price.
+        "rate": float(context.fallback / context.unit) if context else 0.0,
+        "usd_per_native": float(context.fallback) if context else 0.0,
         # --- the focus four
         "usd_s": _usd_per_auction(moved, context),
-        "native_s": _native(report.delta_surplus),
+        "native_s": native(report.delta_surplus),
         "pi_delta": impact.delta_surplus,
         "pi_volume": impact.volume_base,
         "window_volume": report.window_volume,
@@ -210,11 +216,11 @@ def row(
             {m.auction_id: m.delta_protocol_and_partner_fees for m in report.moves},
             context,
         ),
-        "native_f": _native(report.delta_protocol_and_partner_fees),
+        "native_f": native(report.delta_protocol_and_partner_fees),
         "usd_score": _usd_per_auction(
             {m.auction_id: m.delta_score for m in report.moves}, context
         ),
-        "native_score": _native(report.delta_score),
+        "native_score": native(report.delta_score),
         "usd_pr": _usd_per_auction(
             {m.auction_id: m.delta_protocol_fees for m in report.moves}, context
         ),
@@ -259,9 +265,9 @@ def row(
                 f"{c}_usd": _usd_per_auction(paid.amounts(c), context)
                 for c in COMPONENTS
             },
-            **{c: _native(paid.amount(c)) for c in COMPONENTS},
+            **{c: native(paid.amount(c)) for c in COMPONENTS},
             "total_usd": _usd_per_auction(paid.totals_by_auction(), context),
-            "total": _native(paid.total),
+            "total": native(paid.total),
             "auctions": paid.auctions,
             "unaccounted": {c: paid.unaccounted[c] for c in COMPONENTS},
             "unaccounted_any": paid.unaccounted_any,
@@ -274,7 +280,7 @@ def row(
         "runner_up": {
             "auctions": report.auctions_runner_up,
             "margin_usd": margin_usd,
-            "margin": _native(report.delta_reference_margin),
+            "margin": native(report.delta_reference_margin),
             "largest_usd": largest_margin_usd,
             "share": abs(largest_margin_usd) / abs(margin_usd) if margin_usd else None,
             "rises": report.reference_margin_rises,
@@ -285,7 +291,7 @@ def row(
             else None,
             # The part beyond the winners' reward caps, settled winners only.
             "above_usd": above_usd if report.delta_margin_above_cap is not None else None,
-            "above": _native(report.delta_margin_above_cap)
+            "above": native(report.delta_margin_above_cap)
             if report.delta_margin_above_cap is not None
             else None,
             "above_share": abs(largest_above_usd) / abs(above_usd) if above_usd else None,
@@ -302,7 +308,7 @@ def row(
             )
             if report.delta_pressed_rewards_capped is not None
             else None,
-            "rewards": _native(report.delta_pressed_rewards_capped)
+            "rewards": native(report.delta_pressed_rewards_capped)
             if report.delta_pressed_rewards_capped is not None
             else None,
             # The margin of the winners that settled, uncapped: the rent the solver's losing
@@ -317,7 +323,7 @@ def row(
             )
             if report.delta_settled_margin is not None
             else None,
-            "settled": _native(report.delta_settled_margin)
+            "settled": native(report.delta_settled_margin)
             if report.delta_settled_margin is not None
             else None,
             # Consistency paid ÷ that margin, native over native; None unless both are there.
@@ -336,7 +342,7 @@ def row(
             "start": quote.start,
             "end": quote.end,
             "window_orders": quote.window_orders,
-            "window_volume": _native(quote.window_volume_native),
+            "window_volume": native(quote.window_volume_native),
             "matched": quote.matched,
             "orders_total": quote.orders_total,
             "wins": quote.quote_wins,
@@ -350,7 +356,7 @@ def row(
             if quote.window_bps is not None
             else None,
             # `window_bps` as an amount: one window figure, so the window-median rate.
-            "delta_native": _native(quote.delta_volume_native),
+            "delta_native": native(quote.delta_volume_native),
             "delta_usd": _usd(quote.delta_volume_native, context),
             "conditional_bps": float(quote.conditional_bps)
             if quote.conditional_bps is not None
@@ -367,7 +373,7 @@ def row(
             "nonpositive": quote.nonpositive,
             "implausible": quote.implausible,
             "price_suspects": quote.price_suspects,
-            "quoted_volume": _native(quote.window_quoted_volume_native),
+            "quoted_volume": native(quote.window_quoted_volume_native),
             "substituted": quote.substituted_orders,
             "fee_recharge_usd": _usd_per_auction(
                 {m.auction_id: m.quote_fee_recharge for m in report.moves}, context
@@ -379,7 +385,7 @@ def row(
             "fee_recharge_partner_usd": _usd_per_auction(
                 {m.auction_id: m.quote_fee_recharge_partner for m in report.moves}, context
             ),
-            "fee_recharge_native": _native(quote.fee_recharge_protocol),
+            "fee_recharge_native": native(quote.fee_recharge_protocol),
             "fee_recharge_median_usd": (
                 _usd(quote.fee_recharge_median, context)
                 if quote.fee_recharge_median is not None
@@ -436,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
             chain["alt_usd_s"] = _usd_per_auction(
                 {m.auction_id: m.delta_surplus for m in report.moves}, context
             )
-            chain["alt_native_s"] = _native(report.delta_surplus)
+            chain["alt_native_s"] = _native(report.delta_surplus, report.network)
 
     chains = sorted({r.network for r in reports})
     windows = sorted({(r.start, r.end) for r in reports})

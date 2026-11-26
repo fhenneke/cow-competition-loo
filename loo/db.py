@@ -57,6 +57,7 @@ NETWORK_DATABASES = {
     "linea": "prod_linea",
     "plasma": "prod_plasma",
     "sepolia": "prod_sepolia",
+    "solana": "prod_solana",
 }
 
 
@@ -265,6 +266,17 @@ def snapshot_dir(network: str, start: str, end: str) -> Path:
 
 Connection = PgConnection | Snapshot
 """What the loaders read from: the DB, or a window's snapshot of it."""
+
+
+def network_of(conn: Connection) -> str:
+    """The network whose database `conn` reads: which tables and SQL it needs."""
+    if isinstance(conn, Snapshot):
+        return conn.network
+    dbname = psycopg2.extensions.parse_dsn(conn.dsn).get("dbname")
+    for network, name in NETWORK_DATABASES.items():
+        if name == dbname:
+            return network
+    raise KeyError(f"connection to {dbname!r} is to no known network's database")
 
 
 def as_int(value: Any) -> int:
