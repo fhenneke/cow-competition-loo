@@ -324,7 +324,8 @@ def check_counterfactual(
                 else sum((r.upper - r.capped for r in rows
                           if r.upper is not None and r.capped is not None), Decimal(0)))
         assert (result.consistency_budget_base, result.consistency_budget_loo) == tuple(budgets)
-        runner_up.check_above_cap(result, truth.base.rewards, truth.loo.rewards)
+        runner_up.check_above_cap(result, truth.base.rewards, truth.loo.rewards,
+                                  auction.excluded)
     # The consistency budget is what the caps leave: with the capped rewards it sums to the
     # upper caps, auction by auction, and exists exactly where the capped delta does.
     if result.delta_rewards_capped is None:

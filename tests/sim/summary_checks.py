@@ -14,7 +14,12 @@ from . import oracle
 from .harness import Sim
 
 COLUMNS = ("won", "Δsurplus", "orders lost", "Δscore", "performance", "runner-up",
-           "Δwinners' rewards", "consistency", "Δquote", "quote")
+           "Δwinners' margin", "consistency", "consistency ÷ margin",
+           "Δquote", "quote")
+
+
+def ratio_text(consistency: Decimal, value: Decimal) -> str:
+    return f"{consistency / value:.2f}" if value > 0 else "n/a"
 
 
 def share_text(deltas: Mapping[int, int | Decimal]) -> str:
@@ -47,8 +52,23 @@ def expected_rows(windows: Sequence[aggregate.SolverWindow],
 
     differ = len({w.headline.window for w in windows}) > 1
     keyed: list[tuple[Decimal, int, str, tuple[str, ...]]] = []
+    # Per network-window: rows, Σ of each additive column, columns with a gap.
+    count: dict[tuple[str, str, str, str], int] = {}
+    sums: dict[tuple[str, str, str, str], dict[str, Decimal]] = {}
+    gaps: dict[tuple[str, str, str, str], set[str]] = {}
     for position, window in enumerate(windows):
         head = window.headline
+        key = head.window
+        count[key] = count.get(key, 0) + 1
+        sum_of = sums.setdefault(key, {})
+        gap = gaps.setdefault(key, set())
+
+        def add(column: str, amount: Decimal | None, *, partial: bool = False,
+                sum_of: dict[str, Decimal] = sum_of, gap: set[str] = gap) -> None:
+            sum_of[column] = sum_of.get(column, Decimal(0)) + (amount or Decimal(0))
+            if amount is None or partial:
+                gap.add(column)
+
         label = (f"{window.solver} {window.start}..{window.end} ({window.network}, "
                  f"{window.mode})" if differ else window.solver)
         surplus_moves = {m.auction_id: m.delta_surplus for m in head.moves}
@@ -65,17 +85,32 @@ def expected_rows(windows: Sequence[aggregate.SolverWindow],
             missing = paid.unaccounted[component]
             if missing > 0 and missing >= paid.auctions:
                 reward[component] = "pending"
+                add(component, None)
                 continue
             per = {a: parts[index] for a, parts in paid.per_auction.items()}
             amount = value(sum(per.values(), Decimal(0)), per)
             reward[component] = text(amount, False) + ("*" if missing else "")
-        pressed = head.delta_pressed_rewards_capped
-        if pressed is None:
-            pressed_cell = "n/a"
+            add(component, amount, partial=missing > 0)
+        # The settled winners' margin, uncapped, by hand from the moves.
+        margin = head.delta_settled_margin
+        if margin is None:
+            margin_cell = ratio_cell = "n/a"
+            add("margin", None)
         else:
-            pressed_moves = {m.auction_id: m.delta_pressed_rewards_capped for m in head.moves
-                             if m.delta_pressed_rewards_capped is not None}
-            pressed_cell = text(value(pressed, pressed_moves), True)
+            moves = {m.auction_id: m.delta_settled_margin for m in head.moves
+                     if m.delta_settled_margin is not None}
+            unknown = head.auctions_margin_cap_unknown > 0
+            margin_cell = (text(value(Decimal(margin), moves), True) + share_text(moves)
+                           + ("*" if unknown else ""))
+            add("margin", value(Decimal(margin), moves), partial=unknown)
+            # The total's ratio is native over native, as each row's.
+            sum_of["margin_native"] = sum_of.get("margin_native", Decimal(0)) + margin
+            sum_of["consistency_native"] = (sum_of.get("consistency_native", Decimal(0))
+                                            + paid.amount("consistency"))
+            missing = paid.unaccounted["consistency"]
+            ratio_cell = ("pending" if missing and missing >= paid.auctions
+                          else ratio_text(paid.amount("consistency"), Decimal(margin))
+                          + ("*" if missing else ""))
         quote = head.quote
         if quote is None:
             quote_cell = "not run"
@@ -88,12 +123,31 @@ def expected_rows(windows: Sequence[aggregate.SolverWindow],
             text(surplus, True) + share_text(surplus_moves),
             f"{head.orders_only_with_solver:,}",
             text(score, True), reward["performance"],
-            f"{head.auctions_runner_up:,}", pressed_cell, reward["consistency"],
-            quote_cell, reward["quote"],
+            f"{head.auctions_runner_up:,}", margin_cell, reward["consistency"],
+            ratio_cell, quote_cell, reward["quote"],
         ]
         keyed.append((surplus, position, label, tuple(cells)))
     keyed.sort(key=lambda k: (k[0], k[1]))
-    return [(label, cells) for _, _, label, cells in keyed]
+    rows = [(label, cells) for _, _, label, cells in keyed]
+    # A total per network-window with more than one solver: recorded rewards and the
+    # settled margin summed, the ratio of the sums, every other column blank.
+    for key, n in count.items():
+        if n < 2:
+            continue
+        total, gap = sums[key], gaps[key]
+
+        def summed(column: str, signed: bool, total: dict[str, Decimal] = total,
+                   gap: set[str] = gap) -> str:
+            return text(total[column], signed) + ("*" if column in gap else "")
+
+        ratio = ratio_text(total.get("consistency_native", Decimal(0)),
+                           total.get("margin_native", Decimal(0))) + (
+            "*" if gap & {"consistency", "margin"} else "")
+        label = "total" + (f" ({key[0]} {key[1]}..{key[2]}, {key[3]})" if differ else "")
+        rows.append((label, ("", "", "", "", summed("performance", False), "",
+                             summed("margin", True),
+                             summed("consistency", False), ratio, "", summed("quote", False))))
+    return rows
 
 
 def check_table(table: aggregate.Table, windows: Sequence[aggregate.SolverWindow],

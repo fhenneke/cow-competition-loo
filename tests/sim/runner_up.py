@@ -101,7 +101,7 @@ def check(result: AuctionCounterfactual, auction: Auction, bids: list[Bid],
 
 def check_above_cap(result: AuctionCounterfactual,
                     rewards_base: Mapping[str, oracle.RewardRow],
-                    rewards_loo: Mapping[str, oracle.RewardRow]) -> None:
+                    rewards_loo: Mapping[str, oracle.RewardRow], excluded: bool) -> None:
     """Against the oracle's reward rows, which are this auction's only where the oracle saw
     the same filter inputs; the margins themselves are checked by `check`."""
     above_base = above_cap(result.reference_margins_base, rewards_base)
@@ -122,6 +122,39 @@ def check_above_cap(result: AuctionCounterfactual,
     base, loo = paid
     assert result.delta_pressed_rewards_capped == (
         None if base is None or loo is None else loo - base)
+    check_value(result, rewards_base, rewards_loo, excluded)
+
+
+def check_value(result: AuctionCounterfactual,
+                rewards_base: Mapping[str, oracle.RewardRow],
+                rewards_loo: Mapping[str, oracle.RewardRow], excluded: bool) -> None:
+    """The settled winners' Δmargin, from the oracle's rows, defined where both capped
+    figures are. It fits them: a settled winner's capped reward is min(margin, cap) and V2
+    takes max(0, margin − cap), so V1 + V2 is the settled Δmargin plus the other pressed
+    winners' Δcapped reward (their penalty). In an excluded auction every capped reward is
+    0, and only V2 is left."""
+    v1, v2 = result.delta_pressed_rewards_capped, result.delta_margin_above_cap
+    if v1 is None or v2 is None:
+        assert result.delta_settled_margin is None
+        return
+    settled = 0
+    split = Decimal(0)
+    for sign, margins, rewards in ((-1, result.reference_margins_base, rewards_base),
+                                   (1, result.reference_margins_loo, rewards_loo)):
+        for solver, m in margins.items():
+            row = rewards[solver]
+            assert row.capped is not None and row.upper is not None
+            if row.observed != row.competition:
+                split += sign * row.capped
+                continue
+            settled += sign * m
+            above = max(Decimal(0), Decimal(m) - row.upper)
+            # A settled winner's uncapped reward is its margin exactly.
+            assert row.uncapped == m
+            assert row.capped + above == (above if excluded else m)
+            split += sign * (above if excluded else m)
+    assert result.delta_settled_margin == settled
+    assert v1 + v2 == split
 
 
 def check_report(report: aggregate.Report, payload: dict[str, Any], analysis: Analysis) -> None:
@@ -129,6 +162,7 @@ def check_report(report: aggregate.Report, payload: dict[str, Any], analysis: An
     assert report.delta_reference_margin == analysis.delta_reference_margin
     assert report.delta_margin_above_cap == analysis.delta_margin_above_cap
     assert report.delta_pressed_rewards_capped == analysis.delta_pressed_rewards_capped
+    assert report.delta_settled_margin == analysis.delta_settled_margin
     assert report.auctions_margin_cap_unknown == analysis.auctions_margin_cap_unknown
     assert report.delta_score == analysis.delta_surplus + analysis.delta_protocol_and_partner_fees
     assert report.auctions_runner_up == analysis.auctions_runner_up
@@ -152,6 +186,9 @@ def check_report(report: aggregate.Report, payload: dict[str, Any], analysis: An
         assert sum((m.delta_margin_above_cap for m in report.moves
                     if m.delta_margin_above_cap is not None),
                    Decimal(0)) == report.delta_margin_above_cap
+    if report.delta_settled_margin is not None:
+        assert sum(v for m in report.moves
+                   if (v := m.delta_settled_margin) is not None) == report.delta_settled_margin
     # Δscore per auction carries the fee leg only where every fee is priced.
     for row in payload["changed"]:
         fees = row["delta_protocol_and_partner_fees"] if row["fees_complete"] else 0
@@ -162,12 +199,14 @@ def check_rows(table: aggregate.Table, windows: list[aggregate.SolverWindow]) ->
     rows = dict(table.rows)
     labels = [label for label, _ in table.rows]
     # The block closes the table, right after the filter rows.
-    assert labels[-7:] == [
+    assert labels[-9:] == [
         "  filter verdicts resting on surplus, in those auctions",
         "runner-up to another winner",
         "Δother winners' rewards (capped)",
         "Δother winners' margin over their reference",
+        "  winners that settled",
         "  above the reward cap, winners that settled",
+        "  consistency rewards paid ÷ margin of winners that settled",
         "  over their winning solutions' volume",
         "  largest single auction of those",
     ]
@@ -204,6 +243,26 @@ def check_rows(table: aggregate.Table, windows: list[aggregate.SolverWindow]) ->
             assert cell["  above the reward cap, winners that settled"] == (
                 oracle.signed_eth_text(above) + " ETH"
                 + (f"; {unknown:,} auctions with an unknown cap left out" if unknown else ""))
+        # The settled winners' margin, uncapped, and consistency paid over it, native.
+        settled = head.delta_settled_margin
+        settled_cell = cell["  winners that settled"]
+        ratio_cell = cell["  consistency rewards paid ÷ margin of winners that settled"]
+        paid = head.paid
+        if settled is None:
+            assert settled_cell == "not computed (surplus mode)"
+            assert ratio_cell == "n/a"
+        else:
+            assert settled_cell == oracle.signed_eth_text(settled) + " ETH" + left_out
+            missing = paid.unaccounted["consistency"] if paid is not None else 0
+            if paid is None:
+                assert ratio_cell == "n/a"
+            elif missing and missing >= paid.auctions:
+                assert ratio_cell == "pending"
+            else:
+                ratio = (f"{paid.amount('consistency') / settled:.2f}"
+                         if settled > 0 else "n/a")
+                assert ratio_cell == ratio + (
+                    "; consistency paid incomplete" if missing else "")
         volume = head.reference_margin_volume
         if volume:
             value = Decimal(head.delta_reference_margin) * 10_000 / Decimal(volume)

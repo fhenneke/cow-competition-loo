@@ -379,6 +379,74 @@ known):
 51.554 ETH of Sector's is auction 14289933, where its losing bid set Rizzolver's
 reference on a 6,291 ETH order and the whole rise lies above Rizzolver's cap.
 
+### The margin of settled winners
+
+`delta_settled_margin` is the pressed winners' margin over their reference,
+counterfactual − actual, uncapped, over the winners whose wins all settled. It is what
+consistency rewards are set against.
+
+**Why the margin and not the rewards.** The margin is the rent a runner-up's bid takes
+from the winner. Without the runner-up the winner gets it back, and the mechanism only
+decides who pays it:
+
+- below the upper cap, the protocol pays it as performance reward, out of the pool that
+  would otherwise pay consistency (`delta_pressed_rewards_capped`);
+- above the cap, users pay it when the winner bids worse at no cost in reward
+  (`delta_margin_above_cap`);
+- in a mechanism with no performance rewards and only a consistency budget, users pay
+  all of it, and Δrewards would mean nothing.
+
+The amount does not depend on how rewards are paid, so it is a mechanism-agnostic
+measure to set a mechanism-specific payment against. Consistency paid ÷ settled Δmargin
+reads as the share of that rent the winners would have to take, absent the solver, for
+its consistency rewards to be earned.
+
+**Why settled winners only.** A batch that did not land delivered nothing, so there is
+no rent to take under any mechanism. Plain `delta_reference_margin` also counts those
+winners. Their penalty change is left out too: penalties belong to this mechanism.
+
+**How it fits the capped figures.** A settled winner's uncapped reward is its margin, so
+its capped reward is min(margin, upper cap) and its part above the cap is
+max(0, margin − upper cap). The two split its margin at the cap, so
+
+```
+Δpressed rewards (capped) + Δmargin above cap = settled Δmargin + Δcapped reward of the
+                                                pressed winners that did not settle
+```
+
+except in an excluded auction, where every capped reward is 0 and only the part above
+the cap is left (`tests/sim/runner_up.py` `check_value`). The settled Δmargin covers the
+same auctions as the two capped figures: an auction with a pressed winner whose cap is
+unknown is left out of all three and counted. Score mode only, since surplus mode has no
+reward rows to tell settlement by.
+
+**What it still assumes.** Bids are fixed, as made under today's mechanism, and winners
+and references come from today's winner selection: it is agnostic about payments, not
+about allocation. Taking the whole margin assumes a winner that knows the second-best
+bid, so it is the most rent the runner-up protects, not a user loss. It is heavy-tailed,
+hence the largest-auction share beside it.
+
+**It does not add up to the consistency pool.** The pool is every winner's unused cap
+plus penalties; a margin counts only what one solver's bids hold back from the winners
+that keep their solutions, and single removals do not add up to a joint one. Measured
+2026-11-26 on the all-solver reports for 2026-11-03..17 (inherited, every cap known,
+`out/consistency-margin-2026-11-03/`), summed over every solver:
+
+| Network | settled Δmargin | all pressed winners' Δmargin | Δpressed rewards (capped) | Σ consistency paid | paid ÷ settled |
+| --- | --- | --- | --- | --- | --- |
+| mainnet | +185.982 ETH | +359.542 ETH | +30.606 ETH | 90.181 ETH | 0.48 |
+| base | +11.768 ETH | +12.991 ETH | +1.315 ETH | 3.454 ETH | 0.29 |
+| arbitrum-one | +9.888 ETH | +14.077 ETH | +0.854 ETH | 1.746 ETH | 0.18 |
+| bnb | +14.121 BNB | +16.531 BNB | +1.441 BNB | 3.492 BNB | 0.25 |
+
+On mainnet, winners that did not settle carry about half of the plain Δmargin
+(`delta_reference_margin`), so leaving them out is first-order there; 20–28% of
+mainnet winners have not landed in time since its deadline went to one block on
+2026-11-03. The identity above left a penalty term of 2.552,
+0.047, 0.012 and 0.019 in the same order. Every other field of these reports equals the
+format-18 run of 2026-11-25 exactly, and recorded payouts to within the wei rounding of
+the per-auction split.
+
 `Δscore` beside it is Δsurplus + Δprotocol and partner fees, the fee leg over the
 auctions whose fees are all priced. With bids fixed it is the solver's own marginal
 contribution, the quantity the performance reward pays before caps.

@@ -940,6 +940,12 @@ def report_analysis(
         )
     above = analysis.delta_margin_above_cap
     pressed = analysis.delta_pressed_rewards_capped
+    settled = analysis.delta_settled_margin
+    if settled is not None:
+        print(
+            f"  winners that settled        {eth(settled)} ETH"
+            "   <- uncapped: the rent the solver's bids take from them, whoever pays it"
+        )
     if pressed is not None:
         print(
             f"delta their capped rewards    {eth(pressed)} ETH"

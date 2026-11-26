@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal, getcontext
 from statistics import median
 from typing import Any
@@ -23,7 +23,7 @@ WEI = Decimal(10) ** 18
 HEADLINE_RULE = "inherited"
 ALTERNATIVE_RULES = ("assume-settled",)
 
-REPORT_FORMAT = 18
+REPORT_FORMAT = 19
 """Bump whenever the `analyse --out` payload shape changes."""
 
 SIGN_CONVENTION_ID = "counterfactual-minus-actual"
@@ -53,7 +53,12 @@ CAVEATS = (
     "one and the reward comes out of the same weekly pool as the consistency budget. "
     "Δother winners' rewards (capped) needs no such theory: it is what the mechanism "
     "would pay those winners more without the solver's bids, which the consistency "
-    "budget then lacks, their caps being the same on both sides.",
+    "budget then lacks, their caps being the same on both sides. Consistency rewards are "
+    "set against the margin of the winners that settled, uncapped: the rent the "
+    "solver's losing bids take from those winners, whoever pays it — the protocol as "
+    "reward below the cap, users above it — so it does not depend on how rewards are "
+    "paid. It takes the whole margin, as if a winner knew the second-best bid: the most "
+    "the runner-up protects, not a user loss.",
     "Settlement risk: winning an auction does not guarantee the batch lands on-chain, "
     "so the counterfactual must assume something about settlement. The headline rule "
     "(`inherited`) keeps each auction slot's recorded outcome — a batch that actually "
@@ -172,6 +177,8 @@ class AuctionMove:
     """Its part above the reward cap, settled winners only; None without caps."""
     delta_pressed_rewards_capped: Decimal | None = None
     """Those winners' capped rewards, counterfactual − actual; None without caps."""
+    delta_settled_margin: int | None = None
+    """The margin of those that settled, uncapped; None where the two above are."""
     delta_score: int = 0
     """Δsurplus + Δprotocol and partner fees (fee leg where every fee is priced)."""
     delta_consistency_budget: Decimal | None = None
@@ -350,6 +357,10 @@ class Report:
     delta_pressed_rewards_capped: Decimal | None
     """Those winners' capped rewards, counterfactual − actual: what the solver's bids held
     back from them, which the consistency budget gets instead. None in surplus mode."""
+    delta_settled_margin: int | None
+    """The margin of the winners that settled, uncapped, counterfactual − actual: the rent
+    the solver's losing bids take from the winners, whoever pays it. Over the auctions of
+    the two above; None in surplus mode."""
     auctions_margin_cap_unknown: int
     delta_score: int
     """Δsurplus + Δprotocol and partner fees."""
@@ -617,6 +628,7 @@ def load_report(path: str) -> Report:
             delta_pressed_rewards_capped=_decimal_or_none(
                 row["delta_pressed_rewards_capped"]
             ),
+            delta_settled_margin=row["delta_settled_margin"],
             delta_score=row["delta_score"],
             delta_consistency_budget=_decimal_or_none(row["delta_consistency_budget"]),
         )
@@ -700,6 +712,7 @@ def load_report(path: str) -> Report:
         delta_pressed_rewards_capped=_decimal_or_none(
             payload["delta_pressed_rewards_capped"]
         ),
+        delta_settled_margin=payload["delta_settled_margin"],
         auctions_margin_cap_unknown=payload["auctions_margin_cap_unknown"],
         delta_score=payload["delta_score"],
         moves=moves,
@@ -760,6 +773,18 @@ def load_report(path: str) -> Report:
                         if m.delta_pressed_rewards_capped is not None
                     ),
                     Decimal(0),
+                ),
+            )
+        )
+    if report.delta_settled_margin is not None:
+        checks.append(
+            (
+                "delta_settled_margin",
+                report.delta_settled_margin,
+                sum(
+                    m.delta_settled_margin
+                    for m in moves
+                    if m.delta_settled_margin is not None
                 ),
             )
         )
@@ -1061,7 +1086,9 @@ def comparison(
     runner_up = row("runner-up to another winner")
     pressed_rewards = row("Δother winners' rewards (capped)")
     margin = row("Δother winners' margin over their reference")
+    margin_settled = row("  winners that settled")
     margin_above = row("  above the reward cap, winners that settled")
+    margin_ratio = row("  consistency rewards paid ÷ margin of winners that settled")
     margin_bps = row("  over their winning solutions' volume")
     margin_whale = row("  largest single auction of those")
 
@@ -1250,7 +1277,9 @@ def comparison(
         )
         margin.append(_margin_cell(report, usd))
         pressed_rewards.append(_pressed_rewards_cell(report, usd))
+        margin_settled.append(_settled_margin_cell(report, usd))
         margin_above.append(_above_cap_cell(report, usd))
+        margin_ratio.append(_settled_margin_ratio_cell(report))
         margin_bps.append(
             f"{bps(report.reference_margin_bps)} of "
             f"{eth(report.reference_margin_volume, 2)} ETH "
@@ -1486,6 +1515,32 @@ def _above_cap_cell(report: Report, usd: UsdContext | None) -> str:
     return cell
 
 
+def _settled_margin_cell(report: Report, usd: UsdContext | None) -> str:
+    margin = report.delta_settled_margin
+    if margin is None:
+        return "not computed (surplus mode)"
+    cell = f"{signed_eth(margin)} ETH"
+    if usd:
+        deltas: dict[int, int | Decimal] = {
+            m.auction_id: v for m in report.moves if (v := m.delta_settled_margin) is not None
+        }
+        cell += f" ({usd_amount(usd_total(deltas, usd))})"
+    if report.auctions_margin_cap_unknown:
+        cell += f"; {report.auctions_margin_cap_unknown:,} auctions with an unknown cap left out"
+    return cell
+
+
+def _settled_margin_ratio_cell(report: Report) -> str:
+    margin, paid = report.delta_settled_margin, report.paid
+    if margin is None or paid is None:
+        return "n/a"
+    missing = paid.unaccounted["consistency"]
+    if missing and missing >= paid.auctions:
+        return "pending"
+    ratio = _consistency_ratio(paid.amount("consistency"), Decimal(margin))
+    return ratio + ("; consistency paid incomplete" if missing else "")
+
+
 def _net_cell(report: Report, usd: UsdContext | None) -> str:
     """Δsurplus − capped Δrewards: only the capped figure is at payout scale."""
     if report.delta_rewards_capped is None:
@@ -1679,9 +1734,12 @@ def summary(
         return f"{sign}${abs(whole):,}"
 
     entries: list[tuple[Decimal, str, list[str]]] = []
+    totals: dict[tuple[str, str, str, str], _SummaryTotal] = {}
     warnings: list[str] = []
     for window in windows:
         report = window.headline
+        total = totals.setdefault(report.window, _SummaryTotal())
+        total.rows += 1
         surplus_moves = {m.auction_id: m.delta_surplus for m in report.moves}
         score_moves = {m.auction_id: m.delta_score for m in report.moves}
         surplus = amount(report, report.delta_surplus, surplus_moves)
@@ -1692,22 +1750,42 @@ def summary(
             missing = paid.unaccounted[component] if paid is not None else 0
             if paid is None:
                 reward[component] = "n/a"
+                total.incomplete.add(component)
             elif missing and missing >= paid.auctions:
                 reward[component] = "pending"
+                total.incomplete.add(component)
             else:
                 value = amount(report, paid.amount(component), paid.amounts(component))
                 reward[component] = text(value, signed=False) + ("*" if missing else "")
+                total.paid[component] += value
+                if missing:
+                    total.incomplete.add(component)
 
-        pressed = report.delta_pressed_rewards_capped
-        if pressed is None:
-            pressed_cell = "n/a"
+        margin = report.delta_settled_margin
+        if margin is None:
+            margin_cell = ratio_cell = "n/a"
+            total.incomplete.add("margin")
         else:
-            pressed_moves: dict[int, int | Decimal] = {
-                m.auction_id: m.delta_pressed_rewards_capped
-                for m in report.moves
-                if m.delta_pressed_rewards_capped is not None
+            margin_moves: dict[int, int | Decimal] = {
+                m.auction_id: v for m in report.moves
+                if (v := m.delta_settled_margin) is not None
             }
-            pressed_cell = text(amount(report, pressed, pressed_moves), signed=True)
+            margin_amount = amount(report, Decimal(margin), margin_moves)
+            margin_cell = text(margin_amount, signed=True) + _largest_share(margin_moves)
+            total.margin += margin_amount
+            total.margin_native += margin
+            if paid is not None:
+                total.consistency_native += paid.amount("consistency")
+            if report.auctions_margin_cap_unknown:
+                total.incomplete.add("margin")
+                margin_cell += "*"
+            # Native over native: one token, so exact and free of the USD conversion.
+            ratio_cell = (
+                _consistency_ratio(paid.amount("consistency"), Decimal(margin))
+                + ("*" if paid.unaccounted["consistency"] else "")
+                if paid is not None and reward["consistency"] != "pending"
+                else reward["consistency"]
+            )
         quote = report.quote
         if quote is None:
             quote_cell = "not run"
@@ -1726,8 +1804,9 @@ def summary(
             reward["performance"],
             # second-best bids
             f"{report.auctions_runner_up:,}",
-            pressed_cell,
+            margin_cell,
             reward["consistency"],
+            ratio_cell,
             # quotes
             quote_cell,
             reward["quote"],
@@ -1742,6 +1821,12 @@ def summary(
             f"no USD rates for {', '.join(lacking)}: every amount is in the native token"
         )
     entries.sort(key=lambda entry: entry[0])
+    rows = [(label, cells) for _, label, cells in entries]
+    for key, total in totals.items():
+        if total.rows < 2:
+            continue
+        label = "total" + (f" ({key[0]} {key[1]}..{key[2]}, {key[3]})" if windows_differ else "")
+        rows.append((label, total.cells(lambda v, signed: text(v, signed=signed))))
 
     unit = "USD, each auction at its own rate" if in_usd else "ETH (the native token)"
     notes = (
@@ -1755,9 +1840,17 @@ def summary(
         "Winning: Δscore is Δsurplus + Δprotocol and partner fees, what the winning bids "
         "delivered; performance rewards pay for it.",
         "Second-best bids: runner-up counts auctions where a losing bid of the solver sets "
-        "another winner's reference score. Δwinners' rewards is what the mechanism would "
-        "pay the winners that keep the same solutions more without the solver, capped; "
-        "the consistency budget, which pays consistency rewards, lacks exactly that much.",
+        "another winner's reference score. Δwinners' margin is how far the margin over "
+        "their reference of the winners that keep the same solutions and settled rises "
+        "without the solver, uncapped: the rent its losing bids take from those winners, "
+        "whoever pays it (the protocol as reward below the cap, users above it). It does "
+        "not depend on how rewards are paid. consistency ÷ margin is consistency paid "
+        "over it, in the native token. * some auctions with an unknown cap left out.",
+        "total: the sum of the solver rows of one network and window, for the recorded "
+        "rewards and Δwinners' margin; the ratio is of the native sums. Single removals do not "
+        "add up to a joint one, and the margins do not add up to the consistency pool: "
+        "a margin counts only what one solver's bids hold back. * some auctions or rows "
+        "missing.",
         "Quotes: Δquote is the change in the quoted amounts of executed orders without "
         "the solver in the quote competition, at the window's median rate (needs analyse "
         "--quotes). Quote rewards pay for accuracy, not for winning: the five quotes "
@@ -1766,13 +1859,54 @@ def summary(
     return Table(
         columns=(
             "won", "Δsurplus", "orders lost", "Δscore", "performance", "runner-up",
-            "Δwinners' rewards", "consistency", "Δquote", "quote",
+            "Δwinners' margin", "consistency", "consistency ÷ margin",
+            "Δquote", "quote",
         ),
-        rows=tuple((label, tuple(cells)) for _, label, cells in entries),
+        rows=tuple((label, tuple(cells)) for label, cells in rows),
         warnings=tuple(warnings),
         notes=notes,
         right_aligned=True,
     )
+
+
+def _consistency_ratio(consistency: Decimal, margin: Decimal) -> str:
+    """Consistency rewards paid over Δwinners' margin; n/a unless the margin is positive."""
+    if margin <= 0:
+        return "n/a"
+    return f"{consistency / margin:.2f}"
+
+
+@dataclass
+class _SummaryTotal:
+    """The summary's additive columns, summed over one network-window's solver rows."""
+
+    rows: int = 0
+    paid: dict[Component, Decimal] = field(
+        default_factory=lambda: {c: Decimal(0) for c in COMPONENTS}
+    )
+    margin: Decimal = Decimal(0)
+    margin_native: Decimal = Decimal(0)
+    consistency_native: Decimal = Decimal(0)
+    """The ratio's two sums in the native token, as each row's ratio; one token per
+    network-window."""
+    incomplete: set[str] = field(default_factory=set[str])
+    """Columns where some row was n/a, pending or partly accounted."""
+
+    def cells(self, text: Callable[[Decimal, bool], str]) -> list[str]:
+        def mark(column: str) -> str:
+            return "*" if column in self.incomplete else ""
+
+        ratio = _consistency_ratio(self.consistency_native, self.margin_native)
+        return [
+            "", "", "", "",
+            text(self.paid["performance"], False) + mark("performance"),
+            "",
+            text(self.margin, True) + mark("margin"),
+            text(self.paid["consistency"], False) + mark("consistency"),
+            ratio + (mark("consistency") or mark("margin")),
+            "",
+            text(self.paid["quote"], False) + mark("quote"),
+        ]
 
 
 def _largest_share(deltas: Mapping[int, int | Decimal]) -> str:

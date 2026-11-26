@@ -232,7 +232,10 @@ function renderQuotes() {
    Its own table, not columns in the focus band: three groups (winning, second-best bids,
    quotes), each a contribution with bids fixed, then the reward that pays for it. Reward
    columns are recorded amounts, not deltas, so they are unsigned and uncoloured. One row
-   per solver-chain in scope, never summed across chains, in the solver table's order. */
+   per solver-chain in scope, never summed across chains, in the solver table's order.
+   Six columns after the solver: Δscore | performance | Δother winners' margin, settled
+   winners, uncapped (capped Δrewards beneath) | consistency (÷ margin beneath) | Δquote |
+   quote. */
 function paidCell(p, component, sym) {
   const missing = p.unaccounted[component];
   if (missing && missing >= p.auctions) {
@@ -267,20 +270,23 @@ function renderPaid() {
     const [perf, cons, quote] =
       ["performance", "consistency", "quote"].map(c => paidCell(p, c, d.sym));
     // Three groups, each the contribution with bids fixed, then the reward paying for it.
-    const pressed = r.rewards_usd === null ? none("no reward caps in surplus mode")
-      : `<td class="group-start ${neg(r.rewards_usd)}">${fmtUsd(r.rewards_usd)}</td>`;
+    const settled = r.settled_usd === null ? none("no settlement records in surplus mode")
+      : `<td class="group-start ${neg(r.settled_usd)}">${fmtUsd(r.settled_usd)}</td>`;
     const quoted = !q ? none("the run had no quote pass")
       : `<td class="group-start ${neg(q.delta_usd)}">${fmtUsd(q.delta_usd)}</td>`;
     out.push(`<tr class="main"><td class="chain" rowspan="2">${shown}</td>` +
       `<td class="group-start ${neg(d.usd_score)}">${fmtUsd(d.usd_score)}</td>` + perf.main +
-      pressed + cons.main + quoted + quote.main + `</tr>`);
+      settled + cons.main + quoted + quote.main + `</tr>`);
     out.push(`<tr class="detail">` +
       `<td class="group-start">${fmtNat(d.native_score, d.sym)}<br>Δsurplus ${fmtUsd(d.usd_s)}<br>Δfees ${
         fmtUsd(d.usd_f)}</td>` + perf.detail +
-      `<td class="group-start">${r.rewards === null ? "" : fmtNat(r.rewards, d.sym) + "<br>"}runner-up in ${
+      `<td class="group-start">${r.settled === null ? "" : fmtNat(r.settled, d.sym) + "<br>"}${
+        r.rewards_usd === null ? "" : `capped Δrewards ${fmtUsd(r.rewards_usd)}<br>`}runner-up in ${
         r.auctions.toLocaleString("en-US")}<br>${
         d.bid ? pct(r.auctions / d.bid, 1) : "n/a"} of its bids${
-        r.cap_unknown ? `<br>${r.cap_unknown} auctions cap unknown` : ""}</td>` + cons.detail +
+        r.cap_unknown ? `<br>${r.cap_unknown} auctions cap unknown` : ""}</td>` +
+      cons.detail.replace("</td>", `<br>÷ margin ${
+        r.ratio === null || r.ratio === undefined ? "n/a" : r.ratio.toFixed(2)}</td>`) +
       (q ? `<td class="group-start">${fmtBps(q.window_bps, 2)} of executed volume<br>${
         q.no_quote.toLocaleString("en-US")} orders not quoted<br>${
         q.wins.toLocaleString("en-US")} quote wins</td>` : '<td class="group-start"></td>') +

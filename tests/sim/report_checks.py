@@ -124,6 +124,9 @@ def check_tampering(payload: dict[str, Any], tmp_path: Path) -> None:
         if payload["delta_margin_above_cap"] is not None:
             refused({"delta_margin_above_cap":
                      str(Decimal(payload["delta_margin_above_cap"]) + 1)}, "above cap")
+        if payload["delta_settled_margin"] is not None:
+            refused({"delta_settled_margin": payload["delta_settled_margin"] + 1},
+                    "settled margin")
     for name in ("performance", "consistency", "quote", "total"):
         paid = copy.deepcopy(payload["paid"])
         paid[name] = str(Decimal(paid[name]) + 1)

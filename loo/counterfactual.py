@@ -882,6 +882,35 @@ class AuctionCounterfactual:
             return None
         return loo - base
 
+    @staticmethod
+    def _settled_margin(margins: Mapping[str, int], rewards: Mapping[str, SolverReward]) -> int:
+        """Σ margin over the pressed winners whose wins all settled. Callers check first
+        that every pressed winner has a reward row."""
+        return sum(
+            margin
+            for solver, margin in margins.items()
+            if rewards[solver].observed_score == rewards[solver].competition_score
+        )
+
+    @property
+    def delta_settled_margin(self) -> int | None:
+        """The pressed winners' margin over their reference, counterfactual − actual, over
+        those whose wins all settled: the rent the removed solvers' losing bids take from
+        the winners, whoever ends up paying it (docs/winner-selection.md, "The margin of
+        settled winners"). Defined where the two capped figures are, so the three cover
+        the same auctions."""
+        if self.delta_margin_above_cap is None or self.delta_pressed_rewards_capped is None:
+            return None
+        return self.settled_margin_loo - self.settled_margin_base
+
+    @property
+    def settled_margin_base(self) -> int:
+        return self._settled_margin(self.reference_margins_base, self.baseline_rewards)
+
+    @property
+    def settled_margin_loo(self) -> int:
+        return self._settled_margin(self.reference_margins_loo, self.loo_rewards)
+
     @property
     def delta_score(self) -> int:
         """Δsurplus + Δprotocol and partner fees, the fee leg only where every fee is
@@ -1423,8 +1452,11 @@ class Analysis:
     pressed_rewards_capped_base: Decimal = Decimal(0)
     pressed_rewards_capped_loo: Decimal = Decimal(0)
     """Σ capped reward of the pressed winners (score mode)."""
+    settled_margin_base: int = 0
+    settled_margin_loo: int = 0
+    """Σ margin over the pressed winners that settled, uncapped (score mode)."""
     auctions_margin_cap_unknown: int = 0
-    """Auctions with a pressed winner whose cap is unknown, left out of both of the above."""
+    """Auctions with a pressed winner whose cap is unknown, left out of the three above."""
 
     valuation_failures: list[tuple[int, int, str]] = field(
         default_factory=list[tuple[int, int, str]]
@@ -1481,6 +1513,13 @@ class Analysis:
         if self.mode != "score":
             return None
         return self.pressed_rewards_capped_loo - self.pressed_rewards_capped_base
+
+    @property
+    def delta_settled_margin(self) -> int | None:
+        """None in surplus mode, which has no reward rows to tell settlement by."""
+        if self.mode != "score":
+            return None
+        return self.settled_margin_loo - self.settled_margin_base
 
     @property
     def delta_score(self) -> int:
@@ -1607,6 +1646,8 @@ class Analysis:
                 self.margin_above_cap_loo += above_loo
                 self.pressed_rewards_capped_base += paid_base
                 self.pressed_rewards_capped_loo += paid_loo
+                self.settled_margin_base += result.settled_margin_base
+                self.settled_margin_loo += result.settled_margin_loo
 
         for diff in result.order_diffs:
             self.orders_compared += 1

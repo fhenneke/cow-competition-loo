@@ -53,6 +53,8 @@ def expected(
     out["margin_above_cap_loo"] = Decimal(0)
     out["pressed_rewards_capped_base"] = Decimal(0)
     out["pressed_rewards_capped_loo"] = Decimal(0)
+    out["settled_margin_base"] = 0
+    out["settled_margin_loo"] = 0
     out["auctions_margin_cap_unknown"] = 0
     out["auctions"] = len(results)
     out["price_suspect_auctions"] = [r.auction_id for r in results if r.price_suspect]
@@ -149,6 +151,12 @@ def expected(
                 out["margin_above_cap_loo"] += above_loo
                 out["pressed_rewards_capped_base"] += paid_base
                 out["pressed_rewards_capped_loo"] += paid_loo
+                # Uncapped margin of the pressed winners whose wins all settled.
+                for key, margins, rewards in (
+                        ("settled_margin_base", r.reference_margins_base, r.baseline_rewards),
+                        ("settled_margin_loo", r.reference_margins_loo, r.loo_rewards)):
+                    out[key] += sum(m for s, m in margins.items()
+                                    if rewards[s].observed_score == rewards[s].competition_score)
         for d in r.order_diffs:
             out["orders_compared"] += 1
             out["orders_only_with_solver"] += d.executed_base and not d.executed_loo
@@ -224,9 +232,12 @@ def compare(analysis: Analysis, want: dict[str, Any]) -> None:
             want["margin_above_cap_loo"] - want["margin_above_cap_base"])
         assert analysis.delta_pressed_rewards_capped == (
             want["pressed_rewards_capped_loo"] - want["pressed_rewards_capped_base"])
+        assert analysis.delta_settled_margin == (
+            want["settled_margin_loo"] - want["settled_margin_base"])
     else:
         assert analysis.delta_margin_above_cap is None
         assert analysis.delta_pressed_rewards_capped is None
+        assert analysis.delta_settled_margin is None
     assert analysis.delta_protocol_fees == (
         want["protocol_and_partner_fees_loo"] - want["partner_fees_loo"]
         - want["protocol_and_partner_fees_base"] + want["partner_fees_base"])

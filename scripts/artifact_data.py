@@ -305,6 +305,28 @@ def row(
             "rewards": _native(report.delta_pressed_rewards_capped)
             if report.delta_pressed_rewards_capped is not None
             else None,
+            # The margin of the winners that settled, uncapped: the rent the solver's losing
+            # bids take from them, whoever pays it. What consistency rewards are set against.
+            "settled_usd": _usd_per_auction(
+                {
+                    m.auction_id: v
+                    for m in report.moves
+                    if (v := m.delta_settled_margin) is not None
+                },
+                context,
+            )
+            if report.delta_settled_margin is not None
+            else None,
+            "settled": _native(report.delta_settled_margin)
+            if report.delta_settled_margin is not None
+            else None,
+            # Consistency paid ÷ that margin, native over native; None unless both are there.
+            "ratio": float(paid.amount("consistency") / report.delta_settled_margin)
+            if paid is not None
+            and report.delta_settled_margin is not None
+            and report.delta_settled_margin > 0
+            and paid.unaccounted["consistency"] < paid.auctions
+            else None,
         },
         # --- the quote side
         "quote": None

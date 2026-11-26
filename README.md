@@ -110,8 +110,8 @@ headline. `--summary` turns it around for many solvers: one row each, sorted by
 Δsurplus, with win share, Δsurplus and orders lost, then three groups, each a
 contribution with bids fixed beside the reward paid for that kind of work: winning
 (Δscore, performance rewards), second-best bids (runner-up auctions, Δother winners'
-capped rewards, consistency rewards) and quotes (Δquote, quote rewards; needs
-`--quotes`). Quote rewards pay for accuracy, not for winning, so the quote pair sits
+margin of the winners that settled, consistency rewards, consistency ÷ margin) and quotes
+(Δquote, quote rewards; needs `--quotes`), plus a total row per network-window. Quote rewards pay for accuracy, not for winning, so the quote pair sits
 side by side without one paying for the other. Its amounts are in USD when every window
 has rates, else native. Give every rule's run of a solver-window together; a group
 without `inherited` is refused. Reports carry a format marker and older ones are refused with "re-run
@@ -239,6 +239,14 @@ Above its cap a winner's reward no longer depends on its bid, so this is score i
 withhold from users at no cost in reward; below the cap a worse bid costs it reward one
 for one, and that reward comes out of the same weekly pool as the consistency budget
 ([why the cap splits it](docs/winner-selection.md#above-the-cap)).
+
+`  winners that settled` is the margin row over the winners whose wins all settled,
+uncapped. It is the rent the solver's losing bids take from those winners, whoever pays
+it: the protocol as reward below the cap, users above it. It does not depend on how
+rewards are paid, so consistency rewards are set against it: `consistency rewards paid
+÷ margin of winners that settled`. It covers the auctions of the two capped figures and
+does not add up to the consistency pool
+([why the margin](docs/winner-selection.md#the-margin-of-settled-winners)).
 
 `Δscore (Δsurplus + Δprotocol and partner fees)` is the sum of the two rows: what the
 winning bids delivered to users, partners and the protocol, the fee leg over the
