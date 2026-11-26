@@ -94,7 +94,9 @@ def check_cli(
     }
     assert extract.all_solvers(conn, world.start, world.end) == sorted(labels)
     address = sorted(bidding)[0]
-    addresses, _ = extract.resolve_solver(conn, base58(address), world.start, world.end)
-    assert addresses == {address}
-    addresses, _ = extract.resolve_solver(conn, "0x" + address, world.start, world.end)
-    assert addresses == {address}
+    directory = extract.solver_directory(conn, world.start, world.end)
+    for spelled in (base58(address), "0x" + address):
+        addresses, _ = extract.resolve_solver(
+            directory, spelled, world.start, world.end, "solana"
+        )
+        assert addresses == {address}

@@ -21,9 +21,10 @@ waits forever (a run sat 7.5 hours that way on 2026-10-22). `connect()` sets:
   minutes after the line goes quiet. A live server answers the probes however long its
   query runs, so slow is never taken for dead. `tcp_user_timeout=120000` covers
   unacknowledged sends on Linux only; macOS accepts and ignores it.
-- **`statement_timeout = 30min`** (server default: none). The slowest statement measured
-  on the default path is the quote side's `ORDERS_SQL`, 81 s for 310,567 rows over mainnet
-  2026-08-01..10-20 (measured 2026-10-22); chunked extraction queries take under a second.
+- **`statement_timeout = 30min`** (server default: none). No statement on the default path
+  needs more than a few seconds: every query is chunked by auctions or orders, and the
+  window-wide ones (`WINDOW_SQL`, `SOLVERS_SQL`, the quote side's `ORDER_UIDS_SQL` and
+  `ORDER_TRADES_SQL`) take seconds over a mainnet week.
 
 `fetch` and `run` re-raise these as `db.ConnectionLostError` / `db.StatementTimeoutError`
 (tested via `conn.closed`, not the message), and the CLI exits 6.
@@ -117,9 +118,12 @@ from the parallel `price_tokens` / `price_values` arrays of
   2026-07-30 (measured 2026-11-23); prices before that exist nowhere in the DB.
 - No array repeats a token, has a length mismatch or a NULL element. While the legacy
   table existed the two sources agreed to the wei on 780,240 of 780,240 sampled prices.
-- The row is wide, so unnesting costs more than an index lookup: +0.25 s per 200-auction
-  `PRICES_SQL` chunk, and 57 s for the quote side's window-wide median
-  (`quotes.TOKEN_PRICES_SQL`) over a week (mainnet, cold, September 2026).
+- The row is wide, so unnesting costs more than an index lookup. A price `loo` needs per
+  (auction, token) is read by position, `price_values[array_position(price_tokens, t)]`
+  (`PRICES_SQL`, `quotes.TRADE_PRICES_SQL`): 21–37 ms a 200-auction chunk against 103–120
+  ms unnested. The quote side's window median (`quotes.TOKEN_PRICES_SQL`) has to read every
+  price, so it counts (token, price) pairs per chunk of auctions and takes the median in
+  Python, as `percentile_cont` computes it ([why](#what-a-first-run-costs-and-where)).
 - **Do not use `int_backend_data__auction_prices`** instead: it holds only tokens of
   *settled* trades, so losing bids, unsettled winners and untraded stablecoins have no
   price there.
@@ -225,7 +229,13 @@ where block_deadline between
   and (select max(block_number) from dbt.stg_rpc_data__block_timestamp where time <  :end)
 ```
 
-The same auction universe the dbt reward models use.
+The same auction universe the dbt reward models use. `loo` finds the two blocks by
+bisecting the block numbers (`extract.WINDOW_BLOCKS`), ~30 index lookups: the `min(…)`
+above reads every block from the table's start, 11–14 s on arbitrum-one (100M blocks)
+and 6–11 s on bnb, three times per run. The answers are equal (24 windows on mainnet,
+base, arbitrum-one and bnb, past the table's ends included) because a block's time never
+falls below its predecessor's: no inversion since 2026-09-01 on those chains (622k, 11M,
+27M and 16M blocks), as consensus requires.
 
 ## `order_surplus_atoms_in_surplus_token` rounds
 
@@ -381,13 +391,80 @@ mainnet, 7-day window, partly warm:
 
 | query | plan | time |
 | --- | --- | --- |
-| `ALL_SOLVERS_SQL` / `SOLVER_SQL`, CTE join | seq scan + hash join | 1.6–10 s each |
+| `ALL_SOLVERS_SQL` / per-name `SOLVER_SQL`, CTE join | seq scan + hash join | 1.6–10 s each |
 | with `ps.auction_id between (min) and (max)` of the window | index scan | 0.3–0.6 s |
 
 Cold or on a busy server each scan takes minutes, which was the whole of the
-"`--all-solvers` never returns" reports. Both queries carry the range bound now (results
-identical row for row). Give any query touching a large staging table an explicit
-`auction_id` range or id array, and check `explain` for `Seq Scan on stg_backend_data__…`.
+"`--all-solvers` never returns" reports. `ALL_SOLVERS_SQL` and `SOLVERS_SQL` (which
+replaced the per-name query: one read of the catalogue with every entry's activity,
+names matched in Python) carry the range bound. Give any query touching a large staging
+table an explicit `auction_id` range or id array, and check `explain` for
+`Seq Scan on stg_backend_data__…`.
+
+## What a first run costs, and where
+
+A run whose window has no snapshot yet waits on the DB and ClickHouse, not on its own
+CPU. Measured 2026-11-26, week 2026-11-17..24, `--quotes`, every solver removed in turn:
+
+| chain | weekly first run, 16:28–17:15 UTC | before, read after the new code | now | replay |
+| --- | --- | --- | --- | --- |
+| mainnet (39,554 auctions) | 939 s | 361 s (11-03..10) | 99 s (52 s for 11-03..10) | 55 s |
+| bnb (44,917) | 1,044 s | 503 s | 69 s | 39 s |
+| base (22,308) | 349 s | 302 s | 34 s | |
+| arbitrum-one (11,851) | 518 s | 375 s | 14 s | |
+
+The first column is the real first run of the week (code before the replay speed-up
+too); the second is the code just before this work, run straight after the new code on
+the same window, so the DB had the window cached — reversed, base 11-10..17 took 276 s
+before and 37 s now. The new runs are on cached data too; reports are equal apart from
+the order of quote diffs and a wei of the recorded weekly rewards (below).
+
+What took the time, and what `loo` does about it:
+
+- **The window's first block cost a scan of every block before it**: up to 14 s per
+  query on arbitrum-one, run by three queries
+  ([bisected now](#mapping-a-date-window-to-auctions)).
+- **The server saturates early.** One query at a time leaves it idle in the round trip and
+  the transfer, but it stops gaining at about 2.2 queries' worth of work in flight
+  (16 chunks: 10.5 s serially, 4.7 s from 4 connections, 5.0 s from 8; in-query parallel
+  workers off). So `loo` reads ahead on six connections (`db.PARALLEL_READS`) while the
+  analysis runs, and what it saves beyond that comes from making each query cheaper.
+- **`= any(ca.order_uids)` reads the whole array per row.** A mainnet auction's
+  `order_uids` is ~300 kB (6,300 uids) stored out of line, and the membership test fetched
+  and copied all of it for every execution row. `EXECUTIONS_SQL` tests each distinct
+  (auction, order) pair once instead: 4.7x less server time (349 → 75 ms a chunk).
+  Unnesting the array per auction is worse (3.5 s a chunk): 1.26M rows to hash.
+- **`o.uid in (select … )` scans every order.** The planner cannot size the subquery and
+  hash-joins a sequential scan of `stg_backend_data__orders` (2.5M rows, 270 ms a chunk).
+  `= any(array(select …))` keeps it on the uid index (8 ms).
+- **Raw tables are cold.** A lookup into `raw_prod_<chain>.order_quotes` read from disk
+  1.7 ms per order, the bulk of the quote side's Postgres time; `quote_id` comes from
+  staging now ([why](quotes.md#quote-ids-link-an-order-to-its-competition-exactly--from-2026-09-29)).
+- **Staging has no `creation_timestamp` index**, so the window's orders cost one scan of
+  the orders table (`ORDER_UIDS_SQL`); their quotes are then looked up 500 at a time on
+  the parallel connections.
+- **ClickHouse reads whole parts.** `raw_quotes.price_estimates` is sorted by estimator
+  and token pair, not time, so a query reads every part its time window touches, and
+  parts hold about a week (mainnet, November 2026: 141M rows, 18 GB read for one day's
+  link). The link reads several days per query, each row tagged with the days it belongs
+  to ([how](quotes.md#quote-ids-link-an-order-to-its-competition-exactly--from-2026-09-29)):
+  three days merged read 30 GB in 6.5 s where three single days read 54.5 GB in 11.1 s.
+  The parser's 256 kB limit is raised from the URL (`ch.MAX_QUERY_BYTES`); the proxy in
+  front still refuses a request body over about 1 MB (`413 Request Entity Too Large`),
+  which bounds how many quote ids or request keys one query can name.
+- **Request-less estimates are rare, so read the null map first.** The re-quote lookup
+  (`request_id is null` plus request keys) read four string columns of every row, 4.8 s
+  and 21 GB a day; `prewhere request_id is null` reads them only where such rows are,
+  0.3 s and 0.8 GB. The ladder's `request_id in (…)` gains nothing from `prewhere`: the
+  test itself needs `request_id` of every row.
+- **The quote side ran the whole analysis again per touched bid.** Where a scenario
+  replaces an order's quote, every bid of the auction was valued anew; only the bids
+  holding a replaced order can change, so only those are (a mainnet week's replay
+  39.5 → 35 s, reports equal).
+- **Some sums come back different every time.** `sum()` over doubles in a parallel plan
+  depends on the order the workers finish (`RELATIVE_SURPLUS_TOTALS_SQL`: 870.4498952577546,
+  …754, …7468 on three runs), so the recorded consistency and quote parts can move by a
+  wei between any two runs, old code or new.
 
 ## Who placed an order: app code, owner, token symbols
 

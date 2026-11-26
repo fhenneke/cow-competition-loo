@@ -3,9 +3,10 @@
 `loo.ch.Client.fetch` runs unchanged — it builds the request, `urllib` "sends" it, and
 the reply is a `JSONCompact` body — because `urlopen` is the thing replaced. The five
 query shapes the quote link sends are recognised by their leading select and answered
-with their filters applied: chain id, the event-time window, the quote-id subquery and
-the request-key tuples. Amounts come back as exact decimal strings, as the raw layer
-stores them, and a `ReplacingMergeTree` duplicate is served now and then.
+with their filters applied: chain id, and per unit (a day of the link) its event-time
+window and its quote-id subquery or request-key tuples, each row tagged with the units it
+meets. Amounts come back as exact decimal strings, as the raw layer stores them, and a
+`ReplacingMergeTree` duplicate is served now and then.
 """
 
 from __future__ import annotations
@@ -13,17 +14,30 @@ from __future__ import annotations
 import io
 import json
 import re
+import threading
 import urllib.error
+import urllib.parse
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 from .world import Estimate, Request, World
 
+PROXY_BODY_BYTES = 1_000_000
+"""nginx's `client_max_body_size` in front of the real endpoint, about 1 MB."""
+
 TAIL = re.compile(r"\nsettings max_execution_time = (\d+)\nformat JSONCompact$")
-WINDOW = re.compile(r"event_timestamp >= '([^']+)' and event_timestamp < '([^']+)'")
+WINDOW = r"event_timestamp >= '([^']+)' and event_timestamp < '([^']+)'"
+LINK_UNIT = re.compile(
+    rf"if\({WINDOW} and request_id in \(select request_id from raw_quotes\.price_estimates "
+    rf"where chain_id = \d+ and {WINDOW} and quote_id in \(([\d, ]+)\)\), (\d+), 0\)"
+)
+REQUOTE_UNIT = re.compile(
+    rf"if\({WINDOW} and \(lower\(sell_token\), lower\(buy_token\), kind, in_amount\) "
+    rf"in \((.*?)\), (\d+), 0\)"
+)
 KEYS = re.compile(r"\('0x([0-9a-f]+)', '0x([0-9a-f]+)', '(\w+)', '(\d+)'\)")
 
 LADDER = ("request_id", "estimator", "solver", "quote_id", "kind", "sell_", "buy_",
@@ -56,6 +70,7 @@ class SimClickHouse:
     refuse_at: int | None = None
     truncate_at: int | None = None
     queries: list[str] = field(default_factory=list[str])
+    _count: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def urlopen(self, request: urllib.request.Request, timeout: float) -> Response:
         data = request.data
@@ -66,8 +81,23 @@ class SimClickHouse:
         assert timeout == int(tail.group(1)) + 30, "the socket must outlive the query"
         assert request.get_header("X-clickhouse-user") == "sim-reader"
         sql = body[: tail.start()]
-        self.queries.append(sql)
-        n = len(self.queries)
+        # The proxy in front refuses a body over 1 MB, before ClickHouse sees it.
+        if len(data) > PROXY_BODY_BYTES:
+            raise urllib.error.HTTPError(
+                "http://sim.clickhouse", 413, "Request Entity Too Large", None,  # type: ignore[arg-type]
+                io.BytesIO(b"<html>413 Request Entity Too Large</html>"),
+            )
+        # The parser's limit: 256 kB unless the URL raises it.
+        settings = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+        limit = int(settings.get("max_query_size", ["262144"])[0])
+        if len(data) > limit:
+            raise urllib.error.HTTPError(
+                "http://sim.clickhouse", 400, "Bad Request", None,  # type: ignore[arg-type]
+                io.BytesIO(b"Code: 62. DB::Exception: Max query size exceeded (simulated)"),
+            )
+        with self._count:  # `loo` asks from several threads
+            self.queries.append(sql)
+            n = len(self.queries)
         if self.refuse_at == n:
             raise urllib.error.HTTPError(
                 "http://sim.clickhouse", 400, "Bad Request", None,  # type: ignore[arg-type]
@@ -84,62 +114,80 @@ class SimClickHouse:
     def _answer(self, sql: str) -> tuple[tuple[str, ...], list[list[Any]]]:
         chain = int(re.findall(r"chain_id = (\d+)", sql)[0])
         assert chain == self.world.chain_id, "every query carries the network's chain id"
-        lo, hi = (datetime.fromisoformat(t) for t in WINDOW.findall(sql)[0])
+        assert "notEmpty(units)" in sql
 
-        def inside(e: Estimate) -> bool:
-            return lo <= e.timestamp < hi
+        def window(lo: str, hi: str) -> Callable[[Estimate], bool]:
+            start, end = datetime.fromisoformat(lo), datetime.fromisoformat(hi)
+            return lambda e: start <= e.timestamp < end
 
-        if sql.startswith("select request_id, estimator from raw_quotes.winning_price_estimates"):
-            return ("request_id", "estimator"), [
-                [r.request_id, r.winner.answer.estimator]
-                for r in self._linked(sql, inside)
-                if r.winner is not None and inside(r.winner)
+        links = [
+            (window(lo, hi), self._linked(window(lo2, hi2), ids), int(k))
+            for lo, hi, lo2, hi2, ids, k in LINK_UNIT.findall(sql)
+        ]
+
+        def linked(r: Request, e: Estimate) -> list[int]:
+            """The units whose window holds `e` and whose ids link `r`."""
+            return [k for inside, requests, k in links if inside(e) and r.request_id in requests]
+
+        if sql.startswith("select request_id, estimator, arrayFilter"):
+            return ("request_id", "estimator", "units"), [
+                [r.request_id, r.winner.answer.estimator, units]
+                for r in self.world.requests
+                if r.request_id is not None and r.winner is not None
+                and (units := linked(r, r.winner))
             ]
-        if sql.startswith("select request_id, quote_id, nats_seq from raw_quotes.quote_computed"):
-            return ("request_id", "quote_id", "nats_seq"), [
-                [r.request_id, e.quote_id, e.nats_seq]
-                for r in self._linked(sql, inside)
+        if sql.startswith("select request_id, quote_id, nats_seq, arrayFilter"):
+            return ("request_id", "quote_id", "nats_seq", "units"), [
+                [r.request_id, e.quote_id, e.nats_seq, units]
+                for r in self.world.requests
+                if r.request_id is not None
                 for e in r.forwarded
-                if inside(e)
+                if (units := linked(r, e))
             ]
         if sql.startswith("select request_id, estimator, solver, quote_id"):
             assert " success " in sql
-            return LADDER, [
-                self._row(LADDER, e)
-                for r in self._linked(sql, inside)
+            return (*LADDER, "units"), [
+                [*self._row(LADDER, e), units]
+                for r in self.world.requests
+                if r.request_id is not None
                 for e in self._served(r.estimates)
-                if e.success and inside(e)
+                if e.success and (units := linked(r, e))
             ]
-        keys = {(s, b, k, int(a)) for s, b, k, a in KEYS.findall(sql)}
         assert "request_id is null" in sql
+        keyed_units = [
+            (window(lo, hi), {(s, b, k, int(a)) for s, b, k, a in KEYS.findall(tuples)}, int(n))
+            for lo, hi, tuples, n in REQUOTE_UNIT.findall(sql)
+        ]
         requotes = [r for r in self.world.requests if r.request_id is None]
 
-        def keyed(e: Estimate) -> bool:
-            return (e.sell_token, e.buy_token, e.kind, e.in_amount) in keys and inside(e)
+        def keyed(e: Estimate) -> list[int]:
+            key = (e.sell_token, e.buy_token, e.kind, e.in_amount)
+            return [n for inside, keys, n in keyed_units if key in keys and inside(e)]
 
-        if sql.startswith("select quote_id from raw_quotes.winning_price_estimates"):
-            return ("quote_id",), [
-                [r.winner.quote_id] for r in requotes if r.winner is not None and keyed(r.winner)
+        if sql.startswith("select quote_id, arrayFilter"):
+            return ("quote_id", "units"), [
+                [r.winner.quote_id, units]
+                for r in requotes
+                if r.winner is not None and (units := keyed(r.winner))
             ]
         if sql.startswith("select quote_id, estimator, solver"):
-            return REQUOTE, [
-                self._row(REQUOTE, e)
+            return (*REQUOTE, "units"), [
+                [*self._row(REQUOTE, e), units]
                 for r in requotes
                 for e in self._served(r.estimates)
-                if e.success and keyed(e)
+                if e.success and (units := keyed(e))
             ]
         raise AssertionError(f"the simulated ClickHouse does not know this query:\n{sql}")
 
-    def _linked(self, sql: str, inside: Any) -> Iterator[Request]:
-        """`request_id in (select request_id … where quote_id in (…))`."""
-        ids_text = re.search(r"quote_id in \(([\d, ]+)\)", sql)
-        assert ids_text
-        ids = {int(i) for i in ids_text.group(1).split(", ")}
-        for request in self.world.requests:
-            if request.request_id is None:
-                continue
-            if any(e.quote_id in ids and inside(e) for e in request.estimates):
-                yield request
+    def _linked(self, inside: Callable[[Estimate], bool], ids_text: str) -> set[str | None]:
+        """`select request_id … where {window} and quote_id in (…)`, as a set."""
+        ids = {int(i) for i in ids_text.split(", ")}
+        return {
+            request.request_id
+            for request in self.world.requests
+            if request.request_id is not None
+            and any(e.quote_id in ids and inside(e) for e in request.estimates)
+        }
 
     def _served(self, estimates: list[Estimate]) -> Iterator[Estimate]:
         """Every row, plus an unmerged duplicate of some, arriving later."""

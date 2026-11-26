@@ -16,7 +16,7 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Literal, NamedTuple, cast
 
-from . import ch, extract, payouts, quotes
+from . import ch, db, extract, payouts, quotes
 from .aggregate import REPORT_FORMAT, SIGN_CONVENTION_ID
 from .counterfactual import (
     OUTCOME_RULE,
@@ -136,6 +136,24 @@ class WindowAnalysis:
     """Excluded before arbitration: no solver competition to re-run."""
 
 
+def window_queries(
+    network: str,
+    start: str,
+    end: str,
+    *,
+    with_quotes: bool = False,
+    all_solvers: bool = False,
+) -> list[tuple[str, dict[str, str] | None]]:
+    """The reads `analyse_window` starts with, which need only the window, for
+    `db.prefetch`: the solver catalogue, the window's auctions and, with the quote side,
+    its orders and trades; `all_solvers` adds the window's bidders by name."""
+    quoted = with_quotes and ch.has_quote_data(network)
+    return [
+        *extract.window_queries(start, end, network, all_solvers=all_solvers),
+        *(quotes.window_queries(start, end) if quoted else []),
+    ]
+
+
 @contextmanager
 def sparse_gc(young: int = 100_000) -> Generator[None]:
     """Run the cyclic garbage collector every `young` net allocations instead of 700.
@@ -180,16 +198,24 @@ def analyse_window(
         raise ValueError(f"duplicate outcome rules: {list(outcome_rules)}")
     emit: Callable[[str], None] = log or (lambda message: None)
     weth = wrapped_native_token(network)
+    # The window-level reads, ahead of all else; the rest is queued once the auctions are
+    # known.
+    db.prefetch(
+        conn, window_queries(network, start, end, with_quotes=with_quotes), first=True
+    )
 
     resolved: list[
         tuple[str, tuple[GroupMember, ...], frozenset[str], list[extract.SolverMatch]]
     ] = []
+    directory = extract.solver_directory(conn, start, end)
     for entry in solvers:
         members: list[GroupMember] = []
         matches: list[extract.SolverMatch] = []
         group_addresses: frozenset[str] = frozenset()
         for name in parse_removal_group(entry):
-            addresses, member_matches = extract.resolve_solver(conn, name, start, end)
+            addresses, member_matches = extract.resolve_solver(
+                directory, name, start, end, network
+            )
             if addresses & group_addresses:
                 raise extract.SolverResolutionError(
                     f"{name!r} resolves to a competitor already named in {entry!r}; "
@@ -259,12 +285,32 @@ def analyse_window(
     if not auction_ids:
         return window
 
+    inherited = any(rule != "assume-settled" for rule in outcome_rules)
+    # Solana's accounting has no quote-share table to split a period by (below).
+    paid = network != SOLANA
+    if with_quotes and not ch.has_quote_data(network):
+        raise ch.NoQuoteDataError(
+            f"--quotes was asked for on {network!r}, which has no quote data; "
+            f"quote coverage is {', '.join(sorted(ch.NETWORK_CHAIN_IDS))}"
+        )
+    # Everything below is read ahead on parallel connections, in the order it is used;
+    # the quote side, used first, puts its queries ahead of these as it learns them.
+    db.prefetch(
+        conn,
+        [
+            *(extract.settlement_queries(auction_ids, network) if inherited else []),
+            *(
+                extract.reward_input_queries(auction_ids, network)
+                if mode == "score"
+                else []
+            ),
+            *(payouts.plan_queries(start, end) if paid else []),
+            *extract.auction_queries(auction_ids, network),
+            *(payouts.performance_queries(auction_ids) if paid else []),
+        ],
+    )
+
     if with_quotes:
-        if not ch.has_quote_data(network):
-            raise ch.NoQuoteDataError(
-                f"--quotes was asked for on {network!r}, which has no quote data; "
-                f"quote coverage is {', '.join(sorted(ch.NETWORK_CHAIN_IDS))}"
-            )
         window.quote_window = quotes.load_quote_window(
             ch.Client.from_env(conn if isinstance(conn, Snapshot) else None),
             conn,
@@ -289,7 +335,7 @@ def analyse_window(
             )
 
     settled: dict[int, dict[int, extract.Settlement]] = {}
-    if any(rule != "assume-settled" for rule in outcome_rules):
+    if inherited:
         settled = extract.load_settlement_outcomes(conn, auction_ids)
         emit(
             f"settlement outcomes for {sum(len(v) for v in settled.values())} "
@@ -303,6 +349,12 @@ def analyse_window(
             f"reward caps for {sum(len(v) for v in caps.values())} "
             f"recorded winning solutions"
         )
+
+    # Every scenario's solvers: the payouts of record are read in one pass for all.
+    every_address = frozenset[str]().union(*(addresses for _, _, addresses, _ in resolved))
+    plan = (
+        payouts.plan_recorded(conn, auction_ids, start, end, every_address) if paid else None
+    )
 
     with_bids: list[int] = []
     deadlines: list[int] = []
@@ -330,7 +382,7 @@ def analyse_window(
     for run in runs:
         run.analysis.fast_path_auctions = list(window.fast_path)
 
-    if network == SOLANA:
+    if not paid:
         # Its weekly accounting has no quote-share table to split a period by, and every
         # Solana reward budget is zero to date: the payouts and COW columns stay unknown.
         emit("recorded rewards and COW conversion: not available on solana")
@@ -343,7 +395,8 @@ def analyse_window(
         [*with_bids, *window.fast_path],
         start,
         end,
-        frozenset[str]().union(*(addresses for _, _, addresses, _ in resolved)),
+        every_address,
+        plan=plan,
     )
     for run in runs:
         run.recorded = recorded

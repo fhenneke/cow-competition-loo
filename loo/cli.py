@@ -420,6 +420,14 @@ def resolve_scenarios(args: argparse.Namespace, conn: db.Connection) -> list[str
     if not args.all_solvers:
         return list(args.solver)
 
+    # Read beside the window's other first queries rather than before them.
+    db.prefetch(
+        conn,
+        run.window_queries(
+            args.network, args.start, args.end, with_quotes=args.quotes, all_solvers=True
+        ),
+        first=True,
+    )
     solvers = extract.all_solvers(conn, args.start, args.end)
     if not solvers:
         print(
@@ -449,11 +457,8 @@ def run_analyse(args: argparse.Namespace) -> int:
 
     # A past window replays its snapshot; a recent one is still filling up, so it is read
     # live and nothing is kept.
-    conn: db.Connection
-    if db.settled(args.end):
-        conn = db.Snapshot(args.network, args.start, args.end)
-    else:
-        conn = db.connect(args.network)
+    conn = db.Snapshot(args.network, args.start, args.end, keep=db.settled(args.end))
+    if not conn.keep:
         print(
             f"note: the window ends less than {db.SETTLED_AFTER} ago, so it is read from "
             f"the DB and no snapshot is kept",
@@ -498,7 +503,7 @@ def run_analyse(args: argparse.Namespace) -> int:
             print(f"ERROR: {error}", file=sys.stderr)
             return 5
     finally:
-        if isinstance(conn, db.Snapshot):
+        if conn.keep:
             print(conn.summary(), file=sys.stderr)
         conn.close()
 

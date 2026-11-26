@@ -125,7 +125,10 @@ Two backend changes make the link a join:
   placed with, for API and ethflow orders alike; complete in
   `raw_prod_<chain>.order_quotes` from 2026-09-22. **The staging copy
   (`dbt.stg_backend_data__order_quotes.quote_id`) is NULL on rows built before
-  ~2026-10-06** (incremental model, column appended): read the raw mirror.
+  ~2026-10-06** (incremental model, column appended), which is before any window `loo`
+  replays; since then it equals the raw mirror (0 of 584k orders created 2026-10-28..11-26
+  differ on mainnet, base, arbitrum-one and bnb), so `loo` reads staging and spares a
+  first run a cold lookup into the raw table per order.
 - **Every estimate carries its own id and solver** (one id is drawn per
   estimator before quoting and published with the estimator's settlement address).
   Ids appear on every chain at the same deploy, **2026-09-29 17:16 UTC**.
@@ -137,9 +140,13 @@ every estimate of the request. Each estimator has exactly one settlement address
 chain, so `solver` maps estimators to addresses directly. Only trivial ETH/WETH estimates
 lack an id (0.18%).
 
-`link_by_quote_id` resolves ids to requests in one ClickHouse round trip per creation day
+`link_by_quote_id` resolves each creation day's ids to requests within that day's window
 (creation −30 min / +90 s), and keeps a link only when the linked estimate **is** the
-recorded winner **and** reproduces the order's stored amount **to the atom**. An order
+recorded winner **and** reproduces the order's stored amount **to the atom**. A query
+covers several days, each a *unit* with its own window and ids: a column `units` lists
+the units whose condition a row meets, and the rows of a unit are exactly what a query for
+that day alone returns (a row near midnight can belong to two). One query per day read
+every ClickHouse part its day falls in, and a part holds about a week. An order
 that fails gets a second pass ([the re-quote](#an-ethflow-orders-stored-quote-can-come-from-the-backends-own-re-quote))
 or the [stream rule](#streamed-quotes-the-order-takes-what-the-stream-showed-not-the-winner);
 reasons for the rest are reported.
@@ -375,8 +382,8 @@ for 78.3% and 1.0000 at every quantile p10–p99 (2026-07-25).
 4. **An estimate with no `request_id` can be the order's quote** (the ethflow re-quote).
    Look for request-less estimates reproducing the stored amount before calling an
    ethflow order unlinkable.
-5. **`stg_backend_data__order_quotes.quote_id` is NULL before ~2026-10-06.** Read
-   `raw_prod_<chain>.order_quotes`.
+5. **`stg_backend_data__order_quotes.quote_id` is NULL before ~2026-10-06.** Before that,
+   read `raw_prod_<chain>.order_quotes`.
 6. **"Nothing in `fct_quote_requests`" does not mean unquoted**; the gold tables drop
    competitions without a request event.
 7. **`request_id in (…)` scans unless bounded by day.** **The `_live` views are

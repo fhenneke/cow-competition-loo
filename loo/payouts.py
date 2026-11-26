@@ -23,7 +23,7 @@ from decimal import Decimal, getcontext
 from typing import Any, Literal
 
 from . import extract
-from .db import Connection, Row, chunked, fetch
+from .db import Connection, Row, chunked, fetch, prefetch
 
 # Performance rewards are ~40-digit numerics; the default 28-digit context rounds sums.
 getcontext().prec = 78
@@ -433,6 +433,15 @@ class RecordedWindow:
         )
 
 
+def _metric_params(
+    piece: Sequence[int], solvers: list[bytes], chunk_size: int
+) -> list[dict[str, Any]]:
+    return [
+        {"first": chunk[0], "last": chunk[-1], "solvers": solvers}
+        for chunk in chunked(list(piece), chunk_size)
+    ]
+
+
 def _metric_rows(
     conn: Connection,
     sql: str,
@@ -442,8 +451,7 @@ def _metric_rows(
     chunk_size: int,
 ) -> dict[str, dict[int, float]]:
     by_solver: dict[str, dict[int, float]] = {}
-    for chunk in chunked(list(piece), chunk_size):
-        params = {"first": chunk[0], "last": chunk[-1], "solvers": solvers}
+    for params in _metric_params(piece, solvers, chunk_size):
         for row in fetch(conn, sql, params):
             if row["auction_id"] in window:
                 by_solver.setdefault(row["solver"], {})[row["auction_id"]] = row["metric"]
@@ -484,6 +492,95 @@ def _reconcile(
     return found
 
 
+def _performance_params(window: Sequence[int], chunk_size: int) -> list[dict[str, int]]:
+    return [
+        {"first": chunk[0], "last": chunk[-1]} for chunk in chunked(window, chunk_size)
+    ]
+
+
+def plan_queries(start: str, end: str) -> list[tuple[str, dict[str, Any]]]:
+    """The queries `plan_recorded` makes, for `db.prefetch`."""
+    spans = accounting_periods(start, end)
+    labels = [period_label(begin, finish) for begin, finish in spans]
+    return [
+        (CONSISTENCY_MART_SQL, {"periods": labels}),
+        (QUOTE_MART_SQL, {"periods": labels}),
+        *(
+            (extract.WINDOW_SQL, {"start": _sql_time(begin), "end": _sql_time(finish)})
+            for begin, finish in spans
+        ),
+    ]
+
+
+def performance_queries(
+    auction_ids: Sequence[int], *, chunk_size: int = CHUNK_SIZE
+) -> list[tuple[str, dict[str, Any]]]:
+    """The performance-reward queries `load_recorded` makes, for `db.prefetch`."""
+    return [
+        (PERFORMANCE_SQL, params)
+        for params in _performance_params(sorted(set(auction_ids)), chunk_size)
+    ]
+
+
+@dataclass(frozen=True)
+class RecordedPlan:
+    """What decides the rest of `load_recorded`'s queries, read before them."""
+
+    labels: tuple[str, ...]
+    marts: Mapping[Weekly, Mapping[str, Mapping[str, Row]]]
+    period_ids: tuple[tuple[int, ...], ...]
+    """Every auction of each period in `labels`, the window's and the rest."""
+
+
+def plan_recorded(
+    conn: Connection,
+    auction_ids: Sequence[int],
+    start: str,
+    end: str,
+    addresses: Collection[str],
+    *,
+    chunk_size: int = CHUNK_SIZE,
+) -> RecordedPlan:
+    """Read the marts and each period's auctions, and queue the queries they decide: the
+    period totals and the window's per-auction metrics. Call it early so those run while
+    the analysis does."""
+    in_window = frozenset(auction_ids)
+    solvers = [bytes.fromhex(a) for a in sorted(frozenset(addresses))]
+    spans = accounting_periods(start, end)
+    labels = tuple(period_label(begin, finish) for begin, finish in spans)
+
+    def paid_out(rows: list[Row]) -> bool:
+        return set(labels) <= {row["accounting_period"] for row in rows}
+
+    marts: dict[Weekly, dict[str, dict[str, Row]]] = {
+        "consistency": _by_period(
+            fetch(conn, CONSISTENCY_MART_SQL, {"periods": list(labels)}, final=paid_out)
+        ),
+        "quote": _by_period(
+            fetch(conn, QUOTE_MART_SQL, {"periods": list(labels)}, final=paid_out)
+        ),
+    }
+    period_ids: list[tuple[int, ...]] = []
+    queries: list[tuple[str, dict[str, Any]]] = []
+    for (begin, finish), label in zip(spans, labels, strict=True):
+        ids = tuple(extract.auctions_in_window(conn, _sql_time(begin), _sql_time(finish)))
+        period_ids.append(ids)
+        piece = [a for a in ids if a in in_window]
+        if not piece:
+            continue
+        for component in WEEKLY:
+            if not marts[component].get(label):
+                continue
+            per_auction_sql, totals_sql = _METRIC_SQL[component]
+            queries.append((totals_sql, {"first": ids[0], "last": ids[-1]}))
+            queries.extend(
+                (per_auction_sql, params)
+                for params in _metric_params(piece, solvers, chunk_size)
+            )
+    prefetch(conn, queries)
+    return RecordedPlan(labels=labels, marts=marts, period_ids=tuple(period_ids))
+
+
 def load_recorded(
     conn: Connection,
     auction_ids: Sequence[int],
@@ -493,11 +590,15 @@ def load_recorded(
     addresses: Collection[str],
     *,
     chunk_size: int = CHUNK_SIZE,
+    plan: RecordedPlan | None = None,
 ) -> RecordedWindow:
-    """Recorded rewards over `auction_ids` (the window `[start, end)`) for `addresses`.
+    """Recorded rewards over `auction_ids` (the window `[start, end)`) for `addresses`;
+    `plan` is `plan_recorded` of the same arguments, read now if not given.
 
     `with_bids` are the window auctions with a recorded solution: those, and only those,
     need a reward row to count as accounted."""
+    if plan is None:
+        plan = plan_recorded(conn, auction_ids, start, end, addresses, chunk_size=chunk_size)
     window = sorted(set(auction_ids))
     in_window = frozenset(window)
     expected = in_window & frozenset(with_bids)
@@ -506,12 +607,14 @@ def load_recorded(
 
     performance: dict[str, dict[int, Decimal]] = {}
     covered: set[int] = set()
-    for chunk in chunked(window, chunk_size):
+    for chunk, params in zip(
+        chunked(window, chunk_size), _performance_params(window, chunk_size), strict=True
+    ):
         due = expected.intersection(chunk)
         rows = fetch(
             conn,
             PERFORMANCE_SQL,
-            {"first": chunk[0], "last": chunk[-1]},
+            params,
             final=lambda rows, due=due: due <= {row["auction_id"] for row in rows},
         )
         for row in rows:
@@ -523,31 +626,17 @@ def load_recorded(
             if row["solver"] in wanted and amount:
                 performance.setdefault(row["solver"], {})[auction] = amount
 
-    spans = accounting_periods(start, end)
-    labels = [period_label(begin, finish) for begin, finish in spans]
-
-    def paid_out(rows: list[Row]) -> bool:
-        return set(labels) <= {row["accounting_period"] for row in rows}
-
-    marts: dict[Weekly, dict[str, dict[str, Row]]] = {
-        "consistency": _by_period(
-            fetch(conn, CONSISTENCY_MART_SQL, {"periods": labels}, final=paid_out)
-        ),
-        "quote": _by_period(fetch(conn, QUOTE_MART_SQL, {"periods": labels}, final=paid_out)),
-    }
-
     periods: list[Period] = []
     mismatches: list[Mismatch] = []
     assigned: set[int] = set()
-    for (begin, finish), label in zip(spans, labels, strict=True):
-        period_ids = extract.auctions_in_window(conn, _sql_time(begin), _sql_time(finish))
+    for label, period_ids in zip(plan.labels, plan.period_ids, strict=True):
         piece = [a for a in period_ids if a in in_window]
         if not piece:
             continue
         assigned.update(piece)
         weekly: dict[Weekly, WeeklyPeriod | None] = {}
         for component in WEEKLY:
-            mart = marts[component].get(label)
+            mart = plan.marts[component].get(label)
             if not mart:
                 weekly[component] = None
                 continue

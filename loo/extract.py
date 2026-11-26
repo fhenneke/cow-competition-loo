@@ -9,6 +9,7 @@ and `sql_for` picks by the connection's network.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -19,7 +20,17 @@ from pathlib import Path
 from statistics import median
 from typing import Any, NamedTuple
 
-from .db import Connection, Row, as_int, cache_dir, chunked, fetch, network_of, settled
+from .db import (
+    Connection,
+    Row,
+    as_int,
+    cache_dir,
+    chunked,
+    fetch,
+    network_of,
+    prefetch,
+    settled,
+)
 from .fees import (
     EMPTY_FEE_CONTEXT,
     FeeContext,
@@ -136,12 +147,53 @@ class AuctionBundle:
     """`EMPTY_FEE_CONTEXT` when fees were not loaded: fees read unrecorded, not zero."""
 
 
-WINDOW_SQL = """
+_BLOCK_TIMES = "dbt.stg_rpc_data__block_timestamp"
+
+
+def _first_block_at(param: str) -> str:
+    """The first block whose time is at or after `%(param)s`, found by bisecting the block
+    numbers: `min(block_number) where time >= …` reads every block from the table's start
+    (12 s on arbitrum-one, 100M blocks), the bisection ~30 index lookups. Equal because a
+    block's time never falls below its predecessor's (no inversion since 2026-09-01 on
+    mainnet, base, arbitrum-one or bnb); missing block numbers are skipped over."""
+    return f"""(
+    with recursive search (lo, hi) as (
+        select (select min(block_number) from {_BLOCK_TIMES}),
+               (select max(block_number) from {_BLOCK_TIMES}) + 1
+      union all
+        select case when coalesce(probe.time >= %({param})s, true) then search.lo else mid.b + 1 end,
+               case when coalesce(probe.time >= %({param})s, true) then mid.b else search.hi end
+        from search
+        cross join lateral (select search.lo + (search.hi - search.lo) / 2 as b) mid
+        left join lateral (
+            select time from {_BLOCK_TIMES}
+            where block_number >= mid.b order by block_number limit 1
+        ) probe on true
+        where search.lo < search.hi
+    )
+    select (
+        select block_number from {_BLOCK_TIMES}
+        where block_number >= search.lo order by block_number limit 1
+    )
+    from search where search.lo = search.hi
+)"""
+
+
+WINDOW_BLOCKS = f"""between {_first_block_at("start")}
+  and (
+    select max(block_number) from {_BLOCK_TIMES}
+    where block_number < coalesce(
+        {_first_block_at("end")}, (select max(block_number) from {_BLOCK_TIMES}) + 1
+    )
+)"""
+"""`between` the window's first block and its last: the first block at or after `start`,
+and the last before `end` (the block before the first at or after it)."""
+
+
+WINDOW_SQL = f"""
 select distinct auction_id
 from dbt.pre_stg__orders_per_auction_with_at_least_one_bid
-where block_deadline between
-      (select min(block_number) from dbt.stg_rpc_data__block_timestamp where time >= %(start)s)
-  and (select max(block_number) from dbt.stg_rpc_data__block_timestamp where time <  %(end)s)
+where block_deadline {WINDOW_BLOCKS}
 order by auction_id
 """
 
@@ -153,8 +205,21 @@ order by auction_id, uid
 """
 
 # Auction orders only; JIT orders are inert. Exact only while
-# `surplus_capturing_jit_order_owners` is empty, which is not read.
+# `surplus_capturing_jit_order_owners` is empty, which is not read. Membership is tested
+# once per (auction, order), not per execution: each test reads the auction's whole
+# `order_uids` array (~300 kB on mainnet), which made this the costliest query of a run.
 EXECUTIONS_SQL = """
+with pairs as materialized (
+    select distinct auction_id, order_uid
+    from dbt.stg_backend_data__proposed_trade_executions
+    where auction_id = any(%(ids)s)
+),
+members as materialized (
+    select p.auction_id, p.order_uid
+    from pairs p
+    join dbt.stg_backend_data__competition_auctions ca on ca.auction_id = p.auction_id
+    where p.order_uid = any(ca.order_uids)
+)
 select
     pte.auction_id,
     pte.solution_uid,
@@ -168,12 +233,10 @@ select
     o.kind::text                    as kind,
     o.partially_fillable
 from dbt.stg_backend_data__proposed_trade_executions pte
-join dbt.stg_backend_data__competition_auctions ca
-    on ca.auction_id = pte.auction_id
+join members m on m.auction_id = pte.auction_id and m.order_uid = pte.order_uid
 left join dbt.stg_backend_data__orders o
     on o.uid = pte.order_uid
 where pte.auction_id = any(%(ids)s)
-  and pte.order_uid = any(ca.order_uids)
 """
 
 AUCTIONS_SQL = """
@@ -194,18 +257,28 @@ _ARRAY_PRICES = """
     where ca.auction_id = any(%(ids)s)
 """
 
-# Sell tokens too: the price-sanity check values each trade through both tokens.
+# Sell tokens too: the price-sanity check values each trade through both tokens. Each
+# (auction, token) is looked up by its position in the price arrays; unnesting them
+# instead walks the whole price list once per traded token.
 PRICES_SQL = """
-with traded as (
+with traded as materialized (
     select distinct pte.auction_id, t.token
-    from dbt.stg_backend_data__proposed_trade_executions pte
+    from (
+        select distinct auction_id, order_uid
+        from dbt.stg_backend_data__proposed_trade_executions
+        where auction_id = any(%(ids)s)
+    ) pte
     join dbt.stg_backend_data__orders o on o.uid = pte.order_uid
     cross join lateral (values (o.sell_token), (o.buy_token)) as t (token)
-    where pte.auction_id = any(%(ids)s)
 )
-select ap.auction_id, encode(ap.token, 'hex') as token, ap.price
-from {auction_prices} ap
-join traded t on t.auction_id = ap.auction_id and t.token = ap.token
+select t.auction_id, encode(t.token, 'hex') as token, ca.price_values[p.position] as price
+from traded t
+join dbt.stg_backend_data__competition_auctions ca on ca.auction_id = t.auction_id
+-- `offset 0` keeps the position computed once, not once per use
+cross join lateral (
+    select array_position(ca.price_tokens, t.token) as position offset 0
+) as p
+where p.position is not null
 """
 
 FEE_POLICIES_SQL = """
@@ -223,17 +296,24 @@ where auction_id = any(%(ids)s)
 order by auction_id, order_uid, application_order
 """
 
-# Non-zero counts only; an absent order has zero partners.
+# Every order proposed in the auctions, JIT ones too (they are never looked up). Non-zero
+# counts only; an absent order has zero partners. The orders as an array, not `in (…)`:
+# with the subquery the planner scans all orders (270 ms a chunk on mainnet, not 8).
 PARTNER_COUNTS_SQL = """
 select
     encode(o.uid, 'hex')                        as order_uid,
     array_length(ad.partner_fee_recipients, 1)  as partner_count
 from dbt.stg_backend_data__orders o
 join dbt.stg_backend_data__app_data ad on ad.contract_app_data = o.app_data
-where o.uid = any(%(uids)s)
+where o.uid = any(array(
+    select distinct order_uid
+    from dbt.stg_backend_data__proposed_trade_executions
+    where auction_id = any(%(ids)s)
+))
   and array_length(ad.partner_fee_recipients, 1) > 0
 """
 
+# The quotes of the orders a price-improvement policy is recorded for in the auctions.
 QUOTES_SQL = """
 select
     encode(order_uid, 'hex') as order_uid,
@@ -243,7 +323,12 @@ select
     gas_price,
     sell_token_price
 from dbt.stg_backend_data__order_quotes
-where order_uid = any(%(uids)s)
+where order_uid = any(array(
+    select distinct order_uid
+    from dbt.stg_backend_data__fee_policies
+    where auction_id = any(%(ids)s)
+      and kind = 'priceimprovement'
+))
 """
 
 REFERENCE_SCORES_SQL = """
@@ -309,15 +394,13 @@ where ap.token = any(%(tokens)s)
 # Names match exactly, case-insensitively (`Arc` is a substring of `Arctic`); one name can
 # hold several rotated addresses, which go together. "Uncatalogued" is a bucket, not a
 # solver: those addresses are named by address.
-# Bound `ps.auction_id` by the window's id range (here and in `SOLVER_SQL`) or the planner
+# Bound `ps.auction_id` by the window's id range (here and in `SOLVERS_SQL`) or the planner
 # seq-scans `proposed_solutions`.
-ALL_SOLVERS_SQL = """
+ALL_SOLVERS_SQL = f"""
 with window_auctions as (
     select distinct auction_id
     from dbt.pre_stg__orders_per_auction_with_at_least_one_bid
-    where block_deadline between
-          (select min(block_number) from dbt.stg_rpc_data__block_timestamp where time >= %(start)s)
-      and (select max(block_number) from dbt.stg_rpc_data__block_timestamp where time <  %(end)s)
+    where block_deadline {WINDOW_BLOCKS}
 ),
 bidders as (
     select distinct ps.solver
@@ -333,29 +416,13 @@ left join dbt.dune_data__cow_protocol__solvers s
 order by label
 """
 
-SOLVER_SQL = """
+# Every catalogue entry with what it bid in the window; `--solver` names are matched
+# against it in Python (`solver_matches`), so a run asks once however many it names.
+SOLVERS_SQL = f"""
 with window_auctions as (
     select distinct auction_id
     from dbt.pre_stg__orders_per_auction_with_at_least_one_bid
-    where block_deadline between
-          (select min(block_number) from dbt.stg_rpc_data__block_timestamp where time >= %(start)s)
-      and (select max(block_number) from dbt.stg_rpc_data__block_timestamp where time <  %(end)s)
-),
-needle as (
-    -- `substr(raw, 3)` rather than `ltrim(raw, '0x')`: ltrim strips a character *set*, so
-    -- an address of leading zeroes would lose them and silently mismatch.
-    select
-        %(solver)s::text as raw,
-        lower(case
-            when %(solver)s like '0x%%' or %(solver)s like '0X%%' then substr(%(solver)s, 3)
-            else %(solver)s
-        end) as hexish
-),
-candidates as (
-    select s.address, s.name, s.environment, s.active
-    from dbt.dune_data__cow_protocol__solvers s, needle n
-    where (lower(s.name) = lower(n.raw) and s.name <> 'Uncatalogued')
-       or encode(s.address, 'hex') = n.hexish
+    where block_deadline {WINDOW_BLOCKS}
 ),
 activity as (
     select
@@ -367,20 +434,18 @@ activity as (
     join window_auctions using (auction_id)
     where ps.auction_id between (select min(auction_id) from window_auctions)
                             and (select max(auction_id) from window_auctions)
-      and ps.solver in (select address from candidates)
     group by 1
 )
 select
-    encode(c.address, 'hex')          as address,
-    c.name,
-    c.environment,
-    c.active,
+    encode(s.address, 'hex')          as address,
+    s.name,
+    s.environment,
+    s.active,
     coalesce(a.solutions, 0)          as solutions,
     coalesce(a.auctions_bid, 0)       as auctions_bid,
     coalesce(a.winning_solutions, 0)  as winning_solutions
-from candidates c
-left join activity a on a.solver = c.address
-order by coalesce(a.solutions, 0) desc, c.name
+from dbt.dune_data__cow_protocol__solvers s
+left join activity a on a.solver = s.address
 """
 
 
@@ -509,6 +574,23 @@ def _on(conn: Connection, sql: str) -> str:
     return sql_for(sql, network_of(conn))
 
 
+def window_queries(
+    start: str, end: str, network: str = "mainnet", *, all_solvers: bool = False
+) -> list[tuple[str, dict[str, str] | None]]:
+    """The window-level reads every `analyse` makes first, for `db.prefetch`: the solver
+    catalogue with its activity, the window's auctions and, for `--all-solvers`, its
+    bidders by name."""
+    params = {"start": start, "end": end}
+    if network == SOLANA:
+        return [
+            (SOLANA_CATALOGUE_SQL, None),
+            (SOLANA_ACTIVITY_SQL, params),
+            (SOLANA_WINDOW_SQL, params),
+        ]
+    bidders = [(ALL_SOLVERS_SQL, params)] if all_solvers else []
+    return [*bidders, (SOLVERS_SQL, params), (WINDOW_SQL, params)]
+
+
 def auctions_in_window(conn: Connection, start: str, end: str) -> list[int]:
     """Auction ids with at least one bid in `[start, end)`; sparse, not contiguous."""
     rows = fetch(
@@ -546,6 +628,32 @@ def _auction_span(auction_ids: Collection[int]) -> str:
     return f"{len(auction_ids)} auctions in {min(auction_ids)}..{max(auction_ids)}"
 
 
+def _id_chunks(auction_ids: Sequence[int], chunk_size: int) -> list[dict[str, Any]]:
+    """The parameters of one query per chunk of `auction_ids`. A prefetch and the fetch it
+    serves must build them alike: the parameters are part of the query's key."""
+    return [{"ids": list(chunk)} for chunk in chunked(list(auction_ids), chunk_size)]
+
+
+def auction_queries(
+    auction_ids: Sequence[int],
+    network: str = "mainnet",
+    chunk_size: int = CHUNK_SIZE,
+    with_fees: bool = True,
+) -> list[tuple[str, dict[str, Any]]]:
+    """The queries `load_auctions` will make on `network`, in its order, for
+    `db.prefetch`. Solana has no fee tables to read."""
+    wanted = [
+        sql_for(AUCTIONS_SQL, network),
+        sql_for(SOLUTIONS_SQL, network),
+        sql_for(EXECUTIONS_SQL, network),
+        price_query(PRICES_SQL, network),
+        sql_for(REFERENCE_SCORES_SQL, network),
+    ]
+    if with_fees and network != SOLANA:
+        wanted += [FEE_POLICIES_SQL, PARTNER_COUNTS_SQL, QUOTES_SQL]
+    return [(sql, params) for params in _id_chunks(auction_ids, chunk_size) for sql in wanted]
+
+
 def load_auctions(
     conn: Connection,
     auction_ids: Sequence[int],
@@ -558,9 +666,9 @@ def load_auctions(
     Fast-path auctions are not yielded; their ids go to `fast_path`
     ([why](../docs/winner-selection.md#fast-path-auctions-are-excluded)).
     """
-    for chunk in chunked(list(auction_ids), chunk_size):
-        ids = list(chunk)
-        params = {"ids": ids}
+    prefetch(conn, auction_queries(auction_ids, network_of(conn), chunk_size, with_fees))
+    for params in _id_chunks(auction_ids, chunk_size):
+        ids: list[int] = params["ids"]
 
         contexts = {
             row["auction_id"]: row for row in fetch(conn, _on(conn, AUCTIONS_SQL), params)
@@ -571,7 +679,7 @@ def load_auctions(
         price_rows = fetch_prices(conn, PRICES_SQL, params)
         reference_rows = fetch(conn, _on(conn, REFERENCE_SCORES_SQL), params)
         fee_contexts = (
-            _load_fee_contexts(conn, ids, execution_rows, solution_rows)
+            _load_fee_contexts(conn, params, execution_rows, solution_rows)
             if with_fees
             else {}
         )
@@ -640,9 +748,13 @@ def load_auctions(
 
 
 def _load_fee_contexts(
-    conn: Connection, ids: list[int], execution_rows: list[Row], solution_rows: list[Row]
+    conn: Connection,
+    params: dict[str, Any],
+    execution_rows: list[Row],
+    solution_rows: list[Row],
 ) -> dict[int, FeeContext]:
     """Policies are recorded iff the order is in a non-filtered-out solution."""
+    ids: list[int] = params["ids"]
     known: dict[int, set[str]] = {}
     if network_of(conn) == SOLANA:
         # No order carries a fee on Solana: protocol fees are configured but empty and
@@ -667,8 +779,7 @@ def _load_fee_contexts(
 
     # Appending keeps `application_order`, which `policy_fees` walks in reverse.
     collected: dict[int, dict[str, list[Policy]]] = {}
-    needs_quote: set[str] = set()
-    for row in fetch(conn, FEE_POLICIES_SQL, {"ids": ids}):
+    for row in fetch(conn, FEE_POLICIES_SQL, params):
         kind: PolicyKind = row["kind"]
         by_order = collected.setdefault(row["auction_id"], {})
         by_order.setdefault(row["order_uid"], []).append(
@@ -683,37 +794,30 @@ def _load_fee_contexts(
                 ],
             )
         )
-        if kind == "priceimprovement":
-            needs_quote.add(row["order_uid"])
 
     policies = {
         auction_id: {uid: tuple(items) for uid, items in by_order.items()}
         for auction_id, by_order in collected.items()
     }
 
-    traded = sorted({row["order_uid"] for row in execution_rows})
-    partner_counts: dict[str, int] = {}
-    for chunk in chunked(traded, 5000):
-        uids = [bytes.fromhex(uid) for uid in chunk]
-        for row in fetch(conn, PARTNER_COUNTS_SQL, {"uids": uids}):
-            partner_counts[row["order_uid"]] = int(row["partner_count"])
+    partner_counts = {
+        row["order_uid"]: int(row["partner_count"])
+        for row in fetch(conn, PARTNER_COUNTS_SQL, params)
+    }
 
+    # The orders with a price-improvement policy in these auctions.
     quotes: dict[str, Quote] = {}
-    for chunk in chunked(sorted(needs_quote), 5000):
-        uids = [bytes.fromhex(uid) for uid in chunk]
-        for row in fetch(conn, QUOTES_SQL, {"uids": uids}):
-            try:
-                fee = quote_fee(
-                    row["gas_amount"], row["gas_price"], row["sell_token_price"]
-                )
-            except FeeError:
-                # Left out, so its orders report unknown fees.
-                continue
-            quotes[row["order_uid"]] = Quote(
-                sell_amount=as_int(row["sell_amount"]),
-                buy_amount=as_int(row["buy_amount"]),
-                fee=fee,
-            )
+    for row in fetch(conn, QUOTES_SQL, params):
+        try:
+            fee = quote_fee(row["gas_amount"], row["gas_price"], row["sell_token_price"])
+        except FeeError:
+            # Left out, so its orders report unknown fees.
+            continue
+        quotes[row["order_uid"]] = Quote(
+            sell_amount=as_int(row["sell_amount"]),
+            buy_amount=as_int(row["buy_amount"]),
+            fee=fee,
+        )
 
     return {
         auction_id: FeeContext(
@@ -784,13 +888,22 @@ def _build_bid(row: Row, execution_rows: list[Row], limits: dict[str, _Limit]) -
     )
 
 
+def settlement_queries(
+    auction_ids: Sequence[int], network: str = "mainnet", chunk_size: int = CHUNK_SIZE
+) -> list[tuple[str, dict[str, Any]]]:
+    sql = sql_for(SETTLEMENTS_SQL, network)
+    return [(sql, params) for params in _id_chunks(auction_ids, chunk_size)]
+
+
 def load_settlement_outcomes(
     conn: Connection, auction_ids: Sequence[int], chunk_size: int = CHUNK_SIZE
 ) -> dict[int, dict[int, Settlement]]:
     """Outcome per winning solution, keyed by auction then `solution_uid`."""
+    queries = settlement_queries(auction_ids, network_of(conn), chunk_size)
+    prefetch(conn, queries)
     outcomes: dict[int, dict[int, Settlement]] = {}
-    for chunk in chunked(list(auction_ids), chunk_size):
-        for row in fetch(conn, _on(conn, SETTLEMENTS_SQL), {"ids": list(chunk)}):
+    for sql, params in queries:
+        for row in fetch(conn, sql, params):
             outcomes.setdefault(row["auction_id"], {})[row["solution_uid"]] = Settlement(
                 landed=bool(row["landed"]),
                 in_time=bool(row["in_time"]),
@@ -818,11 +931,20 @@ class RewardInputs:
     caps: AuctionCaps
 
 
+def reward_input_queries(
+    auction_ids: Sequence[int], network: str = "mainnet", chunk_size: int = CHUNK_SIZE
+) -> list[tuple[str, dict[str, Any]]]:
+    sql = sql_for(REWARD_INPUTS_SQL, network)
+    return [(sql, params) for params in _id_chunks(auction_ids, chunk_size)]
+
+
 def _reward_input_rows(
     conn: Connection, auction_ids: Sequence[int], chunk_size: int
 ) -> Iterator[Row]:
-    for chunk in chunked(list(auction_ids), chunk_size):
-        yield from fetch(conn, _on(conn, REWARD_INPUTS_SQL), {"ids": list(chunk)})
+    queries = reward_input_queries(auction_ids, network_of(conn), chunk_size)
+    prefetch(conn, queries)
+    for sql, params in queries:
+        yield from fetch(conn, sql, params)
 
 
 def load_reward_inputs(
@@ -999,12 +1121,45 @@ def load_usd_rates(
     return {a: cached[a] for a in wanted if a in cached}
 
 
-def solver_matches(conn: Connection, solver: str, start: str, end: str) -> list[SolverMatch]:
-    """Catalogue entries matching `solver`, with how much each one bid in the window."""
+def solver_directory(conn: Connection, start: str, end: str) -> list[SolverMatch]:
+    """Every catalogue entry, with how much it bid in `[start, end)`."""
     if network_of(conn) == SOLANA:
-        return _solana_solver_matches(conn, solver, start, end)
-    rows = fetch(conn, SOLVER_SQL, {"solver": solver, "start": start, "end": end})
+        activity = _solana_activity(conn, start, end)
+        return [
+            SolverMatch(
+                address=entry.address,
+                name=entry.name,
+                environment=entry.environment,
+                active=entry.active,
+                solutions=activity.get(entry.address, {}).get("solutions", 0),
+                auctions_bid=activity.get(entry.address, {}).get("auctions_bid", 0),
+                winning_solutions=activity.get(entry.address, {}).get("winning_solutions", 0),
+            )
+            for entry in _solana_catalogue(conn)
+        ]
+    rows = fetch(conn, SOLVERS_SQL, {"start": start, "end": end})
     return [SolverMatch(**row) for row in rows]
+
+
+def solver_matches(
+    directory: Sequence[SolverMatch], solver: str, network: str = "mainnet"
+) -> list[SolverMatch]:
+    """Catalogue entries named `solver` (exactly, ignoring case; never "Uncatalogued") or
+    at address `solver` (with or without `0x`, and on Solana in base58 too), most
+    solutions first."""
+    # Strip a literal prefix: `lstrip("0x")` strips a character set and would eat an
+    # address's leading zeroes.
+    addresses = {(solver[2:] if solver[:2] in ("0x", "0X") else solver).lower()}
+    if network == SOLANA:
+        with contextlib.suppress(ValueError):  # not base58: a name
+            addresses.add(base58_to_hex(solver))
+    name = solver.lower()
+    matches = [
+        m
+        for m in directory
+        if (m.name.lower() == name and m.name != "Uncatalogued") or m.address in addresses
+    ]
+    return sorted(matches, key=lambda m: (-m.solutions, m.name))
 
 
 def all_solvers(conn: Connection, start: str, end: str) -> list[str]:
@@ -1036,36 +1191,6 @@ def _solana_activity(conn: Connection, start: str, end: str) -> dict[str, Row]:
     return {row["solver"]: row for row in rows}
 
 
-def _solana_solver_matches(
-    conn: Connection, solver: str, start: str, end: str
-) -> list[SolverMatch]:
-    """`SOLVER_SQL` in Python: by exact name, case-insensitively, or by address in base58
-    or in hex with or without `0x`."""
-    hexish = (solver[2:] if solver[:2].lower() == "0x" else solver).lower()
-    try:
-        decoded = base58_to_hex(solver)
-    except ValueError:
-        decoded = None
-    activity = _solana_activity(conn, start, end)
-    matches: list[SolverMatch] = []
-    for entry in _solana_catalogue(conn):
-        named = entry.name.lower() == solver.lower() and entry.name != "Uncatalogued"
-        if not named and entry.address not in (hexish, decoded):
-            continue
-        row = activity.get(entry.address, {})
-        matches.append(SolverMatch(
-            address=entry.address,
-            name=entry.name,
-            environment=entry.environment,
-            active=entry.active,
-            solutions=row.get("solutions", 0),
-            auctions_bid=row.get("auctions_bid", 0),
-            winning_solutions=row.get("winning_solutions", 0),
-        ))
-    matches.sort(key=lambda m: (-m.solutions, m.name))
-    return matches
-
-
 def _solana_all_solvers(conn: Connection, start: str, end: str) -> list[str]:
     """`ALL_SOLVERS_SQL` in Python; an uncatalogued address is named in base58."""
     names = {
@@ -1080,19 +1205,24 @@ def _solana_all_solvers(conn: Connection, start: str, end: str) -> list[str]:
 
 
 def resolve_solver(
-    conn: Connection, solver: str, start: str, end: str
+    directory: Sequence[SolverMatch],
+    solver: str,
+    start: str,
+    end: str,
+    network: str = "mainnet",
 ) -> tuple[frozenset[str], list[SolverMatch]]:
-    """Every address of `--solver` that bid in the window, and the matches behind them."""
-    matches = solver_matches(conn, solver, start, end)
+    """Every address of `--solver` that bid in the window, and the matches behind them;
+    `directory` is `solver_directory` of the window."""
+    matches = solver_matches(directory, solver, network)
     if not matches:
         catalogue = (
-            "dune_data__solana_solvers" if network_of(conn) == SOLANA
+            "dune_data__solana_solvers" if network == SOLANA
             else "dune_data__cow_protocol__solvers"
         )
         raise SolverResolutionError(
             f"{solver!r} matches no solver in {catalogue}. Names are matched exactly and "
             f"are case-insensitive; addresses may be given with or without a 0x prefix"
-            f"{', or in base58' if network_of(conn) == SOLANA else ''}."
+            f"{', or in base58' if network == SOLANA else ''}."
         )
 
     live = [m for m in matches if m.solutions]

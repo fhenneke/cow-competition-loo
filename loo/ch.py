@@ -9,9 +9,10 @@ import json
 import os
 import urllib.error
 import urllib.request
+from collections.abc import Iterable
 from typing import Any
 
-from .db import Snapshot, always, load_env
+from .db import Result, Snapshot, always, as_rows, load_env
 
 RAW_DATABASE = "raw_quotes"  # not gold_quotes: those miss competitions
 
@@ -30,6 +31,11 @@ NETWORK_CHAIN_IDS = {
 }
 
 STATEMENT_TIMEOUT_SECONDS = 300
+
+MAX_QUERY_BYTES = 4_000_000
+"""The parser's limit, raised from the default 256 kB so that days of quote ids fit in one
+query: each query reads every part its days touch, however few rows it wants from them.
+The proxy in front refuses a request body much over 1 MB, which binds first."""
 
 Row = dict[str, Any]
 
@@ -94,12 +100,29 @@ class Client:
             return self.snapshot.rows(
                 ("clickhouse", sql), lambda: self._query(sql, timeout), always
             )
-        return self._query(sql, timeout)
+        return as_rows(self._query(sql, timeout))
 
-    def _query(self, sql: str, timeout: int) -> list[Row]:
+    def prefetch(
+        self, queries: Iterable[str], *, timeout: int = STATEMENT_TIMEOUT_SECONDS
+    ) -> None:
+        """Start reading `queries` in parallel; `fetch` takes each result later. Only for
+        queries the caller goes on to fetch. Nothing happens without a snapshot."""
+        if self.snapshot is None:
+            return
+        self.snapshot.prefetch(
+            [
+                (("clickhouse", sql), lambda sql=sql: self._query(sql, timeout))
+                for sql in queries
+            ],
+            pool="clickhouse",
+        )
+
+    def _query(self, sql: str, timeout: int) -> Result:
         body = f"{sql}\nsettings max_execution_time = {timeout}\nformat JSONCompact"
+        # A URL parameter, as the limit applies before the query's own settings are read.
+        separator = "&" if "?" in self.url else "?"
         request = urllib.request.Request(
-            self.url,
+            f"{self.url}{separator}max_query_size={MAX_QUERY_BYTES}",
             data=body.encode(),
             headers={
                 "X-ClickHouse-User": self._user,
@@ -120,5 +143,5 @@ class Client:
             raise ClickHouseError(
                 f"ClickHouse returned an incomplete response: …{tail}"
             ) from error
-        columns = [column["name"] for column in payload["meta"]]
-        return [dict(zip(columns, row, strict=True)) for row in payload["data"]]
+        columns = tuple(column["name"] for column in payload["meta"])
+        return columns, [tuple(row) for row in payload["data"]]

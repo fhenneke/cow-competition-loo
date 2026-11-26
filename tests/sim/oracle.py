@@ -20,6 +20,15 @@ from decimal import ROUND_HALF_UP, Decimal
 from fractions import Fraction
 
 ONE = 10**18
+
+
+def window_median(prices: Sequence[int]) -> float:
+    """`percentile_cont(0.5)` as Postgres computes it: the prices as doubles, sorted, the
+    two middle ones interpolated in double precision."""
+    values = sorted(float(p) for p in prices)
+    position = 0.5 * (len(values) - 1)
+    low, high = values[math.floor(position)], values[math.ceil(position)]
+    return low + (position - math.floor(position)) * (high - low)
 NATIVE = "ee" * 20
 LAMPORTS = 10**9
 """Solana's `NATIVE_PRICE_DENOMINATOR`: its prices are lamports per atom × 1e9."""

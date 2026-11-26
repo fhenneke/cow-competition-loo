@@ -85,12 +85,15 @@ for solver_run in window.runs:
 
 #### Runtime
 
-The run waits on the analytics DB for ~96% of its time, so runtime is the DB's and varies
-2x or more by day: one mainnet day took 42 s of wall time and 1.7 s of CPU for one solver
-(2026-09-15). A month of mainnet with every solver removed in turn has taken 12–25
-minutes on different days, two outcome rules about 1.4x one. Each further (solver, rule)
-adds about 1.5 s of CPU per month (2026-11-26). Measure before promising: `--limit 3000`
-over one day gives the DB's current rate.
+A first run of a window reads the DB (and ClickHouse with `--quotes`) on several
+connections at once — six to Postgres, eight to ClickHouse (`db.PARALLEL_READS`) — while
+the analysis works through what has arrived. A week with `--quotes` and every solver
+removed in turn took 14 s on arbitrum-one, 34 s on base, 69 s on bnb and 99 s on mainnet
+(2026-11-17..24, measured 2026-11-26 on cached data; the same week's first runs that
+morning took 518 s, 349 s, 1,044 s and 939 s); a replay of the snapshot takes 40–55 s on
+mainnet ([where a first run's time goes](docs/analytics-db.md#what-a-first-run-costs-and-where)).
+The DB's speed still varies 2x or more by day, so quote a measured range with its date.
+Each further (solver, rule) adds about 1.5 s of CPU per month.
 
 #### Snapshots: a rerun of a past window needs no DB
 
@@ -103,9 +106,8 @@ queries it does not share with earlier runs, from the DB, and adds them; a run t
 replays everything opens no connection. The last stderr line counts the queries replayed,
 read and kept, and read but not kept. Measured on mainnet, 2026-11-03..17 with every
 solver removed in turn (69,312 auctions, 29 scenarios, 2026-11-26): the replay took 43 s
-of wall time, all of it the analysis itself, and peaked at 2.2 GB; a first run adds the
-wait on the DB, about 15 minutes that day. Its snapshot is 96 MB in 3,554 files and loads
-in 3.5 s.
+of wall time, all of it the analysis itself, and peaked at 2.2 GB. Its snapshot is 96 MB
+in 3,554 files and loads in 3.5 s.
 
 Not kept, and so read again on every run until the DB settles them: the rewards of
 auctions not yet accounted, the weekly reward marts of periods not yet paid out,

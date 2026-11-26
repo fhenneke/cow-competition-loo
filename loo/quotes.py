@@ -26,8 +26,8 @@ from fractions import Fraction
 from typing import TYPE_CHECKING, Literal
 
 from . import ch
-from .db import Connection, as_int, chunked, fetch, raw_schema
-from .extract import fetch_prices
+from .db import Connection, as_int, chunked, fetch, prefetch
+from .extract import price_query
 from .fees import FeeError, Quote, quote_fee
 from .primitives import ONE_ETH, canonical_token, price_in_eth, wrapped_native_token
 
@@ -322,15 +322,21 @@ def counterfactual_quote(
 
 # --- the recorded orders and their quotes -------------------------------------------
 
-# `quote_id` comes from `raw_prod_<chain>.order_quotes`: the staging copy is NULL early.
+# The window's orders by creation, then their quotes a chunk at a time: staging has no
+# index on `creation_timestamp`, so the window costs one scan of the orders table, and the
+# per-order lookups after it run in parallel.
+ORDER_UIDS_SQL = """
+select encode(uid, 'hex') as order_uid
+from dbt.stg_backend_data__orders
+where creation_timestamp >= %(start)s and creation_timestamp < %(end)s
+order by creation_timestamp, uid
+"""
+
+# Staging's `quote_id` is NULL only on rows built before ~2026-10-06, before any window
+# `loo` replays, and equals raw's since (0 of 584k orders differ on mainnet, base,
+# arbitrum-one and bnb, 2026-10-28..11-26). Raw's copy would cost a cold index read per
+# order (1.7 ms on mainnet): the most of a first run's quote side.
 ORDERS_SQL = """
-with traded as (
-    select t.order_uid, sum(t.sell_amount) as executed_sell
-    from dbt.stg_backend_data__trades t
-    join dbt.stg_backend_data__orders o on o.uid = t.order_uid
-    where o.creation_timestamp >= %(start)s and o.creation_timestamp < %(end)s
-    group by t.order_uid
-)
 select
     encode(o.uid, 'hex')                as order_uid,
     o.creation_timestamp,
@@ -346,26 +352,32 @@ select
     oq.sell_token_price,
     oq.verified                         as quote_verified,
     coalesce(ad.app_code, '(none)')     as app_code,
-    coalesce(t.executed_sell, 0)        as executed_sell,
-    rq.quote_id
+    oq.quote_id
 from dbt.stg_backend_data__orders o
 join dbt.stg_backend_data__order_quotes oq on oq.order_uid = o.uid
-left join {raw_schema}.order_quotes rq on rq.order_uid = o.uid
 left join dbt.stg_backend_data__app_data ad on ad.contract_app_data = o.app_data
-left join traded t on t.order_uid = o.uid
-where o.creation_timestamp >= %(start)s and o.creation_timestamp < %(end)s
-order by o.creation_timestamp
+where o.uid = any(%(uids)s)
 """
 
-# Window median per token: a cross-check and `autopilot` input, never a valuation.
+ORDERS_CHUNK = 500
+"""Orders per `ORDERS_SQL` query: small, as each order is a few index lookups, at first
+touch each a read from disk, and the chunks run in parallel."""
+
+# Window median per token: a cross-check and `autopilot` input, never a valuation. Each
+# query counts the prices of a chunk of auctions, and `load_token_prices` takes the median
+# over the chunks: prices repeat from auction to auction (1.76M prices of a mainnet day
+# held 44.6k distinct values, 2026-11-26), so the counts are small and the chunks run in
+# parallel, where one median over the window ran alone for minutes.
 TOKEN_PRICES_SQL = """
-select encode(ap.token, 'hex') as token, percentile_cont(0.5) within group (
-           order by ap.price
-       ) as price
+select encode(ap.token, 'hex') as token, ap.price, count(*) as n
 from {auction_prices} ap
 where ap.token = any(%(tokens)s)
-group by ap.token
+  and ap.price is not null
+group by ap.token, ap.price
 """
+
+TOKEN_PRICES_CHUNK = 5000
+"""Auctions per `TOKEN_PRICES_SQL` query."""
 
 
 @dataclass(frozen=True)
@@ -429,15 +441,31 @@ class RecordedQuote:
         return self.executed_sell > 0
 
 
+def window_queries(start: str, end: str) -> list[tuple[str, dict[str, str]]]:
+    """The quote side's first reads, which need only the window, for `db.prefetch`."""
+    return [order_trades_query(start, end), order_uid_query(start, end)]
+
+
+def order_uid_query(start: str, end: str) -> tuple[str, dict[str, str]]:
+    return ORDER_UIDS_SQL, {"start": start, "end": end}
+
+
 def load_recorded_quotes(
-    conn: Connection, start: str, end: str, *, network: str
+    conn: Connection, start: str, end: str, *, executed: Mapping[str, int]
 ) -> tuple[list[RecordedQuote], int]:
-    """Orders created in `[start, end)` with a recorded quote, and how many were dropped
-    as unevaluable."""
+    """Orders created in `[start, end)` with a recorded quote, in creation order, and how
+    many were dropped as unevaluable. `executed` is each order's executed sell amount
+    over all its trades (`load_order_trades`)."""
     orders: list[RecordedQuote] = []
     dropped = 0
-    sql = ORDERS_SQL.format(raw_schema=raw_schema(network))
-    for row in fetch(conn, sql, {"start": start, "end": end}):
+    created = [row["order_uid"] for row in fetch(conn, *order_uid_query(start, end))]
+    queries = [
+        (ORDERS_SQL, {"uids": [bytes.fromhex(uid) for uid in part]})
+        for part in chunked(created, ORDERS_CHUNK)
+    ]
+    prefetch(conn, queries, first=True)
+    by_uid = {row["order_uid"]: row for query in queries for row in fetch(conn, *query)}
+    for row in (by_uid[uid] for uid in created if uid in by_uid):
         try:
             fee = quote_fee(row["gas_amount"], row["gas_price"], row["sell_token_price"])
         except FeeError:
@@ -449,7 +477,7 @@ def load_recorded_quotes(
         orders.append(
             RecordedQuote(
                 app_code=row["app_code"],
-                executed_sell=as_int(row["executed_sell"]),
+                executed_sell=executed.get(row["order_uid"], 0),
                 order_uid=row["order_uid"],
                 created=row["creation_timestamp"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
                 kind=row["kind"],
@@ -588,12 +616,68 @@ def _exact(value: object) -> float:
         return float(text)
 
 
+LINK_CHUNK = 100_000
+"""Quote ids per unit: a day's in one."""
+
+UNIT_IDS_PER_QUERY = 40_000
+"""Quote ids per link query, about four mainnet days: each query reads the table's parts
+its days fall in once (a part holds about a week), so fewer queries read less. Bounded
+by the response, ~90 MB of JSON at this size; the request body is ~440 kB."""
+
+UNIT_KEYS_PER_QUERY = 5_000
+"""Request keys per re-quote query, ~650 kB of text: the proxy in front of ClickHouse
+refuses a request body much over 1 MB (`413 Request Entity Too Large`)."""
+
+
+@dataclass(frozen=True)
+class _Unit:
+    """One day (and chunk) of a link: the per-day query's time window and the rest of its
+    condition. A unit-tagged query reads several units in one pass, and the rows of a unit
+    are exactly what that unit's own query would return."""
+
+    window: str
+    condition: str
+    size: int
+
+
+def _unit_groups(units: Sequence[_Unit], budget: int) -> list[list[tuple[int, _Unit]]]:
+    """Consecutive units, numbered from 1, in groups of at most `budget` (or one unit)."""
+    groups: list[list[tuple[int, _Unit]]] = []
+    total = 0
+    for number, unit in enumerate(units, 1):
+        if not groups or total + unit.size > budget:
+            groups.append([])
+            total = 0
+        groups[-1].append((number, unit))
+        total += unit.size
+    return groups
+
+
+def _tagged(group: Sequence[tuple[int, _Unit]]) -> tuple[str, str]:
+    """`units`, the numbers of the units a row meets, as a select column, and the windows
+    as a prefilter: it lets ClickHouse skip the parts outside them."""
+    tags = ", ".join(
+        f"if({unit.window} and {unit.condition}, {number}, 0)" for number, unit in group
+    )
+    windows = " or ".join(f"({unit.window})" for _, unit in group)
+    return f"arrayFilter(k -> k > 0, [{tags}]) as units", f"({windows})"
+
+
+def _by_unit(rows: Iterable[ch.Row]) -> dict[int, list[ch.Row]]:
+    """Rows by unit; a row in two units' windows is in both, as with a query per unit."""
+    grouped: dict[int, list[ch.Row]] = {}
+    for row in rows:
+        for number in row["units"]:
+            grouped.setdefault(int(number), []).append(row)
+    return grouped
+
+
 def link_by_quote_id(
     client: ch.Client,
     network: str,
     orders: Sequence[RecordedQuote],
     *,
-    chunk: int = 2000,
+    chunk: int = LINK_CHUNK,
     log: Callable[[str], None] | None = None,
 ) -> IdLink:
     """Link each order to its competition by quote id, through the raw layer only (the
@@ -617,6 +701,8 @@ def link_by_quote_id(
     arrived_at: dict[tuple[str, str], str] = {}
     winners: dict[str, set[str]] = {}
     addresses: dict[str, dict[str, int]] = {}
+    # A unit per creation day (and chunk of its quote ids): the requests its ids name.
+    units: list[_Unit] = []
     for day in sorted(by_day):
         after = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
         first, last = _time_bounds(day, after)
@@ -628,50 +714,68 @@ def link_by_quote_id(
                 f"select request_id from {ch.RAW_DATABASE}.price_estimates "
                 f"where chain_id = {chain} and {window} and quote_id in ({ids})"
             )
-            for row in client.fetch(
-                f"select request_id, estimator from "
-                f"{ch.RAW_DATABASE}.winning_price_estimates "
-                f"where chain_id = {chain} and {window} and request_id in ({linked})"
-            ):
-                winners.setdefault(row["request_id"], set()).add(row["estimator"])
-            # One `quote_computed` row per forwarded answer.
-            for row in client.fetch(
-                f"select request_id, quote_id, nats_seq from "
-                f"{ch.RAW_DATABASE}.quote_computed "
-                f"where chain_id = {chain} and {window} and request_id in ({linked}) "
-                f"and quote_id is not null"
-            ):
-                computed.setdefault(row["request_id"], {})[int(row["quote_id"])] = int(
-                    row["nats_seq"]
-                )
-            for row in client.fetch(
-                f"select {ID_LADDER_COLUMNS} from {ch.RAW_DATABASE}.price_estimates "
-                f"where chain_id = {chain} and success and {window} "
-                f"and request_id in ({linked})"
-            ):
-                request_id: str = row["request_id"]
-                estimator: str = row["estimator"]
-                arrived_at.setdefault((request_id, estimator), str(row["ts"]))
-                if row["quote_id"] is not None:
-                    by_quote_id[int(row["quote_id"])] = (request_id, estimator)
-                    ids_of.setdefault(request_id, {})[int(row["quote_id"])] = estimator
-                if row["solver"]:
-                    address = str(row["solver"]).lower().removeprefix("0x")
-                    seen = addresses.setdefault(estimator, {})
-                    seen[address] = seen.get(address, 0) + 1
-                fields_of.setdefault(request_id, row)
-                _keep_earliest(
-                    rows,
-                    request_id,
-                    int(row["nats_seq"]),
-                    Estimate(
-                        estimator=estimator,
-                        out_amount=_exact(row["out_amount"]),
-                        gas=_exact(row["gas"]),
-                        verified=bool(row["verified"]),
-                        is_winner=estimator in winners.get(request_id, ()),
-                    ),
-                )
+            units.append(_Unit(window, f"request_id in ({linked})", len(part)))
+    # (winners, forwarded answers, ladder) per group of units, read ahead with the
+    # re-quotes of the orders placed without an id, which need no link first.
+    queries: list[tuple[str, str, str]] = []
+    for group in _unit_groups(units, UNIT_IDS_PER_QUERY):
+        tag, windows = _tagged(group)
+        queries.append(
+            (
+                f"select request_id, estimator, {tag} "
+                f"from {ch.RAW_DATABASE}.winning_price_estimates "
+                f"where chain_id = {chain} and {windows} and notEmpty(units)",
+                # One `quote_computed` row per forwarded answer.
+                f"select request_id, quote_id, nats_seq, {tag} "
+                f"from {ch.RAW_DATABASE}.quote_computed "
+                f"where chain_id = {chain} and {windows} and quote_id is not null "
+                f"and notEmpty(units)",
+                f"select {ID_LADDER_COLUMNS}, {tag} from {ch.RAW_DATABASE}.price_estimates "
+                f"where chain_id = {chain} and success and {windows} and notEmpty(units)",
+            )
+        )
+    without_id = [o for o in orders if not o.quote_id]
+    client.prefetch(
+        [*(sql for group in queries for sql in group), *_requote_queries(chain, without_id)]
+    )
+    winners_of: dict[int, list[ch.Row]] = {}
+    computed_of: dict[int, list[ch.Row]] = {}
+    ladder_of: dict[int, list[ch.Row]] = {}
+    for winners_sql, computed_sql, ladder_sql in queries:
+        winners_of.update(_by_unit(client.fetch(winners_sql)))
+        computed_of.update(_by_unit(client.fetch(computed_sql)))
+        ladder_of.update(_by_unit(client.fetch(ladder_sql)))
+    for number in range(1, len(units) + 1):
+        for row in winners_of.get(number, ()):
+            winners.setdefault(row["request_id"], set()).add(row["estimator"])
+        for row in computed_of.get(number, ()):
+            computed.setdefault(row["request_id"], {})[int(row["quote_id"])] = int(
+                row["nats_seq"]
+            )
+        for row in ladder_of.get(number, ()):
+            request_id: str = row["request_id"]
+            estimator: str = row["estimator"]
+            arrived_at.setdefault((request_id, estimator), str(row["ts"]))
+            if row["quote_id"] is not None:
+                by_quote_id[int(row["quote_id"])] = (request_id, estimator)
+                ids_of.setdefault(request_id, {})[int(row["quote_id"])] = estimator
+            if row["solver"]:
+                address = str(row["solver"]).lower().removeprefix("0x")
+                seen = addresses.setdefault(estimator, {})
+                seen[address] = seen.get(address, 0) + 1
+            fields_of.setdefault(request_id, row)
+            _keep_earliest(
+                rows,
+                request_id,
+                int(row["nats_seq"]),
+                Estimate(
+                    estimator=estimator,
+                    out_amount=_exact(row["out_amount"]),
+                    gas=_exact(row["gas"]),
+                    verified=bool(row["verified"]),
+                    is_winner=estimator in winners.get(request_id, ()),
+                ),
+            )
 
     requests: dict[str, QuoteRequest] = {}
     for request_id, ladder in _ladders(rows).items():
@@ -696,7 +800,7 @@ def link_by_quote_id(
     }
     # With the reason that stands if no re-quote places them.
     requote_candidates: list[tuple[RecordedQuote, str]] = [
-        (o, "no quote id") for o in orders if not o.quote_id
+        (o, "no quote id") for o in without_id
     ]
     for order in with_id:
         found = by_quote_id.get(order.quote_id or 0)
@@ -739,9 +843,18 @@ def link_by_quote_id(
     streamed_early = sum(
         1 for m in streamed if m.stream and m.stream.taken != m.request.winner
     )
-    requoted, requote_addresses = _link_requotes(
-        client, chain, [o for o, _ in requote_candidates]
-    )
+    # Those without an id were read with the link; those it failed are read now. A
+    # re-quote depends only on the rows of the order's own request key and day, so the
+    # two rounds place the same orders one round would.
+    failed = [o for o, why in requote_candidates if why != "no quote id"]
+    requoted, requote_addresses = _link_requotes(client, chain, without_id)
+    if failed:
+        more, more_addresses = _link_requotes(client, chain, failed)
+        requoted.extend(more)
+        for estimator, seen in more_addresses.items():
+            mine = requote_addresses.setdefault(estimator, {})
+            for address, n in seen.items():
+                mine[address] = mine.get(address, 0) + n
     matches.extend(requoted)
     placed = {m.order.order_uid for m in requoted}
     for order, why in requote_candidates:
@@ -830,28 +943,22 @@ REQUOTE_COLUMNS = (
 )
 
 
-def _link_requotes(
-    client: ch.Client,
-    chain: int,
-    orders: Sequence[RecordedQuote],
-    *,
-    chunk: int = 300,
-) -> tuple[list[MatchedQuote], dict[str, dict[str, int]]]:
-    """Link ethflow orders to the request-less competition the backend ran when indexing
-    them, found by the stored amount; also returns the settlement addresses seen
-    ([docs](../docs/quotes.md#an-ethflow-orders-stored-quote-can-come-from-the-backends-own-re-quote)).
-    """
-    from datetime import date, datetime, timedelta
+REQUOTE_CHUNK = 100_000
+"""Orders per re-quote unit: a day's in one."""
 
-    def when(stamp: str) -> datetime:
-        return datetime.fromisoformat(stamp)
+
+def _requote_units(
+    orders: Sequence[RecordedQuote], chunk: int = REQUOTE_CHUNK
+) -> tuple[list[_Unit], list[Sequence[RecordedQuote]]]:
+    """A unit per creation day (and chunk) of orders: their request keys, and the orders."""
+    from datetime import date, datetime, timedelta
 
     by_day: dict[str, list[RecordedQuote]] = {}
     for order in orders:
         if order.in_atoms > 0 and order.out_atoms > 0:
             by_day.setdefault(order.created[:10], []).append(order)
-    matches: list[MatchedQuote] = []
-    addresses: dict[str, dict[str, int]] = {}
+    units: list[_Unit] = []
+    parts: list[Sequence[RecordedQuote]] = []
     for day in sorted(by_day):
         first = datetime.fromisoformat(day) + timedelta(seconds=REQUOTE_AFTER_CREATION_SECONDS[0])
         last = datetime.fromisoformat(
@@ -867,86 +974,125 @@ def _link_requotes(
                 f"('0x{sell}', '0x{buy}', '{kind}', '{amount}')"
                 for sell, buy, kind, amount in keys
             )
-            key_filter = (
-                f"chain_id = {chain} and request_id is null and {window} "
-                f"and (lower(sell_token), lower(buy_token), kind, in_amount) in ({tuples})"
+            condition = f"(lower(sell_token), lower(buy_token), kind, in_amount) in ({tuples})"
+            units.append(_Unit(window, condition, len(keys)))
+            parts.append(part)
+    return units, parts
+
+
+def _requote_queries(chain: int, orders: Sequence[RecordedQuote]) -> list[str]:
+    """(winning quote ids, estimates) per group of units: what `_link_requotes` reads."""
+    units, _ = _requote_units(orders)
+    queries: list[str] = []
+    for group in _unit_groups(units, UNIT_KEYS_PER_QUERY):
+        tag, windows = _tagged(group)
+        # `prewhere`: request-less rows are rare, so reading the null map first spares
+        # reading the key columns of every row (0.3 s and 0.8 GB a day, not 4.8 s, 21 GB).
+        request_less = (
+            f"prewhere request_id is null where chain_id = {chain} "
+            f"and quote_id is not null and {windows} and notEmpty(units)"
+        )
+        queries.append(
+            f"select quote_id, {tag} from {ch.RAW_DATABASE}.winning_price_estimates "
+            f"{request_less}"
+        )
+        queries.append(
+            f"select {REQUOTE_COLUMNS}, {tag} from {ch.RAW_DATABASE}.price_estimates "
+            f"{request_less} and success"
+        )
+    return queries
+
+
+def _link_requotes(
+    client: ch.Client, chain: int, orders: Sequence[RecordedQuote]
+) -> tuple[list[MatchedQuote], dict[str, dict[str, int]]]:
+    """Link ethflow orders to the request-less competition the backend ran when indexing
+    them, found by the stored amount; also returns the settlement addresses seen
+    ([docs](../docs/quotes.md#an-ethflow-orders-stored-quote-can-come-from-the-backends-own-re-quote)).
+    """
+    from datetime import datetime
+
+    def when(stamp: str) -> datetime:
+        return datetime.fromisoformat(stamp)
+
+    matches: list[MatchedQuote] = []
+    addresses: dict[str, dict[str, int]] = {}
+    _, parts = _requote_units(orders)
+    queries = _requote_queries(chain, orders)
+    client.prefetch(queries)
+    winning_of: dict[int, list[ch.Row]] = {}
+    rows_of: dict[int, list[ch.Row]] = {}
+    for winning_sql, rows_sql in zip(queries[::2], queries[1::2], strict=True):
+        winning_of.update(_by_unit(client.fetch(winning_sql)))
+        rows_of.update(_by_unit(client.fetch(rows_sql)))
+    for number, part in enumerate(parts, 1):
+        winning = {int(row["quote_id"]) for row in winning_of.get(number, ())}
+        rows = rows_of.get(number, [])
+        by_key: dict[tuple[str, str, str, str], list[ch.Row]] = {}
+        for row in rows:
+            key = (
+                str(row["sell_"]).removeprefix("0x"),
+                str(row["buy_"]).removeprefix("0x"),
+                str(row["kind"]),
+                str(row["in_amount"]),
             )
-            winning = {
-                int(row["quote_id"])
-                for row in client.fetch(
-                    f"select quote_id from {ch.RAW_DATABASE}.winning_price_estimates "
-                    f"where {key_filter} and quote_id is not null"
-                )
-            }
-            rows = client.fetch(
-                f"select {REQUOTE_COLUMNS} from {ch.RAW_DATABASE}.price_estimates "
-                f"where success and quote_id is not null and {key_filter}"
+            by_key.setdefault(key, []).append(row)
+        for order in part:
+            created = when(order.created)
+            same_key = by_key.get(
+                (order.sell_token, order.buy_token, order.kind, str(order.in_atoms)), []
             )
-            by_key: dict[tuple[str, str, str, str], list[ch.Row]] = {}
-            for row in rows:
-                key = (
-                    str(row["sell_"]).removeprefix("0x"),
-                    str(row["buy_"]).removeprefix("0x"),
-                    str(row["kind"]),
-                    str(row["in_amount"]),
-                )
-                by_key.setdefault(key, []).append(row)
-            for order in part:
-                created = when(order.created)
-                same_key = by_key.get(
-                    (order.sell_token, order.buy_token, order.kind, str(order.in_atoms)), []
-                )
-                anchors = sorted(
-                    (
-                        row
-                        for row in same_key
-                        if str(row["out_amount"]) == str(order.out_atoms)
-                        and int(row["quote_id"]) in winning
-                        and REQUOTE_AFTER_CREATION_SECONDS[0]
-                        <= (when(str(row["ts"])) - created).total_seconds()
-                        <= REQUOTE_AFTER_CREATION_SECONDS[1]
-                    ),
-                    key=lambda row: abs((when(str(row["ts"])) - created).total_seconds()),
-                )
-                if not anchors:
+            anchors = sorted(
+                (
+                    row
+                    for row in same_key
+                    if str(row["out_amount"]) == str(order.out_atoms)
+                    and int(row["quote_id"]) in winning
+                    and REQUOTE_AFTER_CREATION_SECONDS[0]
+                    <= (when(str(row["ts"])) - created).total_seconds()
+                    <= REQUOTE_AFTER_CREATION_SECONDS[1]
+                ),
+                key=lambda row: abs((when(str(row["ts"])) - created).total_seconds()),
+            )
+            if not anchors:
+                continue
+            anchor = anchors[0]
+            anchor_id, anchor_at = int(anchor["quote_id"]), when(str(anchor["ts"]))
+            siblings: dict[tuple[str, str], tuple[Arrival, Estimate]] = {}
+            for row in same_key:
+                if (
+                    abs(int(row["quote_id"]) - anchor_id) > REQUOTE_ID_SPAN
+                    or abs((when(str(row["ts"])) - anchor_at).total_seconds())
+                    > REQUOTE_SIBLING_SECONDS
+                ):
                     continue
-                anchor = anchors[0]
-                anchor_id, anchor_at = int(anchor["quote_id"]), when(str(anchor["ts"]))
-                siblings: dict[tuple[str, str], tuple[Arrival, Estimate]] = {}
-                for row in same_key:
-                    if (
-                        abs(int(row["quote_id"]) - anchor_id) > REQUOTE_ID_SPAN
-                        or abs((when(str(row["ts"])) - anchor_at).total_seconds())
-                        > REQUOTE_SIBLING_SECONDS
-                    ):
-                        continue
-                    _keep_earliest(
-                        siblings,
-                        str(anchor_id),
-                        int(row["nats_seq"]),
-                        Estimate(
-                            estimator=row["estimator"],
-                            out_amount=_exact(row["out_amount"]),
-                            gas=_exact(row["gas"]),
-                            verified=bool(row["verified"]),
-                            is_winner=row["estimator"] == anchor["estimator"],
-                        ),
-                    )
-                    if row["solver"]:
-                        seen = addresses.setdefault(row["estimator"], {})
-                        address = str(row["solver"]).lower().removeprefix("0x")
-                        seen[address] = seen.get(address, 0) + 1
-                ladder = _ladders(siblings).get(str(anchor_id), ())
-                request = QuoteRequest(
-                    request_id=f"requote-{anchor_id}",
-                    kind=order.kind,
-                    sell_token=order.sell_token,
-                    buy_token=order.buy_token,
-                    in_amount=order.in_atoms,
-                    winner=str(anchor["estimator"]),
-                    estimates=ladder,
+                _keep_earliest(
+                    siblings,
+                    str(anchor_id),
+                    int(row["nats_seq"]),
+                    Estimate(
+                        estimator=row["estimator"],
+                        out_amount=_exact(row["out_amount"]),
+                        gas=_exact(row["gas"]),
+                        verified=bool(row["verified"]),
+                        is_winner=row["estimator"] == anchor["estimator"],
+                    ),
                 )
-                matches.append(MatchedQuote(order=order, request=request))
+                if row["solver"]:
+                    seen = addresses.setdefault(row["estimator"], {})
+                    address = str(row["solver"]).lower().removeprefix("0x")
+                    seen[address] = seen.get(address, 0) + 1
+            ladder = _ladders(siblings).get(str(anchor_id), ())
+            request = QuoteRequest(
+                request_id=f"requote-{anchor_id}",
+                kind=order.kind,
+                sell_token=order.sell_token,
+                buy_token=order.buy_token,
+                in_amount=order.in_atoms,
+                winner=str(anchor["estimator"]),
+                estimates=ladder,
+            )
+            matches.append(MatchedQuote(order=order, request=request))
     return matches, addresses
 
 
@@ -982,7 +1128,8 @@ class OrderTrade:
 
 
 # A trade belongs to the first settlement after it in its block, whose `Settlement` event
-# carries the auction id (the `int_backend_data__trade_with_tx_hash` rule).
+# carries the auction id (the `int_backend_data__trade_with_tx_hash` rule). A trade with
+# no settlement recorded has none; it still counts towards its order's executed amount.
 ORDER_TRADES_SQL = """
 with window_trades as (
     select t.order_uid, t.block_number, t.log_index, t.sell_amount, t.buy_amount
@@ -993,35 +1140,54 @@ with window_trades as (
 select encode(wt.order_uid, 'hex') as order_uid, s.auction_id,
        wt.sell_amount, wt.buy_amount
 from window_trades wt
-cross join lateral (
+left join lateral (
     select s.auction_id
     from dbt.stg_backend_data__settlements s
     where s.block_number = wt.block_number and s.log_index > wt.log_index
     order by s.log_index
     limit 1
-) s
+) s on true
 """
 
+# Each (auction, token) by its position in that auction's price arrays.
 TRADE_PRICES_SQL = """
-select ap.auction_id, encode(ap.token, 'hex') as token, ap.price
-from {auction_prices} ap
-join unnest(%(pair_auctions)s::bigint[], %(pair_tokens)s::bytea[]) as w (auction_id, token)
-  on w.auction_id = ap.auction_id and w.token = ap.token
+select w.auction_id, encode(w.token, 'hex') as token, ca.price_values[p.position] as price
+from unnest(%(pair_auctions)s::bigint[], %(pair_tokens)s::bytea[]) as w (auction_id, token)
+join dbt.stg_backend_data__competition_auctions ca on ca.auction_id = w.auction_id
+-- `offset 0` keeps the position computed once, not once per use
+cross join lateral (
+    select array_position(ca.price_tokens, w.token) as position offset 0
+) as p
+where p.position is not null
 """
 
 
-def load_order_trades(conn: Connection, start: str, end: str) -> list[OrderTrade]:
+def order_trades_query(start: str, end: str) -> tuple[str, dict[str, str]]:
+    return ORDER_TRADES_SQL, {"start": start, "end": end}
+
+
+def load_order_trades(
+    conn: Connection, start: str, end: str
+) -> tuple[list[OrderTrade], dict[str, int]]:
     """Every trade, with its auction, of orders created in `[start, end)` — including
-    trades after `end`. Trades with an unrecorded settlement are left out."""
-    return [
-        OrderTrade(
-            order_uid=row["order_uid"],
-            auction_id=row["auction_id"],
-            sell_amount=as_int(row["sell_amount"]),
-            buy_amount=as_int(row["buy_amount"]),
+    trades after `end` — and each order's executed sell amount over all its trades. Trades
+    with an unrecorded settlement are left out of the list, not out of the amount."""
+    trades: list[OrderTrade] = []
+    executed: dict[str, int] = {}
+    for row in fetch(conn, *order_trades_query(start, end)):
+        sold = as_int(row["sell_amount"])
+        executed[row["order_uid"]] = executed.get(row["order_uid"], 0) + sold
+        if row["auction_id"] is None:
+            continue
+        trades.append(
+            OrderTrade(
+                order_uid=row["order_uid"],
+                auction_id=row["auction_id"],
+                sell_amount=sold,
+                buy_amount=as_int(row["buy_amount"]),
+            )
         )
-        for row in fetch(conn, ORDER_TRADES_SQL, {"start": start, "end": end})
-    ]
+    return trades, executed
 
 
 def _priced_token(token: str, weth: str) -> str:
@@ -1029,16 +1195,14 @@ def _priced_token(token: str, weth: str) -> str:
     return canonical_token(token, weth)
 
 
-def load_trade_prices(
-    conn: Connection,
+def trade_price_queries(
     orders: Sequence[RecordedQuote],
     trades: Sequence[OrderTrade],
     *,
     weth: str,
     chunk: int = 2000,
-) -> dict[tuple[int, str], int]:
-    """`(auction_id, token) -> native price` for both tokens of every trade, in the auction
-    that trade settled in. Absent pairs stay absent."""
+) -> list[tuple[str, dict[str, list[int] | list[bytes]]]]:
+    """The queries `load_trade_prices` makes, for `db.prefetch`."""
     tokens = {
         o.order_uid: (_priced_token(o.sell_token, weth), _priced_token(o.buy_token, weth))
         for o in orders
@@ -1051,22 +1215,38 @@ def load_trade_prices(
             for token in tokens[trade.order_uid]
         }
     )
-    prices: dict[tuple[int, str], int] = {}
     auction_ids = sorted({auction_id for auction_id, _ in pairs})
-    if not auction_ids:
-        return prices
+    queries: list[tuple[str, dict[str, list[int] | list[bytes]]]] = []
     for part in chunked(auction_ids, chunk):
         ids = set(part)
         wanted = [(a, t) for a, t in pairs if a in ids]
-        for row in fetch_prices(
-            conn,
-            TRADE_PRICES_SQL,
-            {
-                "ids": list(part),
-                "pair_auctions": [a for a, _ in wanted],
-                "pair_tokens": [bytes.fromhex(t) for _, t in wanted],
-            },
-        ):
+        queries.append(
+            (
+                TRADE_PRICES_SQL,
+                {
+                    "pair_auctions": [a for a, _ in wanted],
+                    "pair_tokens": [bytes.fromhex(t) for _, t in wanted],
+                },
+            )
+        )
+    return queries
+
+
+def load_trade_prices(
+    conn: Connection,
+    orders: Sequence[RecordedQuote],
+    trades: Sequence[OrderTrade],
+    *,
+    weth: str,
+    chunk: int = 2000,
+) -> dict[tuple[int, str], int]:
+    """`(auction_id, token) -> native price` for both tokens of every trade, in the auction
+    that trade settled in. Absent pairs stay absent."""
+    queries = trade_price_queries(orders, trades, weth=weth, chunk=chunk)
+    prefetch(conn, queries, first=True)
+    prices: dict[tuple[int, str], int] = {}
+    for sql, params in queries:
+        for row in fetch(conn, sql, params):
             if row["price"]:
                 prices[(row["auction_id"], row["token"])] = as_int(row["price"])
     return prices
@@ -1131,23 +1311,61 @@ def traded_sell_prices(
     return {uid: value / amount for uid, (value, amount) in sums.items()}
 
 
+def token_price_queries(
+    auction_ids: Sequence[int], tokens: Sequence[str]
+) -> list[tuple[str, dict[str, list[int] | list[bytes]]]]:
+    """The queries `load_token_prices` makes, for `db.prefetch`."""
+    if not auction_ids or not tokens:
+        return []
+    raw = [bytes.fromhex(token) for token in sorted(set(tokens))]
+    return [
+        (price_query(TOKEN_PRICES_SQL), {"ids": list(ids), "tokens": list(part)})
+        for part in chunked(raw, 5000)
+        for ids in chunked(list(auction_ids), TOKEN_PRICES_CHUNK)
+    ]
+
+
 def load_token_prices(
     conn: Connection, auction_ids: Sequence[int], tokens: Sequence[str]
 ) -> dict[str, float]:
     """Median native price per token over the window's auctions, for the `autopilot`
     ranking's out-token side. Absent tokens stay absent."""
+    queries = token_price_queries(auction_ids, tokens)
+    prefetch(conn, queries, first=True)
+    counts: dict[str, dict[float, int]] = {}
+    for sql, params in queries:
+        for row in fetch(conn, sql, params):
+            # As `percentile_cont` takes them: the numeric cast to double precision.
+            by_value = counts.setdefault(row["token"], {})
+            value = float(row["price"])
+            by_value[value] = by_value.get(value, 0) + int(row["n"])
     prices: dict[str, float] = {}
-    if not auction_ids or not tokens:
-        return prices
-    raw = [bytes.fromhex(token) for token in sorted(set(tokens))]
-    for part in chunked(raw, 5000):
-        rows = fetch_prices(
-            conn, TOKEN_PRICES_SQL, {"ids": list(auction_ids), "tokens": list(part)}
-        )
-        for row in rows:
-            if row["price"]:
-                prices[row["token"]] = float(row["price"])
+    for token, by_value in counts.items():
+        median = percentile_cont_half(by_value)
+        if median:
+            prices[token] = median
     return prices
+
+
+def percentile_cont_half(counts: Mapping[float, int]) -> float:
+    """`percentile_cont(0.5)` of a multiset given as value -> count, to the bit as
+    Postgres computes it: the two middle values of the sorted rows, interpolated in
+    double precision."""
+    position = 0.5 * (sum(counts.values()) - 1)
+    first, second = math.floor(position), math.ceil(position)
+    low = high = None
+    seen = 0
+    for value in sorted(counts):
+        seen += counts[value]
+        if low is None and seen > first:
+            low = value
+        if seen > second:
+            high = value
+            break
+    assert low is not None and high is not None, "an empty multiset has no median"
+    if first == second:
+        return low
+    return low + (position - first) * (high - low)
 
 
 # --- the counterfactual -------------------------------------------------------------
@@ -1711,19 +1929,32 @@ def load_quote_window(
     emit: Callable[[str], None] = log or (lambda message: None)
     ch.chain_id(network)  # refuse an unsupported network before any query runs
 
-    orders, dropped = load_recorded_quotes(conn, start, end, network=network)
+    # Postgres reads ahead of everything else the run has queued: the quote side is used
+    # first. Each step queues the next as soon as its inputs are known.
+    prefetch(conn, window_queries(start, end), first=True)
+    trades, executed = load_order_trades(conn, start, end)
+    orders, dropped = load_recorded_quotes(conn, start, end, executed=executed)
     linkable = [o for o in orders if not o.trivial]
     emit(
         f"{len(orders)} orders created in [{start}, {end}) carry a recorded quote "
         f"({dropped} dropped as unevaluable); {len(orders) - len(linkable)} trivial "
         f"unwraps (quote solver 0x0) had no competition and are not linked"
     )
+    weth = wrapped_native_token(network)
+    # Data guards, not ranking inputs: they run under every ranking.
+    guard_tokens = sorted({o.sell_token for o in orders})
+    prefetch(
+        conn,
+        [
+            *trade_price_queries(orders, trades, weth=weth),
+            *(token_price_queries(auction_ids, guard_tokens) if ranking != "autopilot" else []),
+        ],
+        first=True,
+    )
     id_link = link_by_quote_id(client, network, linkable, log=log)
     matches = id_link.matches
     estimator_map = id_link.estimator_map
 
-    # Data guards, not ranking inputs: they run under every ranking.
-    guard_tokens = sorted({o.sell_token for o in orders})
     wanted = guard_tokens + (
         sorted({m.order.buy_token for m in matches}) if ranking == "autopilot" else []
     )
@@ -1734,8 +1965,6 @@ def load_quote_window(
         if ranking == "autopilot"
         else {}
     )
-    weth = wrapped_native_token(network)
-    trades = load_order_trades(conn, start, end)
     trade_prices = load_trade_prices(conn, orders, trades, weth=weth)
     one_sided = price_suspect_orders(
         orders,

@@ -37,10 +37,10 @@ Results pages: the [solver-value-artifact skill](.claude/skills/solver-value-art
 13. Fast-path auctions (`fast_path_quote_id` non-NULL) are excluded, not arbitrated.
 14. `int_backend_data__solution_data.lower_reward_cap` is not the floor, so read it through
     `rewards.lower_reward_cap`.
-15. Quotes: link an order to its competition by `quote_id` from
-    `raw_prod_<chain>.order_quotes`, and read only `raw_quotes`, never `gold_quotes`. The
-    quote winner need not have bid on its order, and quote-side guards run after the
-    did-the-solver-win test.
+15. Quotes: link an order to its competition by `order_quotes.quote_id` (staging's copy is
+    NULL only before ~2026-10-06, raw's before 2026-09-22), and read only `raw_quotes`,
+    never `gold_quotes`. The quote winner need not have bid on its order, and quote-side
+    guards run after the did-the-solver-win test.
 16. A price check that compares two feeds for the same token passes a token both feeds
     get wrong. Instead, compare what was sold with what was bought, at that auction's
     prices.

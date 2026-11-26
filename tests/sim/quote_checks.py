@@ -67,7 +67,7 @@ def expected_suspects(world: World, auction_ids: list[int]) -> tuple[set[str], s
                 sum(p * q for p, q in weighted) / sum(q for _, q in weighted))
         else:
             seen = [a.prices[order.sell_token] for a in window if order.sell_token in a.prices]
-            reference = float(median(seen)) if seen else None
+            reference = oracle.window_median(seen) if seen else None
         api = order.quote.sell_token_price
         if reference and api > 0:
             ratio = (reference / 1e18) / api

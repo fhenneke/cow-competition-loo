@@ -1053,27 +1053,44 @@ def _quote_overlay(
 ) -> tuple[list[ValuedBid] | None, frozenset[str]]:
     """Revalue every bid with the replacement quotes; return them and the orders substituted.
 
+    A bid's valuation reads only its own orders' quotes, so a bid holding none of the
+    replaced orders keeps its baseline valuation; only the others are valued again.
+
     An order whose replacement leaves its fee unknown keeps its recorded quote, so one
     unusable replacement does not void the rest. `(None, ∅)` if nothing could be substituted."""
+    # Read only for the replaced orders: asking every bid would price fees no one needs.
     known_in_baseline = {
         order.uid
         for entry in baseline
+        if any(order.uid in quoted for order in entry.bid.orders)
         for order in entry.bid.orders
-        if order.uid not in entry.valuation.fees_unknown
+        if order.uid in quoted and order.uid not in entry.valuation.fees_unknown
     }
+    as_valued = {entry.bid.uid: entry for entry in baseline}
     overlay: dict[str, Quote] = {uid: counterfactual_quotes[uid] for uid in quoted}
     for _attempt in range(2):
         if not overlay:
             return None, frozenset()
         quotes: dict[str, Quote] = dict(bundle.fee_context.quotes)
         quotes.update(overlay)
-        valued, failures = build_solutions(
-            bundle.bids,
+        touched = [
+            bid
+            for bid in bundle.bids
+            if bid.uid not in as_valued or any(o.uid in overlay for o in bid.orders)
+        ]
+        revalued, failures = build_solutions(
+            touched,
             bundle.native_prices,
             weth,
             mode=mode,
             fee_context=replace(bundle.fee_context, quotes=quotes),
         )
+        by_uid = {entry.bid.uid: entry for entry in revalued}
+        valued = [
+            by_uid.get(bid.uid) or as_valued[bid.uid]
+            for bid in bundle.bids
+            if bid.uid not in failures
+        ]
         broken = {
             uid
             for entry in valued

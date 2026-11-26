@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from statistics import median
-
 from loo import ch, quotes
 
 from .harness import Sim
+from .oracle import window_median
 from .world import World
 
 
@@ -21,7 +20,7 @@ def check_autopilot(sim: Sim, world: World, auction_ids: list[int],
     for token, price in window.buy_token_prices.items():
         seen = [a.prices[token] for a in world.auctions
                 if a.auction_id in ids and token in a.prices]
-        assert price == float(median(seen)) / 1e18
+        assert price == window_median(seen) / 1e18
     v = window.validation
     assert v.ranking == "autopilot"
     assert v.reproduced + v.tie_mismatches + len(v.disagreements) + v.unpriced <= v.requests

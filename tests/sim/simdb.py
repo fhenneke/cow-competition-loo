@@ -3,9 +3,10 @@
 Each query `loo` sends is recognised by its exact text — the module's own SQL constant,
 formatted the way the module formats it — and answered from the world with that query's
 semantics: its filters, its joins, its ordering. Queries without an `order by` come back
-in a seeded random order, so nothing downstream may depend on row order the SQL does not
-promise. An unrecognised query is a failure: the pipeline asked for something the
-simulation does not know, which is exactly what a changed query looks like.
+in a random order seeded by the query itself, so nothing downstream may depend on row
+order the SQL does not promise, and a seed replays alike whichever of `loo`'s parallel
+readers asks first. An unrecognised query is a failure: the pipeline asked for something
+the simulation does not know, which is exactly what a changed query looks like.
 
 `Faults` injects what a real connection does wrong: it drops mid-run, a statement times
 out, a table loses rows.
@@ -14,7 +15,7 @@ out, a table loses rows.
 from __future__ import annotations
 
 import random
-import statistics
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -64,21 +65,20 @@ class SimServer:
     queries: list[str] = field(default_factory=list[str])
 
     def __post_init__(self) -> None:
-        self._rng = random.Random(self.shuffle_seed)
+        self._local = threading.local()
+        self._count = threading.Lock()
         self._handlers = self._routes()
 
     # --- dispatch ---------------------------------------------------------------------
 
     def _routes(self) -> dict[str, Callable[[dict[str, Any]], list[Row]]]:
         q = extract.price_query
-        network = self.world.network
-        orders_sql = quotes.ORDERS_SQL.format(raw_schema="raw_prod_" + network.replace("-", "_"))
         routes: dict[str, Callable[[dict[str, Any]], list[Row]]] = {
             extract.WINDOW_SQL: self._window,
             extract.AUCTIONS_SQL: self._auctions,
             extract.SOLUTIONS_SQL: self._solutions,
             extract.EXECUTIONS_SQL: self._executions,
-            q(extract.PRICES_SQL): self._prices,
+            extract.PRICES_SQL: self._prices,
             extract.REFERENCE_SCORES_SQL: self._references,
             extract.FEE_POLICIES_SQL: self._policies,
             extract.PARTNER_COUNTS_SQL: self._partner_counts,
@@ -88,13 +88,14 @@ class SimServer:
             extract.FCT_REWARDS_SQL: self._mart,
             extract.CONVERSION_RATES_SQL: self._rates,
             q(extract.USD_PRICES_SQL): self._usd_prices,
-            extract.SOLVER_SQL: self._solver,
+            extract.SOLVERS_SQL: self._solvers,
             extract.ALL_SOLVERS_SQL: self._all_solvers,
             extract.DB_SURPLUS_SQL: self._db_surplus,
-            orders_sql: self._quote_orders,
-            q(quotes.TOKEN_PRICES_SQL): self._token_medians,
+            quotes.ORDER_UIDS_SQL: self._order_uids,
+            quotes.ORDERS_SQL: self._quote_orders,
+            q(quotes.TOKEN_PRICES_SQL): self._token_price_counts,
             quotes.ORDER_TRADES_SQL: self._order_trades,
-            q(quotes.TRADE_PRICES_SQL): self._trade_prices,
+            quotes.TRADE_PRICES_SQL: self._trade_prices,
             payouts.PERFORMANCE_SQL: self._performance,
             payouts.RELATIVE_SURPLUS_SQL: lambda p: self._metric(p, self._relative_rows()),
             payouts.RELATIVE_SURPLUS_TOTALS_SQL: lambda p: self._metric_totals(
@@ -122,8 +123,10 @@ class SimServer:
         return solana
 
     def query(self, conn: SimConnection, sql: str, params: Any) -> list[Row]:
-        self.queries.append(sql)
-        n = len(self.queries)
+        with self._count:
+            self.queries.append(sql)
+            n = len(self.queries)
+        self._local.rng = random.Random(f"{self.shuffle_seed}:{sql}:{params!r}")
         if self.faults.lose_connection_at == n:
             conn.closed = 2
             raise psycopg2.OperationalError("SSL SYSCALL error: Operation timed out")
@@ -139,7 +142,8 @@ class SimServer:
         return handler(dict(params or {}))
 
     def _unordered(self, rows: list[Row]) -> list[Row]:
-        self._rng.shuffle(rows)
+        rng: random.Random = self._local.rng
+        rng.shuffle(rows)
         return rows
 
     # --- the window and its auctions --------------------------------------------------
@@ -288,16 +292,28 @@ class SimServer:
     def _uids(self, params: dict[str, Any]) -> set[str]:
         return {bytes(uid).hex() for uid in params["uids"]}
 
+    def _listed(self, uid: str) -> bool:
+        """In `stg_backend_data__orders`."""
+        return uid in self.world.orders and uid not in self.faults.drop_orders
+
     def _partner_counts(self, params: dict[str, Any]) -> list[Row]:
+        """Every order proposed in the auctions, JIT or not, with partners."""
+        proposed = {t.uid for a in self._auctions_by_id(params) for s in a.solutions
+                    for t in s.trades}
         return self._unordered([
             {"order_uid": uid, "partner_count": self.world.orders[uid].partners}
-            for uid in self._uids(params)
-            if uid in self.world.orders and self.world.orders[uid].partners > 0
+            for uid in proposed
+            if self._listed(uid) and self.world.orders[uid].partners > 0
         ])
 
     def _order_quotes(self, params: dict[str, Any]) -> list[Row]:
+        """The quotes of the orders with a price-improvement policy in the auctions."""
+        improving = {
+            uid for _, uid in self._covered(set(params["ids"]))
+            if any(p.kind == "priceimprovement" for p in self.world.orders[uid].policies)
+        }
         rows: list[Row] = []
-        for uid in self._uids(params):
+        for uid in improving:
             order = self.world.orders.get(uid)
             if order is None or order.quote is None:
                 continue
@@ -461,16 +477,12 @@ class SimServer:
                 activity[s.solver] = (n + 1, auctions, won + s.is_winner)
         return activity
 
-    def _solver(self, params: dict[str, Any]) -> list[Row]:
-        raw: str = params["solver"]
-        hexish = (raw[2:] if raw[:2].lower() == "0x" else raw).lower()
+    def _solvers(self, params: dict[str, Any]) -> list[Row]:
+        """Every catalogue entry with its window activity."""
         activity = self._activity(params)
         rows: list[Row] = []
         for solver in self.world.solvers:
             for address in solver.addresses:
-                by_name = solver.name.lower() == raw.lower() and solver.name != "Uncatalogued"
-                if not by_name and address != hexish:
-                    continue
                 n, auctions, won = activity.get(address, (0, set[int](), 0))
                 rows.append({
                     "address": address,
@@ -481,8 +493,7 @@ class SimServer:
                     "auctions_bid": len(auctions),
                     "winning_solutions": won,
                 })
-        rows.sort(key=lambda r: (-r["solutions"], r["name"]))
-        return rows
+        return self._unordered(rows)
 
     def _all_solvers(self, params: dict[str, Any]) -> list[Row]:
         bidders = set(self._activity(params))
@@ -550,13 +561,17 @@ class SimServer:
         end = datetime.fromisoformat(params["end"])
         return [o for o in self.world.orders.values() if start <= o.created < end]
 
+    def _order_uids(self, params: dict[str, Any]) -> list[Row]:
+        created = sorted(self._created_in(params), key=lambda o: (o.created, o.uid))
+        return [{"order_uid": o.uid} for o in created]
+
     def _quote_orders(self, params: dict[str, Any]) -> list[Row]:
-        trades = self._executed()
         rows: list[Row] = []
-        for order in self._created_in(params):
-            q = order.quote
-            if q is None:
+        for uid in self._uids(params):
+            order = self.world.orders.get(uid)
+            if order is None or order.quote is None:
                 continue
+            q = order.quote
             rows.append({
                 "order_uid": order.uid,
                 "creation_timestamp": order.created,
@@ -572,21 +587,20 @@ class SimServer:
                 "sell_token_price": q.sell_token_price,
                 "quote_verified": q.verified,
                 "app_code": order.app_code,
-                "executed_sell": Decimal(sum(t[1] for t in trades.get(order.uid, []))),
                 "quote_id": q.quote_id,
             })
-        rows.sort(key=lambda r: r["creation_timestamp"])
-        return rows
+        return self._unordered(rows)
 
-    def _token_medians(self, params: dict[str, Any]) -> list[Row]:
+    def _token_price_counts(self, params: dict[str, Any]) -> list[Row]:
+        """How often each (token, price) occurs in the auctions' price arrays."""
         tokens = {bytes(t).hex() for t in params["tokens"]}
-        by_token: dict[str, list[int]] = {}
+        counts: dict[tuple[str, int], int] = {}
         for _, token, price in self._price_rows(set(params["ids"])):
             if token in tokens:
-                by_token.setdefault(token, []).append(price)
+                counts[(token, price)] = counts.get((token, price), 0) + 1
         return self._unordered([
-            {"token": token, "price": float(statistics.median(prices))}
-            for token, prices in by_token.items()
+            {"token": token, "price": Decimal(price), "n": n}
+            for (token, price), n in counts.items()
         ])
 
     def _order_trades(self, params: dict[str, Any]) -> list[Row]:
@@ -604,7 +618,7 @@ class SimServer:
                          (bytes(t).hex() for t in params["pair_tokens"]), strict=True))
         return self._unordered([
             {"auction_id": a, "token": token, "price": Decimal(price)}
-            for a, token, price in self._price_rows(set(params["ids"]))
+            for a, token, price in self._price_rows({a for a, _ in wanted})
             if (a, token) in wanted
         ])
 
@@ -622,10 +636,16 @@ def base58(address: str) -> str:
     return "1" * (len(raw) - len(raw.lstrip(b"\0"))) + digits
 
 
+@dataclass(frozen=True)
+class SimColumn:
+    name: str
+
+
 class SimCursor:
     def __init__(self, conn: SimConnection) -> None:
         self._conn = conn
-        self._rows: list[Row] = []
+        self._rows: list[tuple[Any, ...]] = []
+        self.description: list[SimColumn] | None = None
 
     def __enter__(self) -> SimCursor:
         return self
@@ -634,9 +654,11 @@ class SimCursor:
         return None
 
     def execute(self, sql: str, params: Any = None) -> None:
-        self._rows = self._conn.server.query(self._conn, sql, params)
+        rows = self._conn.server.query(self._conn, sql, params)
+        self.description = [SimColumn(name) for name in rows[0]] if rows else []
+        self._rows = [tuple(row.values()) for row in rows]
 
-    def fetchall(self) -> list[Row]:
+    def fetchall(self) -> list[tuple[Any, ...]]:
         return self._rows
 
 
@@ -650,6 +672,9 @@ class SimConnection:
 
     def cursor(self, cursor_factory: object = None) -> SimCursor:
         return SimCursor(self)
+
+    def rollback(self) -> None:
+        return None
 
     def close(self) -> None:
         self.closed = 1
