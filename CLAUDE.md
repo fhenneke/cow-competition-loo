@@ -72,7 +72,4 @@ Results pages: the [solver-value-artifact skill](.claude/skills/solver-value-art
 
 Each milestone is a branch that lands on `main` as one squashed commit, and the branch
 is kept: `git merge --squash <branch>`, then one message, then check that
-`git diff main <branch>` is empty. Commits are signed with a YubiKey tap. Use
-`git commit -F -` from a re-runnable script that does no staging and is guarded by
-`git diff --cached --quiet`. Run it in the background, and ask for the tap as the
-entire next message. Details: [.claude/hardware-key-signing.md](.claude/hardware-key-signing.md).
+`git diff main <branch>` is empty. How commits are signed is up to each developer.
