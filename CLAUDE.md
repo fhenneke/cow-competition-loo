@@ -65,6 +65,9 @@ Results pages: the [solver-value-artifact skill](.claude/skills/solver-value-art
 - Runs wait on the DB, and their runtimes drift by 2x or more from day to day. Quote a
   range with the date it was measured. Launch long runs as `caffeinate -i uv run loo …`.
   Exit 6 means the network failed, not the data, so rerun unchanged.
+- A rerun of a past window replays its snapshot and does not touch the DB
+  ([README](README.md#snapshots-a-rerun-of-a-past-window-needs-no-db)). Delete the
+  window's snapshot directory to read the DB afresh.
 - Do not edit `loo/` while a run is in flight, because each run re-imports from disk.
 - `.env` stays out of commits.
 

@@ -21,7 +21,7 @@ from .counterfactual import (
     OutcomeRule,
     analyse_auction,
 )
-from .db import Connection
+from .db import Connection, Snapshot
 from .fees import Quote
 from .primitives import MAX_WINNERS, wrapped_native_token
 from .quotes import QuoteAnalysis, QuoteRanking, QuoteWindow
@@ -245,7 +245,7 @@ def analyse_window(
                 f"quote coverage is {', '.join(sorted(ch.NETWORK_CHAIN_IDS))}"
             )
         window.quote_window = quotes.load_quote_window(
-            ch.Client.from_env(),
+            ch.Client.from_env(conn if isinstance(conn, Snapshot) else None),
             conn,
             network,
             start,
@@ -284,8 +284,10 @@ def analyse_window(
         )
 
     with_bids: list[int] = []
+    deadlines: list[int] = []
     for bundle in extract.load_auctions(conn, auction_ids, fast_path=window.fast_path):
         with_bids.append(bundle.auction_id)
+        deadlines.append(bundle.block_deadline)
         for run in runs:
             run.analysis.add(
                 analyse_auction(
@@ -340,6 +342,7 @@ def analyse_window(
                     for r in moved_auctions(run.analysis)
                 }
             ),
+            (min(deadlines, default=0), max(deadlines, default=0)),
         )
         for run in runs:
             run.cow = convert_delta_rewards(run.analysis, rates)

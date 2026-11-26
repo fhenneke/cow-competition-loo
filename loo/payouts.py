@@ -501,7 +501,14 @@ def load_recorded(
     performance: dict[str, dict[int, Decimal]] = {}
     covered: set[int] = set()
     for chunk in chunked(window, chunk_size):
-        for row in fetch(conn, PERFORMANCE_SQL, {"first": chunk[0], "last": chunk[-1]}):
+        due = expected.intersection(chunk)
+        rows = fetch(
+            conn,
+            PERFORMANCE_SQL,
+            {"first": chunk[0], "last": chunk[-1]},
+            final=lambda rows, due=due: due <= {row["auction_id"] for row in rows},
+        )
+        for row in rows:
             auction = row["auction_id"]
             if auction not in in_window:
                 continue
@@ -512,9 +519,15 @@ def load_recorded(
 
     spans = accounting_periods(start, end)
     labels = [period_label(begin, finish) for begin, finish in spans]
+
+    def paid_out(rows: list[Row]) -> bool:
+        return set(labels) <= {row["accounting_period"] for row in rows}
+
     marts: dict[Weekly, dict[str, dict[str, Row]]] = {
-        "consistency": _by_period(fetch(conn, CONSISTENCY_MART_SQL, {"periods": labels})),
-        "quote": _by_period(fetch(conn, QUOTE_MART_SQL, {"periods": labels})),
+        "consistency": _by_period(
+            fetch(conn, CONSISTENCY_MART_SQL, {"periods": labels}, final=paid_out)
+        ),
+        "quote": _by_period(fetch(conn, QUOTE_MART_SQL, {"periods": labels}, final=paid_out)),
     }
 
     periods: list[Period] = []

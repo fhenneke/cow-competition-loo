@@ -5,9 +5,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
-from collections.abc import Generator, Iterator, Sequence
+import pickle
+import zlib
+from collections.abc import Callable, Generator, Iterator, Sequence
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, TypeVar
@@ -16,7 +20,7 @@ import psycopg2
 import psycopg2.errors
 import psycopg2.extras
 
-Connection = psycopg2.extensions.connection
+PgConnection = psycopg2.extensions.connection
 Row = dict[str, Any]
 
 
@@ -81,7 +85,7 @@ class StatementTimeoutError(RuntimeError):
     """A statement ran past `STATEMENT_TIMEOUT` and the server cancelled it."""
 
 
-def connect(network: str = "mainnet", *, connect_timeout: int = 20) -> Connection:
+def connect(network: str = "mainnet", *, connect_timeout: int = 20) -> PgConnection:
     load_env()
     url = os.environ.get("ANALYTICS_DB_URL")
     if not url:
@@ -113,7 +117,7 @@ def connect(network: str = "mainnet", *, connect_timeout: int = 20) -> Connectio
 
 
 @contextmanager
-def _named_failures(conn: Connection, sql: str) -> Generator[None, None, None]:
+def _named_failures(conn: PgConnection, sql: str) -> Generator[None, None, None]:
     """Rename the `OperationalError` psycopg2 raises for both a lost connection and a
     statement timeout."""
     try:
@@ -142,13 +146,125 @@ def _named_failures(conn: Connection, sql: str) -> Generator[None, None, None]:
         raise
 
 
-def fetch(conn: Connection, sql: str, params: Any = None) -> list[Row]:
+def _query(conn: PgConnection, sql: str, params: Any) -> list[Row]:
     with (
         _named_failures(conn, sql),
         conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur,
     ):
         cur.execute(sql, params)
         return [dict(row) for row in cur.fetchall()]
+
+
+def always(rows: list[Row]) -> bool:
+    return True
+
+
+def fetch(
+    conn: Connection,
+    sql: str,
+    params: Any = None,
+    *,
+    final: Callable[[list[Row]], bool] = always,
+) -> list[Row]:
+    """`final` says whether the rows can no longer change; a `Snapshot` keeps only those."""
+    if isinstance(conn, Snapshot):
+        snapshot = conn
+        return snapshot.rows(
+            (sql, params), lambda: _query(snapshot.connection(), sql, params), final
+        )
+    return _query(conn, sql, params)
+
+
+# --- snapshots: a past window's query results, replayed in place of the DB
+
+SETTLED_AFTER = timedelta(days=1)
+"""How long the DB takes to hold everything recorded before a moment."""
+
+
+def utcnow() -> datetime:
+    """The clock, naive UTC like the DB session. The simulation pins it."""
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+def settled(moment: str) -> bool:
+    """Whether the DB holds everything recorded before `moment` (UTC unless it says)."""
+    when = datetime.fromisoformat(moment)
+    if when.tzinfo is not None:
+        when = when.astimezone(UTC).replace(tzinfo=None)
+    return when + SETTLED_AFTER <= utcnow()
+
+
+def cache_dir() -> Path:
+    """`$LOO_CACHE_DIR`, default `~/.cache/loo`."""
+    return Path(os.environ.get("LOO_CACHE_DIR") or Path.home() / ".cache" / "loo")
+
+
+class Snapshot:
+    """One window's query results on disk, read in place of the DB.
+
+    A result is one file, named by a hash of its query text and parameters: a changed
+    query or parameter misses, is read from the DB, and is kept beside the old files. A
+    result its caller marks as not final is read again on every run and never kept. The
+    connection opens on the first miss, so a full replay never connects."""
+
+    def __init__(self, network: str, start: str, end: str) -> None:
+        self.network = network
+        self.directory = snapshot_dir(network, start, end)
+        self.replayed = 0
+        self.kept = 0
+        self.unsettled = 0
+        self._conn: PgConnection | None = None
+
+    def connection(self) -> PgConnection:
+        if self._conn is None:
+            self._conn = connect(self.network)
+        return self._conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+
+    def rows(
+        self,
+        query: Any,
+        read: Callable[[], list[Row]],
+        final: Callable[[list[Row]], bool],
+    ) -> list[Row]:
+        """`query` (text and parameters) from disk, else `read()` and keep it if final."""
+        digest = hashlib.sha256(repr(query).encode()).hexdigest()[:32]
+        path = self.directory / f"{digest}.pickle.z"
+        if path.exists():
+            self.replayed += 1
+            columns, values = pickle.loads(zlib.decompress(path.read_bytes()))
+            return [dict(zip(columns, value, strict=True)) for value in values]
+        rows = read()
+        if not final(rows):
+            self.unsettled += 1
+            return rows
+        # Column names once, not per row: a third of the size and of the load time.
+        columns = tuple(rows[0]) if rows else ()
+        values = [tuple(row[column] for column in columns) for row in rows]
+        blob = zlib.compress(pickle.dumps((columns, values), pickle.HIGHEST_PROTOCOL))
+        self.directory.mkdir(parents=True, exist_ok=True)
+        partial = path.with_suffix(f".{os.getpid()}.tmp")
+        partial.write_bytes(blob)
+        partial.replace(path)
+        self.kept += 1
+        return rows
+
+    def summary(self) -> str:
+        return (
+            f"snapshot {self.directory}: {self.replayed} queries replayed, "
+            f"{self.kept} read and kept, {self.unsettled} read but not yet final"
+        )
+
+
+def snapshot_dir(network: str, start: str, end: str) -> Path:
+    return cache_dir() / "snapshots" / network / f"{start}..{end}"
+
+
+Connection = PgConnection | Snapshot
+"""What the loaders read from: the DB, or a window's snapshot of it."""
 
 
 def as_int(value: Any) -> int:

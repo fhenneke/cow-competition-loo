@@ -437,7 +437,18 @@ def run_analyse(args: argparse.Namespace) -> int:
         )
         return 4
 
-    conn = db.connect(args.network)
+    # A past window replays its snapshot; a recent one is still filling up, so it is read
+    # live and nothing is kept.
+    conn: db.Connection
+    if db.settled(args.end):
+        conn = db.Snapshot(args.network, args.start, args.end)
+    else:
+        conn = db.connect(args.network)
+        print(
+            f"note: the window ends less than {db.SETTLED_AFTER} ago, so it is read from "
+            f"the DB and no snapshot is kept",
+            file=sys.stderr,
+        )
     try:
         # `--all-solvers` needs the DB, so this check follows the connect.
         solvers = resolve_scenarios(args, conn)
@@ -477,6 +488,8 @@ def run_analyse(args: argparse.Namespace) -> int:
             print(f"ERROR: {error}", file=sys.stderr)
             return 5
     finally:
+        if isinstance(conn, db.Snapshot):
+            print(conn.summary(), file=sys.stderr)
         conn.close()
 
     if not window.auction_ids:

@@ -16,7 +16,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from .db import Connection, Row, as_int, chunked, fetch
+from .db import Connection, Row, as_int, cache_dir, chunked, fetch, settled
 from .fees import (
     EMPTY_FEE_CONTEXT,
     FeeContext,
@@ -375,7 +375,7 @@ order by coalesce(a.solutions, 0) desc, c.name
 
 def auctions_in_window(conn: Connection, start: str, end: str) -> list[int]:
     """Auction ids with at least one bid in `[start, end)`; sparse, not contiguous."""
-    rows = fetch(conn, WINDOW_SQL, {"start": start, "end": end})
+    rows = fetch(conn, WINDOW_SQL, {"start": start, "end": end}, final=lambda _: settled(end))
     return [row["auction_id"] for row in rows]
 
 
@@ -722,35 +722,46 @@ def load_fct_rewards(
 
 
 def load_conversion_rates(
-    conn: Connection, blocks: Sequence[int]
+    conn: Connection, blocks: Sequence[int], span: tuple[int, int]
 ) -> dict[int, Decimal | None]:
-    """COW->native rate per block; `None` where the period is not snapshotted or synced."""
-    rates: dict[int, Decimal | None] = {block: None for block in blocks}
-    if not rates:
-        return rates
-    periods = [
-        (row["first_block"], row["last_block"], row["conversion_rate_cow_to_native"])
-        for row in fetch(
-            conn, CONVERSION_RATES_SQL, {"first": min(rates), "last": max(rates)}
+    """COW->native rate per block; `None` where the period is not snapshotted or synced.
+
+    The query covers `span`, the window's blocks, not just `blocks`, so that it does not
+    depend on which auctions the analysis moved."""
+    first, last = span
+
+    def rates(rows: list[Row], wanted: Sequence[int]) -> dict[int, Decimal | None]:
+        found: dict[int, Decimal | None] = dict.fromkeys(wanted)
+        for block in found:
+            for row in rows:
+                if row["first_block"] <= block <= row["last_block"]:
+                    rate = row["conversion_rate_cow_to_native"]
+                    if rate is not None:
+                        # Double precision: `str` keeps the displayed value, not the binary.
+                        found[block] = Decimal(str(rate))
+                    break
+        return found
+
+    if not blocks:
+        return {}
+    rows = fetch(
+        conn,
+        CONVERSION_RATES_SQL,
+        {"first": first, "last": last},
+        final=lambda rows: all(
+            row["conversion_rate_cow_to_native"] is not None for row in rows
         )
-    ]
-    for block in rates:
-        for first, last, rate in periods:
-            if first <= block <= last:
-                if rate is not None:
-                    # Double precision: `str` keeps the displayed value, not the binary.
-                    rates[block] = Decimal(str(rate))
-                break
-    return rates
+        and None not in rates(rows, span).values(),
+    )
+    return rates(rows, blocks)
 
 
 def usd_rates_cache(network: str) -> Path:
     """The file caching one network's USD rates, named by its reference tokens so a change
-    to them starts a new file. In `$LOO_CACHE_DIR`, default `~/.cache/loo`."""
+    to them starts a new file. In `db.cache_dir()`."""
     reference = usd_reference_tokens(network)
     key = hashlib.sha256(json.dumps(sorted(reference.items())).encode()).hexdigest()[:12]
-    root = Path(os.environ.get("LOO_CACHE_DIR") or Path.home() / ".cache" / "loo")
-    return root / f"usd-rates-{network}-{key}.json"
+    return cache_dir() / f"usd-rates-{network}-{key}.json"
 
 
 def load_usd_rates(

@@ -91,6 +91,35 @@ minutes on different days, two outcome rules about 1.4x one. Arbitration adds ~8
 per (solver, rule) per month. Measure before promising: `--limit 3000` over one day gives
 the DB's current rate.
 
+#### Snapshots: a rerun of a past window needs no DB
+
+Past auctions do not change, so `analyse` keeps every query result of a window on disk
+and a rerun of that window (after a code change, say) reads them instead of the DB:
+`$LOO_CACHE_DIR/snapshots/<network>/<start>..<end>/` (default `~/.cache/loo`), one
+compressed file per query, named by a hash of the query's SQL and parameters. A changed
+query, a different `--solver` set, `--limit` or `--quotes` therefore reads only the
+queries it does not share with earlier runs, from the DB, and adds them; a run that
+replays everything opens no connection. The last stderr line counts the queries replayed,
+read and kept, and read but not kept. Measured on mainnet, 2026-11-03..17 with every
+solver removed in turn (69,312 auctions, 29 scenarios, 2026-11-26): the first run took
+22:52 of wall time and 7:58 of CPU, the replay 7:27 of wall time and 7:24 of CPU, all of
+it the analysis itself. Its snapshot is 96 MB in 3,554 files and loads in 3.5 s.
+
+Not kept, and so read again on every run until the DB settles them: the rewards of
+auctions not yet accounted, the weekly reward marts of periods not yet paid out,
+conversion rates of unpaid periods, and the auctions of an accounting period that ended
+less than a day ago. A window that ended less than a day ago is read live and no snapshot
+is kept at all. Everything else is the DB as it was on the first run: a catalogue rename
+and the later fills of orders created in the window (the quote side) show only in a fresh
+snapshot. To take one, delete the window's directory:
+
+```bash
+rm -rf ~/.cache/loo/snapshots/mainnet/2026-11-03..2026-11-17
+```
+
+`rm -rf ~/.cache/loo/snapshots` clears every window; the USD rates beside it are not
+snapshots and stay.
+
 #### Long runs go under `caffeinate -i`
 
 The server drops a client silent for about six minutes, so a Mac that sleeps loses the

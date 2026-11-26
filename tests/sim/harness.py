@@ -1,8 +1,9 @@
 """Wiring: point `loo` at a simulated world and run it the way `loo` runs.
 
-Only the two process boundaries are replaced — `loo.db.connect` hands out a simulated
-connection and `urllib.request.urlopen` reaches a simulated ClickHouse — so everything
-between them, `loo.db.fetch` and `loo.ch.Client.fetch` included, is the real code.
+Only the process boundaries are replaced — `loo.db.connect` hands out a simulated
+connection, `urllib.request.urlopen` reaches a simulated ClickHouse and `loo.db.utcnow`
+reads a pinned clock — so everything between them, `loo.db.fetch`, `loo.ch.Client.fetch`
+and the snapshots included, is the real code.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import tempfile
 import urllib.request
 from collections.abc import Generator
 from dataclasses import dataclass
+from datetime import datetime
 
 import pytest
 
@@ -54,6 +56,10 @@ class Sim:
                 "--end", self.world.end]
 
 
+SETTLED = datetime(2027, 1, 1)
+"""A clock long after every simulated window and its accounting periods."""
+
+
 @contextlib.contextmanager
 def simulate(
     world: World,
@@ -61,6 +67,7 @@ def simulate(
     *,
     shuffle_seed: int | None = None,
     clickhouse: SimClickHouse | None = None,
+    now: datetime = SETTLED,
 ) -> Generator[Sim]:
     server = SimServer(world, faults or Faults(),
                        shuffle_seed=world.seed if shuffle_seed is None else shuffle_seed)
@@ -72,8 +79,10 @@ def simulate(
         return sim.conn()
 
     with pytest.MonkeyPatch.context() as patch, tempfile.TemporaryDirectory() as cache:
-        # A cache of its own: the simulated rates must neither read nor fill the real one.
+        # A cache of its own: simulated rates and snapshots must neither read nor fill
+        # the real ones.
         patch.setenv("LOO_CACHE_DIR", cache)
+        patch.setattr(db, "utcnow", lambda: now)
         patch.setattr(db, "connect", connect)
         patch.setattr(urllib.request, "urlopen", house.urlopen)
         patch.setenv("CLICKHOUSE_URL", ' "http://sim.clickhouse:8123" ')
