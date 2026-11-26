@@ -22,6 +22,7 @@ DEFAULT_SEEDS = 120
 PINNED: dict[int, str] = {
     1: "an auction with an unpriced fee carried a partial fee delta into the USD fee cells",
     80: "a replaced quote's limit shift would move the counterfactual winners",
+    100: "a token both feeds overprice, sold for a sub-wei side the floor read as unpriced",
     107: "a replaced quote's limit shift would move the counterfactual winners",
     138: "a streamed order whose replacement depends on when its user committed",
     271: "our baseline differs from the recorded winners: a guessed filter verdict",

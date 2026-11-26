@@ -283,9 +283,26 @@ other catches:
   (`traded_sell_prices`); the window median only for an untraded order, which weighs
   nothing. Catches a broken api price (bnb order `49e8f493…`, 2.95e11 BNB).
 - **Two-sided** (`imbalanced_orders`): sold against bought value, trade by trade, at the
-  prices of the auction each trade settled in — `price_imbalanced` per order. Catches a
-  token both feeds price wrong by the same factor: on bnb 2026-10-05..12, 26 such orders
-  carried 28.68 M of 28.70 M BNB of executed volume and pushed every `window_bps` to zero.
+  prices of the auction each trade settled in — `price_imbalanced` per order, but exact.
+  Catches a token both feeds price wrong by the same factor: on bnb 2026-10-05..12, 26
+  such orders carried 28.68 M of 28.70 M BNB of executed volume and pushed every
+  `window_bps` to zero.
+
+**A side worth under one wei is not unpriced.** The two-sided check compares the exact
+1e18-scaled products `price × amount`; floored to whole wei, as `price_in_eth` does, a
+sub-wei side reads as zero, and a zero side is skipped as if unpriced. bnb order
+`c0ae1e94…` (Trust Wallet, 2026-10-30) passed both checks that way: it sold 1.22e28 atoms
+of `044f7ac6…` for 64 USDT atoms. Both feeds priced the token at 1.01e-4 BNB per atom,
+so the one-sided check saw agreement, and the 64 USDT atoms are worth 0.09 wei, so the
+floored two-sided check saw nothing. Its 1,236,312 BNB were 94% of the executed volume of
+bnb 2026-10-29..11-26 and made every bnb `window_bps` about 17 times too small. Valued
+exactly, it is 1.3e25x imbalanced; on bnb 2026-10-30 it was the only order the change
+added, and none dropped out. Only a side with no price or a zero amount is left
+unjudged, so an untraded order and an order of an unpriced token still pass. A trade too
+small for its atoms to express its rate within 2x is now judged and can fail; it weighs
+nothing either way. The solve side's `counterfactual.price_suspects` still floors and
+passed the same order (auction 26814584)
+([analytics-db](analytics-db.md#native-prices-can-be-plain-wrong)).
 
 Each trade's auction is the first settlement after it in its block (the rule of
 `int_backend_data__trade_with_tx_hash`); the native token is priced as its wrapped ERC20.
@@ -405,3 +422,5 @@ for 78.3% and 1.0000 at every quantile p10–p99 (2026-07-25).
     winner. Count those before reading a coverage drop as a rule change.
 14. **A per-request median gap is meaningless across estimators.** Quote figures are
     volume-weighted over linked orders.
+15. **Never floor a value a guard compares.** A side worth under one wei floors to zero,
+    and a zero side looks unpriced. Compare exact products.

@@ -73,11 +73,12 @@ def expected_suspects(world: World, auction_ids: list[int]) -> tuple[set[str], s
             ratio = (reference / 1e18) / api
             if ratio > THRESHOLD or ratio < 1 / THRESHOLD:
                 one.add(uid)
+        # Exact, 1e18-scaled: a side worth under one wei is still worth something.
         sold_value = bought_value = 0
         for a, sold, bought in trades.get(uid, []):
             if sell in prices[a] and buy in prices[a]:
-                sold_value += prices[a][sell] * sold // oracle.ONE
-                bought_value += prices[a][buy] * bought // oracle.ONE
+                sold_value += prices[a][sell] * sold
+                bought_value += prices[a][buy] * bought
         if sold_value and bought_value and (
             sold_value > THRESHOLD * bought_value or bought_value > THRESHOLD * sold_value
         ):
@@ -147,8 +148,12 @@ def check_window(sim: Sim, world: World, auction_ids: list[int]) -> QuoteWindow:
     one, two = expected_suspects(world, auction_ids)
     assert window.price_suspects == frozenset(one | two)
     assert (window.one_sided_suspects, window.two_sided_suspects) == (len(one), len(two))
-    clean = [u for u in created if u not in one | two]
     trades = landed_trades(world)
+    # From the world's truth, not a recomputation that can share `loo`'s arithmetic: an
+    # order of a token both feeds overprice is a suspect wherever it traded.
+    misfed = {u for u in created if world.orders[u].sell_token in world.misfed and u in trades}
+    assert misfed <= window.price_suspects
+    clean = [u for u in created if u not in one | two]
     volume = sum(round(sum(t[1] for t in trades.get(u, [])) *
                        world.orders[u].quote.sell_token_price)  # type: ignore[union-attr]
                  for u in clean)

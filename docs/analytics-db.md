@@ -160,6 +160,10 @@ window's five largest winning scores were all that token.
   2026-09-22/23 produced 1e8-BNB deltas that way), and any error under 2x. Scan a run's
   valued volume for absurd figures before quoting it. The quote side has the same hole
   ([quotes](quotes.md#two-price-checks-both-at-the-orders-own-auctions)).
+- **It also misses a fill one side of which is worth under one wei.** It values in whole
+  wei, a sub-wei side floors to zero, and a zero side is skipped as unpriced. bnb auction
+  26814584 passed with a token both feeds overprice sold for 64 USDT atoms (0.09 wei).
+  The quote side's check values exactly; this one is open.
 
 ### The accounting path corrects these prices; the scoring path must not
 

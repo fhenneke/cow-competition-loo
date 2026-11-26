@@ -10,7 +10,8 @@ bids that trade at exactly the limit, single- and multi-pair bids, pairs whose f
 unrecorded, the native-token sentinel next to its wrapped token, `max_winners`
 saturation, dust amounts at the ceil-division boundary, partner fees declared beyond the
 policy list, late and reverted settlements, missing penalty caps, streamed and re-quoted
-quote competitions, price-suspect tokens and fast-path auctions.
+quote competitions, price-suspect tokens, a token both feeds overprice and fast-path
+auctions.
 """
 
 from __future__ import annotations
@@ -279,6 +280,9 @@ class World:
     """order uid -> how the quote link should place it ('id', 'stream', 'requote') or
     why it should not (the unlinked reasons)."""
     quote_suspects: set[str] = field(default_factory=set[str])
+    misfed: dict[str, int] = field(default_factory=dict[str, int])
+    """token -> the factor by which both price feeds, the auctions' and the quote api's,
+    overstate its true price: a wrong price the two agree on."""
     shadows: list[Shadow] = field(default_factory=list[Shadow])
     relative: dict[int, list[tuple[str, str, float]]] = field(
         default_factory=dict[int, list[tuple[str, str, float]]])
@@ -333,6 +337,10 @@ class World:
     @property
     def chain_id(self) -> int | None:
         return CHAIN_IDS.get(self.network)
+
+    def fed(self, token: str) -> int:
+        """The token's price as both feeds have it (`tokens` scaling)."""
+        return self.tokens[token] * self.misfed.get(token, 1)
 
     def solver_of(self, address: str) -> Solver:
         return next(s for s in self.solvers if address in s.addresses)
@@ -423,6 +431,11 @@ def generate(seed: int, knobs: Knobs | None = None) -> World:
         _add_order(rng, world, k, start, end, quote_ids, nats)
     while len(world.orders) < 2:
         _add_order(rng, world, k, start, end, quote_ids, nats)
+    # Its own stream, so a world without one is the world it was before; every pinned
+    # seed is one of those. Solana has no quotes to check.
+    misfed = random.Random(seed * 6_007 + 15)
+    if not world.solana and misfed.random() < MISFED_SHARE:
+        _add_misfed_order(misfed, world, k, start, end, quote_ids, nats)
     if world.chain_id is not None and rng.random() < 0.5:
         _add_unwrap(rng, world, start)
     _add_auctions(rng, world, k, start, end)
@@ -527,24 +540,31 @@ def _add_order(
     end: datetime,
     quote_ids: Iterator[int],
     nats: Iterator[int],
+    misfed: tuple[str, str, int] | None = None,
 ) -> None:
-    tokens = list(world.tokens)
-    native = world.native
-    sell_token, buy_token = rng.sample([t for t in tokens if t != native], 2)
-    if rng.random() < k.native_buy:
-        buy_token = native
-        if sell_token == world.weth:
-            sell_token = rng.choice([t for t in tokens if t not in (native, world.weth)])
-    kind = "sell" if rng.random() < 0.7 else "buy"
+    """`misfed` forces a sell order: (sell token, buy token, sell amount)."""
+    if misfed is None:
+        tokens = list(world.tokens)
+        native = world.native
+        sell_token, buy_token = rng.sample([t for t in tokens if t != native], 2)
+        if rng.random() < k.native_buy:
+            buy_token = native
+            if sell_token == world.weth:
+                sell_token = rng.choice([t for t in tokens if t not in (native, world.weth)])
+        kind = "sell" if rng.random() < 0.7 else "buy"
+    else:
+        sell_token, buy_token, _ = misfed
+        kind = "sell"
     market = Fraction(world.tokens[sell_token], world.tokens[buy_token])
     created = start + timedelta(seconds=rng.randint(60, int((end - start).total_seconds()) - 60))
     if rng.random() < 0.1:
         created = start - timedelta(minutes=rng.randint(1, 20))  # before the quote window
     uid = _hex(rng, 32 if world.solana else 56)
-    in_amount = _amount(rng, k, world.tokens[sell_token if kind == "sell" else buy_token],
-                        world.unit)
+    in_amount = (_amount(rng, k, world.tokens[sell_token if kind == "sell" else buy_token],
+                         world.unit)
+                 if misfed is None else misfed[2])
     gas_price = float(rng.randint(1, 60) * 10**9)
-    sell_token_price = world.tokens[sell_token] / 1e18
+    sell_token_price = world.fed(sell_token) / 1e18
     if rng.random() < 0.05:
         world.quote_suspects.add(uid)
         sell_token_price *= 10_000.0
@@ -650,6 +670,37 @@ def _add_order(
     if how == "requote":
         world.requests.append(_requote(rng, world, order, next_id, next_seq))
     world.requests.append(request)
+
+
+MISFED_SHARE = 0.25
+
+
+def _add_misfed_order(
+    rng: random.Random,
+    world: World,
+    k: Knobs,
+    start: datetime,
+    end: datetime,
+    quote_ids: Iterator[int],
+    nats: Iterator[int],
+) -> None:
+    """A sell order of a token both feeds price far above its worth, sized so that what
+    it buys is worth under one wei at the auction's prices (bnb order `c0ae1e94…`: 1.24 M
+    BNB-worth of a token for 64 USDT atoms, 0.09 wei). Floored to whole wei, that side
+    reads as worth nothing, which is what an unpriced side looks like."""
+    buy_token = min((t for t in world.tokens if t != world.native),
+                    key=world.tokens.__getitem__)
+    bought = rng.randint(16, 4096)  # buy atoms at the true rate
+    if bought * world.tokens[buy_token] >= ONE:
+        return  # no token here is cheap enough per atom for a sub-wei side
+    token = _hex(rng, 20)
+    true_price = rng.randint(1, 9)
+    in_amount = bought * world.tokens[buy_token] // true_price
+    worth = 10 ** rng.randint(19, 24)  # in wei, as the feeds have it
+    world.tokens[token] = true_price
+    world.misfed[token] = worth * ONE // (in_amount * true_price)
+    _add_order(rng, world, k, start, end, quote_ids, nats,
+               misfed=(token, buy_token, in_amount))
 
 
 def _address_of(world: World, answer: Answer) -> str:
@@ -804,8 +855,8 @@ def _add_auctions(rng: random.Random, world: World, k: Knobs, start: datetime,
             world.extra_window_ids.append(auction_id)
             auction_id += rng.randint(1, 5)
         prices = {
-            token: max(1, price * rng.randint(990, 1010) // 1000)
-            for token, price in world.tokens.items()
+            token: max(1, world.fed(token) * rng.randint(990, 1010) // 1000)
+            for token in world.tokens
         }
         members = rng.sample(order_uids, min(len(order_uids), rng.randint(1, 6)))
         auction = Auction(auction_id, block, when, prices, members, solana=world.solana)

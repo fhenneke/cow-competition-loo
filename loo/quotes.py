@@ -29,7 +29,7 @@ from . import ch
 from .db import Connection, as_int, chunked, fetch, prefetch
 from .extract import price_query
 from .fees import FeeError, Quote, quote_fee
-from .primitives import ONE_ETH, canonical_token, price_in_eth, wrapped_native_token
+from .primitives import ONE_ETH, canonical_token, wrapped_native_token
 
 if TYPE_CHECKING:  # only `shifted_limit` needs the type; `valuation` imports `fees` too
     from .valuation import Order
@@ -1260,8 +1260,12 @@ def imbalanced_orders(
     weth: str,
 ) -> frozenset[str]:
     """Orders whose executed sell and buy values disagree past the threshold, each trade
-    at its own auction's prices (`counterfactual.price_imbalanced`, per order). Blind to
-    a pair mispriced by the same factor."""
+    at its own auction's prices. Blind to a pair mispriced by the same factor.
+
+    Values are exact and 1e18-scaled, not floored to wei as `primitives.price_in_eth`
+    floors them: a side worth under one wei would floor to zero and pass as unpriced. bnb
+    order `c0ae1e94…` sold 1.24 M BNB-worth of a token both feeds overprice for 64 USDT
+    atoms, 0.09 wei."""
     tokens = {
         o.order_uid: (_priced_token(o.sell_token, weth), _priced_token(o.buy_token, weth))
         for o in orders
@@ -1276,8 +1280,8 @@ def imbalanced_orders(
         if sell_price is None or buy_price is None:
             continue
         value = values.setdefault(trade.order_uid, [0, 0])
-        value[0] += price_in_eth(sell_price, trade.sell_amount)
-        value[1] += price_in_eth(buy_price, trade.buy_amount)
+        value[0] += sell_price * trade.sell_amount
+        value[1] += buy_price * trade.buy_amount
     return frozenset(
         uid
         for uid, (sold, bought) in values.items()
