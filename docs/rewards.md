@@ -64,7 +64,7 @@ penalty_cap_native(solution) = Σ over its user orders of the order's CIP-87 cap
 ### Since 2026-09-08 the lower cap is per order (CIP-87)
 
 The backend records a per-order penalty cap in `competition_auctions.penalty_caps_native`,
-parallel to `order_uids` (services#4785): a fraction of the order's volume, bounded by an
+parallel to `order_uids`: a fraction of the order's volume, bounded by an
 absolute USD amount, smaller for correlated-token pairs (deployment config). On mainnet
 the arrays start at auction 13,763,364 (2026-09-08 08:46 UTC) and none is NULL after it.
 
@@ -73,8 +73,8 @@ the arrays start at auction 13,763,364 (2026-09-08 08:46 UTC) and none is NULL a
   (or 0 in a no-penalties window). Always go through `rewards.lower_reward_cap`, fed by
   `penalty_cap_native` per winning solution (`extract.REWARD_INPUTS_SQL`).
 - **NULL and 0 differ**: NULL means no cap and sends the solver to the flat floor; 0 is a
-  real cap that waives the penalty (fast-path auctions are written with 0). Separated in
-  cow-dagster#1058 (2026-10-16).
+  real cap that waives the penalty (fast-path auctions are written with 0). The marts have
+  kept them apart since 2026-10-16.
 - The test is **per solver**: one of its solutions without a cap sends that solver, not
   the auction, to the flat floor.
 - The mart's `lower_reward_cap` is NULL on rows built before the column existed, so
@@ -161,7 +161,7 @@ scenario):
 | quote (CIP-88) | `fct_quote_rewards_per_solver_and_accounting_period.quote_reward_native` | pro rata, below |
 
 Both weekly rewards are linear in a per-auction metric, with every other factor fixed per
-period (cow-dagster `02cb3ec`, 2026-11-24):
+period (the dbt models as of 2026-11-24):
 
 ```
 consistency(p, s) = budget(p) × T(p, s)·success(p, s) / Σ_s' T(p, s')·success(p, s')
@@ -187,8 +187,8 @@ at the auction's own USD rate.
   reward rows or 382,748 (auction, solver) relative-surplus groups in its id range
   belonged to another week.
 - Both sums come from the int table, so the split stays defined when an int table is
-  rebuilt after its mart (cow-dagster#1364 excluded a wallet from quote rewards for the
-  2026-11-17..24 payout). The int table's full-period sum is still reconciled with the
+  rebuilt after its mart (for the 2026-11-17..24 payout one was rebuilt to exclude a
+  wallet from quote rewards). The int table's full-period sum is still reconciled with the
   mart's own total — Σ relative surplus against `total_relative_surplus`, budget × Σ share
   / N against `quote_reward_native` — at a relative 1e-9, and a disagreement is listed in
   the report and warned about in `compare`.

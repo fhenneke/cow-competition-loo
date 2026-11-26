@@ -1,7 +1,7 @@
 """The quote competition: reproduce the pick, re-run it without a solver, and hand the
 counterfactual quote to the fee path (`fees.py`).
 
-The pick, `services/crates/price-estimation/src/competition/quote.rs` (services#4846):
+The pick, `services/crates/price-estimation/src/competition/quote.rs` (since 2026-09-02):
 
 ```
 is_reasonable          drop any estimate with gas == 0 or out_amount == 0
@@ -40,11 +40,11 @@ RANKING: dict[QuoteRanking, str] = {
     "effective-sell": (
         "the effective quote netted in the sell token, at the order's recorded "
         "gas_price / sell_token_price, truncated to whole atoms — the protocol's own rule "
-        "since services#4846 (merged 2026-09-02), the same quantity the price-improvement "
+        "since 2026-09-02, the same quantity the price-improvement "
         "fee is charged against, and reproducible from the record alone"
     ),
     "autopilot": (
-        "the protocol's rule before services#4846: out_amount valued in wei at the out "
+        "the protocol's rule before 2026-09-02: out_amount valued in wei at the out "
         "token's native price less gas x gas_price, with the buy token's native price "
         "taken from the window's auction prices for sell orders"
     ),
@@ -144,14 +144,14 @@ def rank_key(
     including the zero clamp and the truncation (`U256::saturating_from(v.trunc())`):
     both create ties that arrival order decides."""
     if ranking == "effective-sell":
-        # `RankingContext::effective_out_amount` (services#4846).
+        # `RankingContext::effective_out_amount`.
         cost = pricing.gas_cost_in_sell_atoms(estimate.gas)
         if is_sell:
             value = estimate.out_amount - cost * (estimate.out_amount / in_amount)
             return float(math.trunc(value)) if value > 0 else 0.0
         return -float(math.trunc(estimate.out_amount + cost))
     if ranking == "autopilot":
-        # `effective_eth_out` before services#4846, truncated in wei.
+        # `effective_eth_out` before 2026-09-02, truncated in wei.
         price = pricing.sell_token_price if not is_sell else pricing.buy_token_price
         if not price:
             raise UnpricedRequestError(
@@ -529,7 +529,7 @@ class MatchedQuote:
 
 @dataclass(frozen=True)
 class StreamTake:
-    """Which forwarded answer of a streamed competition (services#4957) an order took.
+    """Which forwarded answer of a streamed competition an order took.
     The commit is unrecorded, so it is placed as late as the record allows (`horizon`)
     ([docs](../docs/quotes.md#streamed-quotes-the-order-takes-what-the-stream-showed-not-the-winner)).
     """
@@ -634,7 +634,7 @@ def link_by_quote_id(
                 f"where chain_id = {chain} and {window} and request_id in ({linked})"
             ):
                 winners.setdefault(row["request_id"], set()).add(row["estimator"])
-            # One `quote_computed` row per forwarded answer (services#4957).
+            # One `quote_computed` row per forwarded answer.
             for row in client.fetch(
                 f"select request_id, quote_id, nats_seq from "
                 f"{ch.RAW_DATABASE}.quote_computed "

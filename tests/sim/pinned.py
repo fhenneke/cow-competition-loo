@@ -177,10 +177,9 @@ def blocked_batch() -> World:
 
 
 def penalty_caps() -> World:
-    """cow-dagster#1058: two winners that both reverted. One's penalty cap is 0 — a real
+    """Two winners that both reverted. One's penalty cap is 0 — a real
     cap, flooring its reward at 0 — the other's is missing, so it falls back to the flat
-    floor. A zero-score bid that trades at exactly its limit is kept, and wins its pair
-    (services#4753)."""
+    floor. A zero-score bid that trades at exactly its limit is kept, and wins its pair."""
     world = blank()
     weth = WRAPPED["sepolia"]
     o1 = order(world, "51" * 56, weth, USDC, 10**9, 10**9)

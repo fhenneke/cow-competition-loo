@@ -136,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "how the quote competition is re-run: on the effective quote netted in the "
             "sell token at the order's own recorded prices (default; the protocol's own "
-            "rule since services#4846, needs nothing that is not recorded), or on the "
+            "rule since 2026-09-02, needs nothing that is not recorded), or on the "
             "out-token rule from before it, which needs the buy token's native price "
             "and is the cross-check"
         ),

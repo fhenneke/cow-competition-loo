@@ -34,7 +34,8 @@ CHUNK_SIZE = 200
 
 
 MECHANISM_START = "2026-10-28"
-"""First day replayed faithfully: services#4902 (JIT orders claim no token pairs)."""
+"""First day replayed faithfully: JIT orders claim no token pairs since v2.385.0, live
+2026-10-27."""
 
 
 class UnsupportedWindowError(Exception):
@@ -45,7 +46,7 @@ def require_current_mechanism(start: str) -> None:
     if start[:10] < MECHANISM_START:
         raise UnsupportedWindowError(
             f"the window starts {start}, before {MECHANISM_START}: this code replays "
-            f"only the current mechanism (JIT orders ignored, services#4902) and reads "
+            f"only the current mechanism (JIT orders ignored) and reads "
             f"prices only from the competition_auctions arrays"
         )
 
@@ -108,7 +109,7 @@ class Bid:
     is_winner: bool
     filtered_out: bool
     orders: tuple[Order, ...]
-    """Auction orders only; JIT orders are inert (services#4902)."""
+    """Auction orders only; JIT orders are inert."""
 
 
 @dataclass(frozen=True)
@@ -140,7 +141,7 @@ where auction_id = any(%(ids)s)
 order by auction_id, uid
 """
 
-# Auction orders only; JIT orders are inert (services#4902). Exact only while
+# Auction orders only; JIT orders are inert. Exact only while
 # `surplus_capturing_jit_order_owners` is empty, which is not read.
 EXECUTIONS_SQL = """
 select

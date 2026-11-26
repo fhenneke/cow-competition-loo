@@ -39,7 +39,7 @@ class Solution:
     order_uids: frozenset[str] = frozenset()
 
     winner_pairs: frozenset[Pair] = frozenset()
-    """`pair_values` pairs, `as_erc20`-normalised. JIT orders claim none (services#4902)."""
+    """`pair_values` pairs, `as_erc20`-normalised. JIT orders claim none."""
 
 
 FilterScale = Literal["score", "surplus"]
@@ -67,7 +67,7 @@ class Ranking:
 
     @property
     def tested(self) -> tuple[Solution, ...]:
-        """Kept plus filtered; excludes solutions with no auction order (services#4753)."""
+        """Kept plus filtered; excludes solutions with no auction order."""
         return self.ranked + self.filtered_out
 
     @property

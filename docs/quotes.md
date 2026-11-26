@@ -64,8 +64,8 @@ not mean unquoted. `loo` therefore reads the raw layer only.
 
 ## How the winner is picked
 
-`services/crates/price-estimation/src/competition/quote.rs`, since **services#4846**
-(merged 2026-09-02); prod's `optimal` estimator is built with
+`services/crates/price-estimation/src/competition/quote.rs`, the rule merged on
+**2026-09-02**; prod's `optimal` estimator is built with
 `PriceRanking::BestBangForBuck`:
 
 ```
@@ -104,10 +104,10 @@ What the ladder records, and what it does not (verified against the Rust on 2026
 `loo.quotes.RANKING`:
 
 - **`effective-sell`** (default) nets gas in the sell token at the order's own recorded
-  `gas_price / sell_token_price` — prod's rule since #4846, from nothing but
+  `gas_price / sell_token_price` — prod's rule since 2026-09-02, from nothing but
   `order_quotes`, and the same quantity the price-improvement fee is charged against, so
   the pick and the fee cannot disagree.
-- **`autopilot`** is the out-token rule from before #4846 (`out × native(out) ∓ gas ×
+- **`autopilot`** is the out-token rule from before 2026-09-02 (`out × native(out) ∓ gas ×
   gas_price`); it needs the buy token's native price (the window's per-token median of
   auction prices) and serves as the cross-check. The two agree to first order and differ
   only through the quote's own pricing error.
@@ -126,8 +126,8 @@ Two backend changes make the link a join:
   `raw_prod_<chain>.order_quotes` from 2026-09-22. **The staging copy
   (`dbt.stg_backend_data__order_quotes.quote_id`) is NULL on rows built before
   ~2026-10-06** (incremental model, column appended): read the raw mirror.
-- **Every estimate carries its own id and solver** (services#4925 draws one id per
-  estimator before quoting; #4966 publishes it with the estimator's settlement address).
+- **Every estimate carries its own id and solver** (one id is drawn per
+  estimator before quoting and published with the estimator's settlement address).
   Ids appear on every chain at the same deploy, **2026-09-29 17:16 UTC**.
 
 **A quote id names one solver's answer, not a competition.** The competition is the
@@ -172,7 +172,7 @@ do not reintroduce it.
 ### Streamed quotes: the order takes what the stream showed, not the winner
 
 `/api/v1/quote/stream` runs the same competition but forwards each answer that beats the
-best sent so far. Since services#4957 (2026-09-23) each forwarded answer is persisted as a
+best sent so far. Since 2026-09-23 each forwarded answer is persisted as a
 `quote_computed` row and the final best is recorded as the winner; the user commits to
 whatever was on screen, and the order carries that answer's id. On bnb 2026-10-05..12,
 44% of orders came through a stream (nearly all Trust Wallet); 308 took an answer before
@@ -357,7 +357,7 @@ for 78.3% and 1.0000 at every quantile p10–p99 (2026-07-25).
 ## Out of scope, and named as such
 
 - **Quote rewards.** The counterfactual quote's eligibility is not evaluated. Since
-  2026-10-12 (CIP-88, cow-dagster#1110) they are a budget share of protocol revenue split
+  2026-10-12 (CIP-88) they are a budget share of protocol revenue split
   by `int_quote_data__quote_reward_shares`; nothing here is checked against those models.
   The quote rewards recorded as paid to the removed solver are reported by `analyse`
   ([rewards](rewards.md#rewards-paid-to-a-solver-recorded)).

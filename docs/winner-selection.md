@@ -13,7 +13,7 @@ with `git ls-remote origin main` before trusting it.
 | baselines | `compute_baseline_scores` |
 | per-token-pair scoring | `score_by_token_pair` |
 | per-order score (CIP-38) | `compute_order_score` |
-| protocol fees | `protocol_fees` (moved to `crates/protocol-fees` by services#5223, formula for formula) |
+| protocol fees | `protocol_fees` (moved to `crates/protocol-fees`, formula for formula) |
 | surplus | `surplus_over_limit_price`, `surplus_over` |
 | clearing prices | `calculate_custom_prices_from_executed` |
 | winner picking | `pick_winners` |
@@ -23,8 +23,8 @@ with `git ls-remote origin main` before trusting it.
 | config defaults | `crates/configs/src/autopilot/run_loop.rs` |
 
 Parameters: `max_winners = 20`, `max_solutions_per_solver = 3`. Line numbers quoted in
-`loo/` docstrings are from the August 2026 revision; the file was reorganised since
-(services#4929), so search by name.
+`loo/` docstrings are from the August 2026 revision; the file was reorganised since,
+so search by name.
 
 ### `loo` replays the current mechanism only
 
@@ -32,10 +32,10 @@ Parameters: `max_winners = 20`, `max_solutions_per_solver = 3`. Line numbers quo
 refuses an earlier window (exit 4); it is run at most a month back, so older rules are not
 kept beside the current ones. Two changes separate today's rules from older ones:
 
-| Change | Rule now |
+| Since | Rule now |
 | --- | --- |
-| services#4753 (v2.376.0, Aug 2026) | a solution is kept iff it trades at least one auction order; a **zero score no longer drops it** |
-| services#4902 (v2.385.0, live 2026-10-27) | **JIT orders claim no token pair** in `pick_winners`; from then on two winners can share a directed pair (2–10 mainnet auctions a day) |
+| v2.376.0, Aug 2026 | a solution is kept iff it trades at least one auction order; a **zero score no longer drops it** |
+| v2.385.0, live 2026-10-27 | **JIT orders claim no token pair** in `pick_winners`; from then on two winners can share a directed pair (2–10 mainnet auctions a day) |
 
 `loo validate`, measured 2026-11-23: winner sets, filtered-out sets and reference scores
 match the record in every auction, with no valuation failure.

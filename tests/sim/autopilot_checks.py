@@ -1,4 +1,4 @@
-"""The quote side under its cross-check ranking, the rule from before services#4846."""
+"""The quote side under its cross-check ranking, the rule from before 2026-09-02."""
 
 from __future__ import annotations
 
