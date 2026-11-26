@@ -103,7 +103,7 @@ function cells(d, isAgg) {
 }
 
 /* ---- state ------------------------------------------------------------- */
-const state = { chain: null, open: new Set() };
+const state = { chain: null, open: new Set(), openPaid: new Set(), openQuote: new Set() };
 const single = DATA.chains.length === 1;
 
 function scoped(solver) {
@@ -169,128 +169,230 @@ document.getElementById("rows").addEventListener("click", e => {
 
 document.querySelectorAll(".pill").forEach(p => p.addEventListener("click", () => {
   state.chain = p.dataset.chain || null;
-  state.open.clear();
+  for (const set of [state.open, state.openPaid, state.openQuote]) set.clear();
   document.querySelectorAll(".pill").forEach(q =>
     q.setAttribute("aria-pressed", String(q === p)));
   render();
 }));
 
-render();
+
+/* ---- nested tables: one row per solver, opening to its chains ----------
+   The reward and quote tables follow the solver table: removing a solver from each chain
+   is an independent scenario, so its chains add up; different solvers' rows never do.
+   With one chain in scope a solver's row is that chain's row, rendered flat. */
+const dashCell = why => `<span class="na" title="${why}">—</span>`;
+const NOT_SUMMABLE = "not summable across chains";
+
+function renderNested(bodyId, open, entries, cellsFor) {
+  const body = document.getElementById(bodyId);
+  if (!body) return;
+  const out = [];
+  for (const { s, ids, agg } of entries) {
+    const flat = ids.length === 1;
+    const d = flat ? s.chains[ids[0]] : agg;
+    const c = cellsFor(d, !flat);
+    const isOpen = open.has(s.name);
+    const shown = label(s.name);
+    const control = flat
+      ? (!state.chain && !single ? `${shown} <span class="chip">${ids[0]}</span>` : shown)
+      : `<button class="disclose" aria-expanded="${isOpen}" data-solver="${s.name}">
+           <span class="tri" aria-hidden="true">${isOpen ? "▾" : "▸"}</span>${shown}
+           <span class="chip">${ids.length} chains</span></button>`;
+    out.push(`<tr class="main"><td class="chain" rowspan="2">${control}</td>${c.main.join("")}</tr>`);
+    out.push(`<tr class="detail">${c.detail.join("")}</tr>`);
+    if (isOpen && !flat) {
+      for (const id of ids) {
+        const cd = cellsFor(s.chains[id], false);
+        out.push(`<tr class="main sub"><td class="chain sub" rowspan="2">
+          <span class="chip">${id}</span></td>${cd.main.join("")}</tr>`);
+        out.push(`<tr class="detail sub">${cd.detail.join("")}</tr>`);
+      }
+    }
+  }
+  body.innerHTML = out.join("\n");
+}
+
+function nestedEntries(keep, aggregateRows, sortKey) {
+  return DATA.solvers
+    .map(s => ({
+      s,
+      ids: DATA.chains.map(c => c.id)
+        .filter(id => (!state.chain || id === state.chain) && s.chains[id] && keep(s.chains[id])),
+    }))
+    .filter(e => e.ids.length)
+    .map(e => ({ ...e, agg: aggregateRows(e.ids.map(id => e.s.chains[id])) }))
+    .sort((a, b) => sortKey(b.agg) - sortKey(a.agg));
+}
 
 /* ---- the quote competition ---------------------------------------------
    Its own table, not columns in the focus band: the quote side answers three
    questions and the third of them — what it costs — is already in the Δfee column
    above, because the price-improvement fee is charged against the quote. */
-function renderQuotes() {
-  const body = document.getElementById("qrows");
-  if (!body) return;
-  // One row per solver-chain in scope: quote figures are per chain (a quote
-  // competition is per network) and are never summed across chains, so a chain
-  // filter narrows the rows and a multi-chain page shows the chain beside the name.
-  const inScope = DATA.chains.filter(c => !state.chain || c.id === state.chain);
-  const rows = [];
-  for (const s of DATA.solvers) {
-    for (const c of inScope) {
-      const chain = s.chains[c.id];
-      if (chain && chain.quote && chain.quote.wins > 0) {
-        rows.push({ name: s.name, chain: c.id, q: chain.quote });
-      }
-    }
-  }
-  rows.sort((a, b) => b.q.wins - a.q.wins);
-  const out = [];
-  for (const { name, chain, q } of rows) {
-    const warn = concentrated(q.largest_share) ? " ⚠" : "";
-    const shown = inScope.length > 1
-      ? `${label(name)} <span class="chip">${chain}</span>` : label(name);
-    out.push(`<tr class="main"><td class="chain" rowspan="2">${shown}</td>` +
-      `<td class="${neg(q.window_bps || 0)}">${fmtBps(q.window_bps)}</td>` +
-      `<td class="${neg(q.median_bps || 0)}">${fmtBps(q.median_bps, 2)}</td>` +
-      `<td>${q.no_quote.toLocaleString("en-US")}</td>` +
-      `<td class="sec">${q.largest_share === null ? "n/a"
-        : pct(q.largest_share, 0) + warn}</td>` +
-      `<td class="${neg(q.fee_recharge_protocol_usd)}">${fmtUsd(q.fee_recharge_protocol_usd)}</td></tr>`);
-    out.push(`<tr class="detail">` +
-      `<td>${fmtBps(q.conditional_bps, 2)} on the ${
-        q.degraded.toLocaleString("en-US")} that moved</td>` +
+const quoteUsdVolume = q => q.window_volume * q.usd_per_native;
+
+function aggregateQuotes(quotes) {
+  const sum = k => quotes.reduce((a, q) => a + (q[k] || 0), 0);
+  const delta = sum("delta_usd");
+  const volume = quotes.reduce((a, q) => a + quoteUsdVolume(q), 0);
+  const fee = sum("fee_recharge_usd");
+  // The largest single order's |Δ| is its share of its own chain's total.
+  const biggest = Math.max(0, ...quotes.map(q => (q.largest_share || 0) * Math.abs(q.delta_usd)));
+  const biggestFee = Math.max(0, ...quotes.map(
+    q => (q.fee_recharge_largest_share || 0) * Math.abs(q.fee_recharge_usd)));
+  return {
+    wins: sum("wins"), delta_usd: delta, window_orders: sum("window_orders"),
+    window_bps: volume ? delta * 10000 / volume : null,
+    conditional_bps: null, median_bps: null, largest_bps: null,
+    degraded: sum("degraded"), class_flips: sum("class_flips"), no_quote: sum("no_quote"),
+    no_quote_share: sum("window_orders") ? sum("no_quote") / sum("window_orders") : null,
+    largest_share: delta ? biggest / Math.abs(delta) : null,
+    fee_recharge_usd: fee, fee_recharge_protocol_usd: sum("fee_recharge_protocol_usd"),
+    fee_recharge_partner_usd: sum("fee_recharge_partner_usd"),
+    fee_recharge_largest_share: fee ? biggestFee / Math.abs(fee) : null,
+    substituted: sum("substituted"), substituted_auctions: sum("substituted_auctions"),
+    quote_only_auctions: sum("quote_only_auctions"),
+  };
+}
+
+function quoteCells(q, isAgg) {
+  const warn = concentrated(q.largest_share) ? " ⚠" : "";
+  return {
+    main: [
+      `<td class="${neg(q.window_bps || 0)}">${fmtBps(q.window_bps)}</td>`,
+      `<td class="${neg(q.median_bps || 0)}">${isAgg ? dashCell(NOT_SUMMABLE) : fmtBps(q.median_bps, 2)}</td>`,
+      `<td>${q.no_quote.toLocaleString("en-US")}</td>`,
+      `<td class="sec">${q.largest_share === null ? "n/a" : pct(q.largest_share, 0) + warn}</td>`,
+      `<td class="${neg(q.fee_recharge_protocol_usd)}">${fmtUsd(q.fee_recharge_protocol_usd)}</td>`,
+    ],
+    detail: [
+      `<td>${isAgg ? `${fmtUsd(q.delta_usd)} over ${q.degraded.toLocaleString("en-US")} that moved`
+        : `${fmtBps(q.conditional_bps, 2)} on the ${q.degraded.toLocaleString("en-US")} that moved`}</td>`,
       `<td>${q.wins.toLocaleString("en-US")} wins${
-        q.class_flips ? `<br>${q.class_flips} lost verification` : ""}</td>` +
+        q.class_flips ? `<br>${q.class_flips} lost verification` : ""}</td>`,
       `<td>${q.no_quote_share === null ? "n/a"
-        : `${pct(q.no_quote_share, 3)} of ${q.window_orders.toLocaleString("en-US")}`}</td>` +
-      `<td class="sec">largest ${fmtBps(q.largest_bps, 0)}</td>` +
+        : `${pct(q.no_quote_share, 3)} of ${q.window_orders.toLocaleString("en-US")}`}</td>`,
+      `<td class="sec">${isAgg ? "" : `largest ${fmtBps(q.largest_bps, 0)}`}</td>`,
       `<td>partner ${fmtUsd(q.fee_recharge_partner_usd)}<br>${
         q.substituted.toLocaleString("en-US")} orders in ${
         q.substituted_auctions.toLocaleString("en-US")} auctions, ${
         q.quote_only_auctions.toLocaleString("en-US")} without its bid<br>largest order ${
         q.fee_recharge_largest_share === null || q.fee_recharge_largest_share === undefined
-          ? "n/a" : pct(q.fee_recharge_largest_share, 0)}</td></tr>`);
-  }
-  body.innerHTML = out.join("\n");
+          ? "n/a" : pct(q.fee_recharge_largest_share, 0)}</td>`,
+    ],
+  };
 }
+
+function renderQuotes() {
+  const withQuote = d => d.quote && d.quote.wins > 0;
+  // A chain row carries its quote; the cell builder sees the quote object either way.
+  const entries = nestedEntries(withQuote, rows => aggregateQuotes(rows.map(chainQuote)),
+    a => a.wins);
+  renderNested("qrows", state.openQuote,
+    entries.map(e => ({ ...e, s: { ...e.s, chains: Object.fromEntries(
+      e.ids.map(id => [id, chainQuote(e.s.chains[id])])) } })),
+    quoteCells);
+}
+
+/* The USD rate travels with the quote so the summed bps can be recomputed. */
+const chainQuote = d => ({ ...d.quote, usd_per_native: d.rate * 1e18 });
 
 /* ---- contribution and reward, side by side ------------------------------
    Its own table, not columns in the focus band: three groups (winning, second-best bids,
    quotes), each a contribution with bids fixed, then the reward that pays for it. Reward
-   columns are recorded amounts, not deltas, so they are unsigned and uncoloured. One row
-   per solver-chain in scope, never summed across chains, in the solver table's order.
-   Six columns after the solver: Δscore | performance | Δother winners' margin, settled
+   columns are recorded amounts, not deltas, so they are unsigned and uncoloured. Six
+   columns after the solver: Δscore | performance | Δother winners' margin, settled
    winners, uncapped (capped Δrewards beneath) | consistency (÷ margin beneath) | Δquote |
    quote. */
-function paidCell(p, component, sym) {
+const COMPONENTS = ["performance", "consistency", "quote"];
+
+function aggregatePaid(rows) {
+  const sum = (xs, k) => xs.reduce((a, x) => a + (x[k] || 0), 0);
+  const paid = rows.map(r => r.paid), ru = rows.map(r => r.runner_up);
+  const quotes = rows.filter(r => r.quote).map(chainQuote);
+  const unaccounted = Object.fromEntries(COMPONENTS.map(c => [c, sum(paid.map(p => p.unaccounted), c)]));
+  const settledKnown = ru.every(r => r.settled_usd !== null);
+  const settled = sum(ru, "settled_usd"), consistency = sum(paid, "consistency_usd");
+  return {
+    usd_score: sum(rows, "usd_score"), usd_s: sum(rows, "usd_s"), usd_f: sum(rows, "usd_f"),
+    native_score: null, sym: null, bid: sum(rows, "bid"),
+    paid: {
+      ...Object.fromEntries(COMPONENTS.map(c => [c + "_usd", sum(paid, c + "_usd")])),
+      unaccounted, auctions: sum(paid, "auctions"),
+    },
+    runner_up: {
+      settled_usd: settledKnown ? settled : null, settled: null,
+      rewards_usd: ru.every(r => r.rewards_usd !== null) ? sum(ru, "rewards_usd") : null,
+      auctions: sum(ru, "auctions"), cap_unknown: sum(ru, "cap_unknown"),
+      // Native ratios do not add across chains, so the summed row's ratio is in USD.
+      ratio: settledKnown && settled > 0 ? consistency / settled : null,
+    },
+    quote: quotes.length ? aggregateQuotes(quotes) : null,
+  };
+}
+
+function paidCell(p, component, sym, isAgg) {
   const missing = p.unaccounted[component];
   if (missing && missing >= p.auctions) {
     return { main: "<td>pending</td>",
       detail: `<td>${missing.toLocaleString("en-US")} auctions not yet accounted</td>` };
   }
   return { main: `<td>${fmtUsdAmt(p[component + "_usd"])}</td>`,
-    detail: `<td>${fmtNatAmt(p[component], sym)}${missing
+    detail: `<td>${isAgg ? dashCell(NOT_SUMMABLE) : fmtNatAmt(p[component], sym)}${missing
       ? `<br>${missing.toLocaleString("en-US")} auctions not yet accounted` : ""}</td>` };
 }
 
-function renderPaid() {
-  const body = document.getElementById("prows");
-  if (!body) return;
-  const inScope = DATA.chains.filter(c => !state.chain || c.id === state.chain);
-  const rows = [];
-  for (const s of DATA.solvers) {
-    for (const c of inScope) {
-      const chain = s.chains[c.id];
-      if (chain && chain.paid && chain.runner_up) {
-        rows.push({ name: s.name, chain: c.id, d: chain });
-      }
-    }
-  }
-  rows.sort((a, b) => Math.abs(b.d.usd_s) - Math.abs(a.d.usd_s));
-  const out = [];
-  const none = why => `<td class="group-start"><span class="na" title="${why}">—</span></td>`;
-  for (const { name, chain, d } of rows) {
-    const p = d.paid, r = d.runner_up, q = d.quote;
-    const shown = inScope.length > 1
-      ? `${label(name)} <span class="chip">${chain}</span>` : label(name);
-    const [perf, cons, quote] =
-      ["performance", "consistency", "quote"].map(c => paidCell(p, c, d.sym));
-    // Three groups, each the contribution with bids fixed, then the reward paying for it.
-    const settled = r.settled_usd === null ? none("no settlement records in surplus mode")
-      : `<td class="group-start ${neg(r.settled_usd)}">${fmtUsd(r.settled_usd)}</td>`;
-    const quoted = !q ? none("the run had no quote pass")
-      : `<td class="group-start ${neg(q.delta_usd)}">${fmtUsd(q.delta_usd)}</td>`;
-    out.push(`<tr class="main"><td class="chain" rowspan="2">${shown}</td>` +
-      `<td class="group-start ${neg(d.usd_score)}">${fmtUsd(d.usd_score)}</td>` + perf.main +
-      settled + cons.main + quoted + quote.main + `</tr>`);
-    out.push(`<tr class="detail">` +
-      `<td class="group-start">${fmtNat(d.native_score, d.sym)}<br>Δsurplus ${fmtUsd(d.usd_s)}<br>Δfees ${
-        fmtUsd(d.usd_f)}</td>` + perf.detail +
-      `<td class="group-start">${r.settled === null ? "" : fmtNat(r.settled, d.sym) + "<br>"}${
+function paidCells(d, isAgg) {
+  const p = d.paid, r = d.runner_up, q = d.quote;
+  const none = why => `<td class="group-start">${dashCell(why)}</td>`;
+  const [perf, cons, quote] = COMPONENTS.map(c => paidCell(p, c, d.sym, isAgg));
+  const native = v => isAgg ? dashCell(NOT_SUMMABLE) : fmtNat(v, d.sym);
+  const settled = r.settled_usd === null ? none("no settlement records in surplus mode")
+    : `<td class="group-start ${neg(r.settled_usd)}">${fmtUsd(r.settled_usd)}</td>`;
+  const quoted = !q ? none("the run had no quote pass")
+    : `<td class="group-start ${neg(q.delta_usd)}">${fmtUsd(q.delta_usd)}</td>`;
+  return {
+    main: [
+      `<td class="group-start ${neg(d.usd_score)}">${fmtUsd(d.usd_score)}</td>`, perf.main,
+      settled, cons.main, quoted, quote.main,
+    ],
+    detail: [
+      `<td class="group-start">${native(d.native_score)}<br>Δsurplus ${fmtUsd(d.usd_s)}<br>Δfees ${
+        fmtUsd(d.usd_f)}</td>`,
+      perf.detail,
+      `<td class="group-start">${r.settled_usd === null ? "" : native(r.settled) + "<br>"}${
         r.rewards_usd === null ? "" : `capped Δrewards ${fmtUsd(r.rewards_usd)}<br>`}runner-up in ${
         r.auctions.toLocaleString("en-US")}<br>${
         d.bid ? pct(r.auctions / d.bid, 1) : "n/a"} of its bids${
-        r.cap_unknown ? `<br>${r.cap_unknown} auctions cap unknown` : ""}</td>` +
+        r.cap_unknown ? `<br>${r.cap_unknown} auctions cap unknown` : ""}</td>`,
       cons.detail.replace("</td>", `<br>÷ margin ${
-        r.ratio === null || r.ratio === undefined ? "n/a" : r.ratio.toFixed(2)}</td>`) +
-      (q ? `<td class="group-start">${fmtBps(q.window_bps, 2)} of executed volume<br>${
+        r.ratio === null || r.ratio === undefined ? "n/a" : r.ratio.toFixed(2)}${
+        isAgg && r.ratio !== null ? " (USD)" : ""}</td>`),
+      q ? `<td class="group-start">${fmtBps(q.window_bps, 2)} of executed volume<br>${
         q.no_quote.toLocaleString("en-US")} orders not quoted<br>${
-        q.wins.toLocaleString("en-US")} quote wins</td>` : '<td class="group-start"></td>') +
-      quote.detail + `</tr>`);
-  }
-  body.innerHTML = out.join("\n");
+        q.wins.toLocaleString("en-US")} quote wins</td>` : '<td class="group-start"></td>',
+      quote.detail,
+    ],
+  };
 }
+
+function renderPaid() {
+  const keep = d => d.paid && d.runner_up;
+  // Same order as the solver table: by |Δsurplus| over the chains in scope.
+  renderNested("prows", state.openPaid, nestedEntries(keep, aggregatePaid, a => Math.abs(a.usd_s)),
+    paidCells);
+}
+
+for (const [id, key] of [["prows", "openPaid"], ["qrows", "openQuote"]]) {
+  const body = document.getElementById(id);
+  if (!body) continue;
+  body.addEventListener("click", e => {
+    const b = e.target.closest(".disclose");
+    if (!b) return;
+    const set = state[key], n = b.dataset.solver;
+    set.has(n) ? set.delete(n) : set.add(n);
+    render();
+  });
+}
+
+// Last, once every constant above exists.
+render();
