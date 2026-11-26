@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import tempfile
 import urllib.request
 from collections.abc import Generator
 from dataclasses import dataclass
@@ -70,7 +71,9 @@ def simulate(
         assert network == world.network, f"connected to {network}, the world is {world.network}"
         return sim.conn()
 
-    with pytest.MonkeyPatch.context() as patch:
+    with pytest.MonkeyPatch.context() as patch, tempfile.TemporaryDirectory() as cache:
+        # A cache of its own: the simulated rates must neither read nor fill the real one.
+        patch.setenv("LOO_CACHE_DIR", cache)
         patch.setattr(db, "connect", connect)
         patch.setattr(urllib.request, "urlopen", house.urlopen)
         patch.setenv("CLICKHOUSE_URL", ' "http://sim.clickhouse:8123" ')

@@ -117,7 +117,10 @@ has rates, else native. Give every rule's run of a solver-window together; a gro
 without `inherited` is refused. Reports carry a format marker and older ones are refused with "re-run
 analyse" — files are cheap to regenerate, a misread one is not. `--skip-usd` needs no DB.
 USD needs one rate per auction with a recorded reward, which over a week is most of its
-auctions: 11,083 mainnet auctions took 16 s cold and 3 s warm (2026-11-25).
+auctions. An auction's prices do not change once recorded, so rates are cached per network
+in `$LOO_CACHE_DIR` (default `~/.cache/loo`) and only new auctions query the DB; the
+first fetch of 218,740 auctions on four chains took 8.7 minutes (2026-11-26). `compare`
+and `scripts/artifact_data.py` share the cache; delete the files to refetch.
 
 ### validate and validate-rewards
 

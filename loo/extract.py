@@ -6,9 +6,13 @@ Reads staging, not `int_backend_data__proposed_solution_data` (lags; no `filtere
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from statistics import median
 from typing import Any
 
@@ -739,6 +743,15 @@ def load_conversion_rates(
     return rates
 
 
+def usd_rates_cache(network: str) -> Path:
+    """The file caching one network's USD rates, named by its reference tokens so a change
+    to them starts a new file. In `$LOO_CACHE_DIR`, default `~/.cache/loo`."""
+    reference = usd_reference_tokens(network)
+    key = hashlib.sha256(json.dumps(sorted(reference.items())).encode()).hexdigest()[:12]
+    root = Path(os.environ.get("LOO_CACHE_DIR") or Path.home() / ".cache" / "loo")
+    return root / f"usd-rates-{network}-{key}.json"
+
+
 def load_usd_rates(
     conn: Connection,
     auction_ids: Sequence[int],
@@ -746,20 +759,35 @@ def load_usd_rates(
     chunk_size: int = CHUNK_SIZE,
 ) -> dict[int, Decimal]:
     """USD per native token per auction, the median over reference stablecoins' prices.
-    Auctions with none priced are absent."""
+    Auctions with none priced are absent.
+
+    An auction's prices do not change once recorded, so rates are cached on disk and only
+    auctions not in the cache are queried. Unpriced auctions are not cached: they are few,
+    and an auction not yet in the price table must not be remembered as unpriced."""
     reference = usd_reference_tokens(network)
+    path = usd_rates_cache(network)
+    cached: dict[int, Decimal] = {}
+    if path.exists():
+        cached = {int(a): Decimal(r) for a, r in json.loads(path.read_text()).items()}
+    wanted = set(auction_ids)
+    missing = sorted(wanted - cached.keys())
     token_bytes = [bytes.fromhex(token) for token in reference]
     per_auction: dict[int, list[Decimal]] = {}
-    for chunk in chunked(list(auction_ids), chunk_size):
+    for chunk in chunked(missing, chunk_size):
         ids = list(chunk)
         rows = fetch_prices(conn, USD_PRICES_SQL, {"ids": ids, "tokens": token_bytes})
         for row in rows:
             per_auction.setdefault(row["auction_id"], []).append(
                 usd_per_native(as_int(row["price"]), reference[row["token"]])
             )
-    return {
-        auction_id: median(rates) for auction_id, rates in per_auction.items()
-    }
+    fetched = {auction_id: median(rates) for auction_id, rates in per_auction.items()}
+    if fetched:
+        cached.update(fetched)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        partial = path.with_suffix(f".{os.getpid()}.tmp")
+        partial.write_text(json.dumps({str(a): str(r) for a, r in sorted(cached.items())}))
+        partial.replace(path)
+    return {a: cached[a] for a in wanted if a in cached}
 
 
 def solver_matches(conn: Connection, solver: str, start: str, end: str) -> list[SolverMatch]:

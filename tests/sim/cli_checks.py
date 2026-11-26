@@ -192,6 +192,13 @@ def check_reports_and_compare(
     # With USD: each auction converted at its own stablecoin-implied rate.
     usd_run = sim.cli("compare", *paths, "--markdown")
     assert usd_run.code == 0, usd_run.err
+    # The rates are cached: a second run prints the same and asks the DB for no rate.
+    asked = len(sim.server.queries)
+    again = sim.cli("compare", *paths, "--markdown")
+    assert again.code == 0, again.err
+    assert again.out == usd_run.out
+    assert not any("ap.token = any(" in sql and "ap.auction_id, encode" in sql
+                   for sql in sim.server.queries[asked:])
     moved = {m.auction_id for w in windows for m in w.headline.moves}
     rates = usd_rates(world, moved)
     for window in windows:
